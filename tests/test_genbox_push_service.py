@@ -6,6 +6,8 @@ from pathlib import Path
 from typing import Any
 import unittest
 
+from curl_cffi import CurlMime
+
 
 os.environ.setdefault("CHATGPT2API_AUTH_KEY", "local-test-admin-key")
 
@@ -133,7 +135,8 @@ class GenBoxPushServiceTests(unittest.TestCase):
         request = self.factory.sessions[1].calls[0]
         self.assertEqual(request["data"]["source_sha256"], digest)
         self.assertEqual(request["data"]["remote_path"], "2026/07/28/image.png")
-        self.assertEqual(request["files"]["image"][1], self.image)
+        self.assertNotIn("files", request)
+        self.assertIsInstance(request["multipart"], CurlMime)
         saved = (self.tmp / "state.json").read_text(encoding="utf-8")
         self.assertNotIn("secret-not-for-responses", saved)
 

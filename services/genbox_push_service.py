@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import urlparse
 
-from curl_cffi import requests
+from curl_cffi import CurlMime, requests
 
 from services.config import DATA_DIR
 from services.image_storage_service import image_storage_service
@@ -249,11 +249,18 @@ class GenBoxPushService:
             if max_bytes and len(payload) > max_bytes:
                 raise GenBoxPushError("图片超过 GenBox 当前允许的大小")
             session = self.session_factory()
+            multipart = CurlMime()
+            multipart.addpart(
+                name="image",
+                filename=Path(relative_path).name,
+                content_type=self._content_type(relative_path),
+                data=payload,
+            )
             try:
                 response = session.post(
                     f"{settings.base_url}/api/sync/push",
                     headers=self._headers(settings),
-                    files={"image": (Path(relative_path).name, payload, self._content_type(relative_path))},
+                    multipart=multipart,
                     data={
                         "remote_path": relative_path,
                         "source_sha256": digest,
@@ -267,6 +274,7 @@ class GenBoxPushService:
             except Exception as exc:
                 raise GenBoxPushError("图片尚未发送成功，源图已保留") from exc
             finally:
+                multipart.close()
                 close = getattr(session, "close", None)
                 if callable(close):
                     close()
