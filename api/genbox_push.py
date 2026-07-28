@@ -5,6 +5,8 @@ from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel, Field
 
 from api.support import require_admin
+from services.genbox_push_batch import genbox_push_batch_service
+from services.genbox_push_schedule import genbox_push_schedule_service
 from services.genbox_push_service import GenBoxPushError, genbox_push_service
 
 
@@ -22,6 +24,23 @@ class GenBoxPushImageRequest(BaseModel):
     created_at: str = ""
     prompt: str = ""
     model: str = ""
+
+
+class GenBoxPushBatchRequest(BaseModel):
+    paths: list[str] = Field(..., min_length=1, max_length=200)
+
+
+class GenBoxPushDateRangeRequest(BaseModel):
+    start_date: str = Field(..., min_length=10, max_length=10)
+    end_date: str = Field(..., min_length=10, max_length=10)
+
+
+class GenBoxPushScheduleRequest(BaseModel):
+    enabled: bool = False
+    weekday: int = Field(default=0, ge=0, le=6)
+    time: str = Field(default="09:00", min_length=5, max_length=5)
+    start_date: str = Field(default="", max_length=10)
+    end_date: str = Field(default="", max_length=10)
 
 
 def _raise_push_error(exc: Exception) -> None:
@@ -69,5 +88,70 @@ def create_router() -> APIRouter:
         except GenBoxPushError as exc:
             _raise_push_error(exc)
         return {"result": result}
+
+    @router.post("/api/genbox-push/batches")
+    async def create_batch(body: GenBoxPushBatchRequest, authorization: str | None = Header(default=None)):
+        require_admin(authorization)
+        try:
+            batch = await run_in_threadpool(genbox_push_batch_service.create, body.paths)
+        except ValueError as exc:
+            _raise_push_error(exc)
+        return {"batch": batch}
+
+    @router.post("/api/genbox-push/batches/preview-date-range")
+    async def preview_batch_date_range(body: GenBoxPushDateRangeRequest, authorization: str | None = Header(default=None)):
+        require_admin(authorization)
+        try:
+            preview = await run_in_threadpool(genbox_push_batch_service.preview_date_range, body.start_date, body.end_date)
+        except ValueError as exc:
+            _raise_push_error(exc)
+        return {"preview": preview}
+
+    @router.get("/api/genbox-push/batches/{batch_id}")
+    async def get_batch(batch_id: str, authorization: str | None = Header(default=None)):
+        require_admin(authorization)
+        batch = await run_in_threadpool(genbox_push_batch_service.get, batch_id)
+        if batch is None:
+            raise HTTPException(status_code=404, detail={"error": "GenBox Push batch not found."})
+        return {"batch": batch}
+
+    @router.post("/api/genbox-push/batches/{batch_id}/cancel")
+    async def cancel_batch(batch_id: str, authorization: str | None = Header(default=None)):
+        require_admin(authorization)
+        batch = await run_in_threadpool(genbox_push_batch_service.cancel, batch_id)
+        if batch is None:
+            raise HTTPException(status_code=404, detail={"error": "GenBox Push batch not found."})
+        return {"batch": batch}
+
+    @router.post("/api/genbox-push/batches/{batch_id}/retry-failed")
+    async def retry_failed_batch(batch_id: str, authorization: str | None = Header(default=None)):
+        require_admin(authorization)
+        batch = await run_in_threadpool(genbox_push_batch_service.retry_failed, batch_id)
+        if batch is None:
+            raise HTTPException(status_code=404, detail={"error": "GenBox Push batch not found."})
+        return {"batch": batch}
+
+    @router.get("/api/genbox-push/schedule")
+    async def get_schedule(authorization: str | None = Header(default=None)):
+        require_admin(authorization)
+        return {"schedule": await run_in_threadpool(genbox_push_schedule_service.get_settings)}
+
+    @router.put("/api/genbox-push/schedule")
+    async def update_schedule(body: GenBoxPushScheduleRequest, authorization: str | None = Header(default=None)):
+        require_admin(authorization)
+        try:
+            schedule = await run_in_threadpool(genbox_push_schedule_service.update_settings, body.model_dump())
+        except ValueError as exc:
+            _raise_push_error(exc)
+        return {"schedule": schedule}
+
+    @router.post("/api/genbox-push/schedule/run-now")
+    async def run_schedule_now(authorization: str | None = Header(default=None)):
+        require_admin(authorization)
+        try:
+            schedule = await run_in_threadpool(genbox_push_schedule_service.run_now)
+        except ValueError as exc:
+            _raise_push_error(exc)
+        return {"schedule": schedule}
 
     return router

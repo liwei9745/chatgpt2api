@@ -3,7 +3,7 @@
     <ModalHeader
       :title="title"
       :subtitle="subtitle"
-      :close-disabled="busy"
+      :close-disabled="busy && !canCancel"
       :bordered="false"
       flush
       @close="$emit('close')"
@@ -29,8 +29,9 @@
       </p>
     </div>
 
-    <ModalFooter v-if="busy && canCancel" class="mt-6" :bordered="false" flush>
-      <Button v-if="busy && canCancel" size="sm" variant="outline" @click="$emit('cancel')">停止</Button>
+    <ModalFooter v-if="(busy && canCancel) || canRetry" class="mt-6" :bordered="false" flush>
+      <Button v-if="canRetry" size="sm" variant="primary" @click="$emit('retry')">重试失败项</Button>
+      <Button v-if="busy && canCancel" size="sm" variant="outline" @click="$emit('cancel')">停止剩余任务</Button>
     </ModalFooter>
   </ModalShell>
 </template>
@@ -54,6 +55,7 @@ const props = withDefaults(defineProps<{
   error?: string
   busy?: boolean
   canCancel?: boolean
+  canRetry?: boolean
   zIndex?: number
 }>(), {
   subtitle: '',
@@ -64,12 +66,14 @@ const props = withDefaults(defineProps<{
   error: '',
   busy: false,
   canCancel: false,
+  canRetry: false,
   zIndex: 150,
 })
 
 defineEmits<{
   close: []
   cancel: []
+  retry: []
 }>()
 
 const progressValue = computed(() => {

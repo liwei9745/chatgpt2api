@@ -68,10 +68,19 @@
           <Button
             size="xs"
             variant="outline"
-            :disabled="selectedCount !== 1 || batchBusy"
+            :disabled="selectedCount === 0 || batchBusy"
             @click="handlePushSelected"
           >
-            推送到 GenBox
+            推送选中的 {{ selectedCount }} 张
+          </Button>
+          <Button
+            v-if="startDate && endDate"
+            size="xs"
+            variant="outline"
+            :disabled="batchBusy"
+            @click="handlePushDateRange"
+          >
+            推送日期范围
           </Button>
           <Button
             size="xs"
@@ -178,7 +187,7 @@
       density="compact"
     >
       <Button size="xs" variant="outline" :disabled="batchBusy" @click="handleBatchDownload">下载 zip</Button>
-      <Button size="xs" variant="outline" :disabled="selectedCount !== 1 || batchBusy" @click="handlePushSelected">推送到 GenBox</Button>
+      <Button size="xs" variant="outline" :disabled="selectedCount === 0 || batchBusy" @click="handlePushSelected">推送选中的 {{ selectedCount }} 张</Button>
       <Button size="xs" variant="outline" :disabled="batchBusy" @click="handleDeleteSelected">删除</Button>
       <Button size="xs" variant="ghost" :disabled="batchBusy" @click="clearSelection">取消</Button>
     </SelectionBulkBar>
@@ -193,7 +202,11 @@
       :message="operationProgress.message"
       :error="operationProgress.error"
       :busy="operationProgress.busy"
+      :can-cancel="Boolean(activePushBatch && (activePushBatch.queued || activePushBatch.sending))"
+      :can-retry="Boolean(activePushBatch?.failed)"
       @close="operationProgress.open = false"
+      @cancel="cancelPushBatch"
+      @retry="retryFailedPushBatch"
     />
 
     <ModalShell
@@ -420,6 +433,8 @@ const galleryOperations = useGalleryOperationsRuntime({
   currentPage,
   storageStats,
   selectedPaths,
+  startDate,
+  endDate,
   loadGallery,
   closePreviewIfPath,
   closeTagEditorIfPath,
@@ -443,6 +458,10 @@ const {
   handleDeleteSelected,
   handleBatchDownload,
   handlePushSelected,
+  handlePushDateRange,
+  activePushBatch,
+  cancelPushBatch,
+  retryFailedPushBatch,
 } = galleryOperations
 
 function getFileUrl(url: string) {

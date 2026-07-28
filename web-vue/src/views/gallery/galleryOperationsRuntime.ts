@@ -1,7 +1,7 @@
 import { reactive, ref, type Ref } from 'vue'
 
 import { galleryApi, type GalleryFile, type ImageStorageStats } from '@/api/gallery'
-import { genboxPushApi } from '@/api/genboxPush'
+import { genboxPushApi, type GenBoxPushBatch } from '@/api/genboxPush'
 import { saveBlob } from '@/lib/downloads'
 import {
   formatCleanupExpiredMessage,
@@ -34,6 +34,8 @@ type GalleryOperationsRuntimeOptions = {
   currentPage: Ref<number>
   storageStats: Ref<ImageStorageStats | null>
   selectedPaths: Ref<Set<string>>
+  startDate: Ref<string>
+  endDate: Ref<string>
   loadGallery: () => Promise<void>
   closePreviewIfPath: (path: string) => void
   closeTagEditorIfPath: (path: string) => void
@@ -47,6 +49,7 @@ export function useGalleryOperationsRuntime(options: GalleryOperationsRuntimeOpt
   const storageActionError = ref('')
   const targetFreeMb = ref('500')
   const batchBusy = ref(false)
+  const activePushBatch = ref<GenBoxPushBatch | null>(null)
   const operationProgress = reactive({
     open: false,
     title: '',
@@ -312,37 +315,141 @@ export function useGalleryOperationsRuntime(options: GalleryOperationsRuntimeOpt
     }
   }
 
+  function applyPushBatch(batch: GenBoxPushBatch) {
+    activePushBatch.value = batch
+    operationProgress.open = true
+    operationProgress.title = '推送到 GenBox'
+    operationProgress.subtitle = `已选择 ${batch.total} 张图片；源图会保留`
+    operationProgress.total = batch.total
+    operationProgress.current = batch.succeeded + batch.failed + batch.cancelled
+    operationProgress.statusLabel = batch.failed ? `失败 ${batch.failed}` : '已处理'
+    operationProgress.message = batch.status === 'queued'
+      ? '已加入推送队列。你可以继续浏览图片。'
+      : batch.status === 'sending'
+        ? '正在推送到 GenBox；关闭此窗口不会取消任务。'
+        : batch.status === 'cancelled'
+          ? '剩余未开始的图片已取消；源图仍保留。'
+          : batch.failed
+            ? '部分图片未完成。可仅重试失败项；源图仍保留。'
+            : '图片已推送完成；源图仍保留。'
+    operationProgress.error = batch.failed
+      ? '部分图片暂时未能推送。不会影响本地源图。'
+      : ''
+    operationProgress.busy = batch.status === 'queued' || batch.status === 'sending'
+    if (!operationProgress.busy) {
+      batchBusy.value = false
+      options.runtime.clearInterval('gallery:genbox-push-batch')
+    }
+  }
+
+  async function refreshPushBatch() {
+    const batchId = activePushBatch.value?.id
+    if (!batchId || !options.runtime.canRun.value) return
+    try {
+      const response = await genboxPushApi.getBatch(batchId)
+      applyPushBatch(response.batch)
+    } catch (error: any) {
+      operationProgress.error = error?.message || '无法刷新 GenBox 推送进度'
+      operationProgress.busy = false
+      batchBusy.value = false
+      options.runtime.clearInterval('gallery:genbox-push-batch')
+    }
+  }
+
+  function startPushBatchPolling(batchId: string) {
+    options.runtime.clearInterval('gallery:genbox-push-batch')
+    if (!batchId) return
+    options.runtime.setInterval('gallery:genbox-push-batch', 1000, () => {
+      void refreshPushBatch()
+    })
+  }
+
   async function handlePushSelected() {
     const paths = Array.from(options.selectedPaths.value)
-    if (paths.length !== 1) return
-    const [path] = paths
+    if (!paths.length) return
     const confirmed = await options.confirmDialog.ask({
       title: '推送到 GenBox',
-      message: '将把这张图片发送到已配置的 GenBox。源图会保留，确定继续吗？',
+      message: `将把已选择的 ${paths.length} 张图片发送到 GenBox。源图会保留，不会删除。确定继续吗？`,
       confirmText: '开始推送',
       cancelText: '取消',
     })
     if (!confirmed) return
 
     batchBusy.value = true
-    resetProgress({ title: '推送到 GenBox', subtitle: path, total: 1, message: '正在检查 GenBox 并发送图片...' })
+    resetProgress({ title: '推送到 GenBox', subtitle: `已选择 ${paths.length} 张图片`, total: paths.length, message: '正在创建可恢复的推送批次...' })
     try {
-      const response = await genboxPushApi.pushImage(path)
-      operationProgress.current = 1
-      operationProgress.statusLabel = '已完成'
-      operationProgress.message = '图片已发送，源图仍保留在当前服务中。'
-      options.toast.success(`图片已${response.result.status === 'imported' ? '导入' : '确认存在'}于 GenBox`, '推送完成')
+      const response = await genboxPushApi.createBatch(paths)
+      options.clearSelection()
+      applyPushBatch(response.batch)
+      startPushBatchPolling(response.batch.id)
     } catch (error: any) {
-      operationProgress.error = error?.message || '图片未发送成功，源图仍保留。'
+      operationProgress.error = error?.message || '无法创建推送批次，源图仍保留。'
       options.toast.error(operationProgress.error, '推送失败')
-    } finally {
       batchBusy.value = false
       operationProgress.busy = false
     }
   }
 
+  async function handlePushDateRange() {
+    const startDate = options.startDate.value.trim()
+    const endDate = options.endDate.value.trim()
+    if (!startDate || !endDate) {
+      options.toast.error('请先选择完整的开始和结束日期。', '日期范围不完整')
+      return
+    }
+    batchBusy.value = true
+    try {
+      const previewResponse = await genboxPushApi.previewBatchDateRange(startDate, endDate)
+      const preview = previewResponse.preview
+      if (!preview.eligible_count) {
+        options.toast.error('这个日期范围没有可推送的图片。', '没有可用图片')
+        return
+      }
+      const confirmed = await options.confirmDialog.ask({
+        title: '推送日期范围',
+        message: `${startDate} 到 ${endDate} 共有 ${preview.eligible_count} 张可推送图片。源图会保留，不会删除。确定创建推送批次吗？`,
+        confirmText: '开始推送',
+        cancelText: '取消',
+      })
+      if (!confirmed) return
+      const response = await genboxPushApi.createBatch(preview.paths)
+      applyPushBatch(response.batch)
+      startPushBatchPolling(response.batch.id)
+    } catch (error: any) {
+      options.toast.error(error?.message || '无法预览这个日期范围的推送任务', '推送失败')
+    } finally {
+      if (!operationProgress.busy) batchBusy.value = false
+    }
+  }
+
+  async function cancelPushBatch() {
+    const batchId = activePushBatch.value?.id
+    if (!batchId) return
+    try {
+      const response = await genboxPushApi.cancelBatch(batchId)
+      applyPushBatch(response.batch)
+    } catch (error: any) {
+      options.toast.error(error?.message || '无法停止剩余推送任务', '取消失败')
+    }
+  }
+
+  async function retryFailedPushBatch() {
+    const batchId = activePushBatch.value?.id
+    if (!batchId) return
+    batchBusy.value = true
+    try {
+      const response = await genboxPushApi.retryFailedBatch(batchId)
+      applyPushBatch(response.batch)
+      startPushBatchPolling(batchId)
+    } catch (error: any) {
+      batchBusy.value = false
+      options.toast.error(error?.message || '无法重新提交失败图片', '重试失败')
+    }
+  }
+
   function deactivate() {
     storageStatsQuery.invalidate()
+    options.runtime.clearInterval('gallery:genbox-push-batch')
     isStorageBusy.value = false
   }
 
@@ -364,6 +471,10 @@ export function useGalleryOperationsRuntime(options: GalleryOperationsRuntimeOpt
     handleDeleteSelected,
     handleBatchDownload,
     handlePushSelected,
+    handlePushDateRange,
+    activePushBatch,
+    cancelPushBatch,
+    retryFailedPushBatch,
     deactivate,
   }
 }

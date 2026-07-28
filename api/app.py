@@ -18,6 +18,8 @@ from services.config import config
 from services.dashboard_metrics_service import dashboard_metrics_service
 from services.image_service import start_image_cleanup_scheduler
 from services.genbox_push_outbox import genbox_push_outbox
+from services.genbox_push_batch import genbox_push_batch_service
+from services.genbox_push_schedule import genbox_push_schedule_service
 from services.log_service import cleanup_old_logs, start_log_cleanup_scheduler
 from services.realtime_monitor_service import realtime_monitor_service
 from utils.log import logger
@@ -55,6 +57,8 @@ def create_app() -> FastAPI:
     async def lifespan(_: FastAPI):
         _configure_threadpool()
         genbox_push_outbox.resume()
+        genbox_push_batch_service.resume()
+        genbox_push_schedule_service.resume()
         account_service.cleanup_auto_remove_accounts()
         stop_event = Event()
         thread = start_limited_account_watcher(stop_event)
@@ -75,6 +79,7 @@ def create_app() -> FastAPI:
             except Exception as exc:
                 logger.error({"event": "dashboard_metrics_shutdown_flush_failed", "error": str(exc)})
             backup_service.stop()
+            genbox_push_schedule_service.stop()
 
     app = FastAPI(title="chatgpt2api", version=app_version, lifespan=lifespan)
     install_exception_handlers(app)
