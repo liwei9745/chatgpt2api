@@ -106,6 +106,22 @@ class GenBoxPushServiceTests(unittest.TestCase):
         self.assertEqual(call["headers"]["X-GenBox-Source"], "chatgpt2api-dev")
         self.assertEqual(call["headers"]["X-GenBox-Key"], "secret-not-for-responses")
 
+    def test_incompatible_probe_contract_refuses_push_without_state(self) -> None:
+        self.configure()
+        self.factory.responses.append(FakeResponse(200, {
+            "ok": True,
+            "contract_version": "v2",
+            "source_id": "chatgpt2api-dev",
+            "max_image_bytes": 4096,
+        }))
+
+        with self.assertRaisesRegex(GenBoxPushError, "不支持"):
+            self.service.push_image("2026/07/28/image.png")
+
+        self.assertFalse((self.tmp / "state.json").exists())
+        self.assertEqual(len(self.factory.sessions), 1)
+        self.assertEqual([call["method"] for call in self.factory.sessions[0].calls], ["GET"])
+
     def test_successful_push_requires_matching_receipt_and_retains_source(self) -> None:
         self.configure()
         digest = hashlib.sha256(self.image).hexdigest()
