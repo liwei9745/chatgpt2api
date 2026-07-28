@@ -68,6 +68,14 @@
           <Button
             size="xs"
             variant="outline"
+            :disabled="selectedCount !== 1 || batchBusy"
+            @click="handlePushSelected"
+          >
+            推送到 GenBox
+          </Button>
+          <Button
+            size="xs"
+            variant="outline"
             :disabled="selectedCount === 0 || batchBusy"
             @click="handleDeleteSelected"
           >
@@ -170,6 +178,7 @@
       density="compact"
     >
       <Button size="xs" variant="outline" :disabled="batchBusy" @click="handleBatchDownload">下载 zip</Button>
+      <Button size="xs" variant="outline" :disabled="selectedCount !== 1 || batchBusy" @click="handlePushSelected">推送到 GenBox</Button>
       <Button size="xs" variant="outline" :disabled="batchBusy" @click="handleDeleteSelected">删除</Button>
       <Button size="xs" variant="ghost" :disabled="batchBusy" @click="clearSelection">取消</Button>
     </SelectionBulkBar>
@@ -433,6 +442,7 @@ const {
   handleDelete,
   handleDeleteSelected,
   handleBatchDownload,
+  handlePushSelected,
 } = galleryOperations
 
 function getFileUrl(url: string) {

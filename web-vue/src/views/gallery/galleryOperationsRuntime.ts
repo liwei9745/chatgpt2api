@@ -1,6 +1,7 @@
 import { reactive, ref, type Ref } from 'vue'
 
 import { galleryApi, type GalleryFile, type ImageStorageStats } from '@/api/gallery'
+import { genboxPushApi } from '@/api/genboxPush'
 import { saveBlob } from '@/lib/downloads'
 import {
   formatCleanupExpiredMessage,
@@ -311,6 +312,35 @@ export function useGalleryOperationsRuntime(options: GalleryOperationsRuntimeOpt
     }
   }
 
+  async function handlePushSelected() {
+    const paths = Array.from(options.selectedPaths.value)
+    if (paths.length !== 1) return
+    const [path] = paths
+    const confirmed = await options.confirmDialog.ask({
+      title: '推送到 GenBox',
+      message: '将把这张图片发送到已配置的 GenBox。源图会保留，确定继续吗？',
+      confirmText: '开始推送',
+      cancelText: '取消',
+    })
+    if (!confirmed) return
+
+    batchBusy.value = true
+    resetProgress({ title: '推送到 GenBox', subtitle: path, total: 1, message: '正在检查 GenBox 并发送图片...' })
+    try {
+      const response = await genboxPushApi.pushImage(path)
+      operationProgress.current = 1
+      operationProgress.statusLabel = '已完成'
+      operationProgress.message = '图片已发送，源图仍保留在当前服务中。'
+      options.toast.success(`图片已${response.result.status === 'imported' ? '导入' : '确认存在'}于 GenBox`, '推送完成')
+    } catch (error: any) {
+      operationProgress.error = error?.message || '图片未发送成功，源图仍保留。'
+      options.toast.error(operationProgress.error, '推送失败')
+    } finally {
+      batchBusy.value = false
+      operationProgress.busy = false
+    }
+  }
+
   function deactivate() {
     storageStatsQuery.invalidate()
     isStorageBusy.value = false
@@ -333,6 +363,7 @@ export function useGalleryOperationsRuntime(options: GalleryOperationsRuntimeOpt
     handleDelete,
     handleDeleteSelected,
     handleBatchDownload,
+    handlePushSelected,
     deactivate,
   }
 }

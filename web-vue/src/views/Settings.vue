@@ -119,6 +119,10 @@
         @delete-item="deleteBackupItem"
       />
 
+      <SettingsGenBoxPushPanel
+        v-else-if="activeSettingsTab === 'genbox'"
+      />
+
       <SettingsIntegrationsPanel
         v-else-if="activeSettingsTab === 'canvas' || activeSettingsTab === 'api-docs'"
         :mode="activeSettingsTab"
@@ -262,6 +266,7 @@ import SettingsBasicPolicyPanel from '@/views/settings/SettingsBasicPolicyPanel.
 import SettingsBackupPanel from '@/views/settings/SettingsBackupPanel.vue'
 import SettingsExternalSourceModals from '@/views/settings/SettingsExternalSourceModals.vue'
 import SettingsExternalSourcesPanel from '@/views/settings/SettingsExternalSourcesPanel.vue'
+import SettingsGenBoxPushPanel from '@/views/settings/SettingsGenBoxPushPanel.vue'
 import SettingsIntegrationsPanel from '@/views/settings/SettingsIntegrationsPanel.vue'
 import SettingsProxyRuntimePanel from '@/views/settings/SettingsProxyRuntimePanel.vue'
 import SettingsPromptSourcesPanel from '@/views/settings/SettingsPromptSourcesPanel.vue'
