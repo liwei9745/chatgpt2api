@@ -8,6 +8,10 @@ import unittest
 
 os.environ.setdefault("CHATGPT2API_AUTH_KEY", "local-test-admin-key")
 
+from fastapi.testclient import TestClient
+
+from api import genbox_push
+from api.app import create_app
 from services.genbox_push_schedule import GenBoxPushScheduleService
 from utils.timezone import BEIJING_TZ
 
@@ -118,6 +122,63 @@ class GenBoxPushScheduleTests(unittest.TestCase):
         self.assertFalse(disabled["enabled"])
         self.assertEqual(disabled["succeeded"], 1)
         self.assertTrue(disabled["source_retained"])
+
+
+class StubScheduleService:
+    def __init__(self) -> None:
+        self.payload: dict[str, object] | None = None
+
+    @staticmethod
+    def _public() -> dict[str, object]:
+        return {
+            "enabled": False, "weekday": 0, "time": "09:00", "start_date": "", "end_date": "",
+            "cursor": "", "last_run_at": "", "last_error": "", "queued": 0,
+            "succeeded": 0, "failed": 0, "source_retained": True,
+        }
+
+    def get_settings(self) -> dict[str, object]:
+        return self._public()
+
+    def update_settings(self, payload: dict[str, object]) -> dict[str, object]:
+        self.payload = payload
+        return {**self._public(), **payload}
+
+    def run_now(self) -> dict[str, object]:
+        return {**self._public(), "queued": 1}
+
+
+class GenBoxPushScheduleApiTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.stub = StubScheduleService()
+        self.previous = genbox_push.genbox_push_schedule_service
+        genbox_push.genbox_push_schedule_service = self.stub
+        self.client = TestClient(create_app())
+        self.headers = {"Authorization": "Bearer local-test-admin-key"}
+
+    def tearDown(self) -> None:
+        genbox_push.genbox_push_schedule_service = self.previous
+        self.client.close()
+
+    def test_schedule_routes_are_admin_only_and_project_safe_fields(self) -> None:
+        self.assertEqual(self.client.get("/api/genbox-push/schedule").status_code, 401)
+        self.assertEqual(self.client.put("/api/genbox-push/schedule", json={}).status_code, 401)
+        self.assertEqual(self.client.post("/api/genbox-push/schedule/run-now").status_code, 401)
+
+        current = self.client.get("/api/genbox-push/schedule", headers=self.headers)
+        updated = self.client.put("/api/genbox-push/schedule", headers=self.headers, json={
+            "enabled": True, "weekday": 2, "time": "10:30", "start_date": "", "end_date": "",
+            "push_key": "must not be accepted",
+        })
+        scanned = self.client.post("/api/genbox-push/schedule/run-now", headers=self.headers)
+
+        self.assertEqual(current.status_code, 200)
+        self.assertEqual(updated.status_code, 200)
+        self.assertEqual(scanned.status_code, 200)
+        self.assertEqual(self.stub.payload, {
+            "enabled": True, "weekday": 2, "time": "10:30", "start_date": "", "end_date": "",
+        })
+        self.assertNotIn("push_key", updated.text)
+        self.assertEqual(scanned.json()["schedule"]["queued"], 1)
 
 
 if __name__ == "__main__":
