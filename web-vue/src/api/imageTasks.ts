@@ -10,6 +10,19 @@ export interface ImageTaskAsset {
   revised_prompt?: string
   width?: number
   height?: number
+  genbox_push?: {
+    status: 'queued' | 'sending' | 'succeeded' | 'failed'
+    attempts: number
+    updated_at: string
+    error: string
+    source_retained: true
+    result?: {
+      status: string
+      sha256: string
+      safe_to_delete_source: boolean
+      source_retained: true
+    } | null
+  }
   [key: string]: unknown
 }
 
@@ -59,6 +72,7 @@ export interface CreateGenerationTaskInput {
   size?: string
   quality?: string
   clientTaskId?: string
+  pushToGenBox?: boolean
 }
 
 export interface CreateEditTaskInput extends CreateGenerationTaskInput {
@@ -296,6 +310,7 @@ function createEditForm(input: CreateEditTaskInput) {
   form.append('model', input.model || DEFAULT_IMAGE_MODEL)
   form.append('n', String(normalizeImageCount(input.n)))
   form.append('quality', input.quality || DEFAULT_IMAGE_QUALITY)
+  form.append('push_to_genbox', input.pushToGenBox ? 'true' : 'false')
   const size = requestSize(input.size)
   if (size) form.append('size', size)
 
@@ -371,6 +386,7 @@ export const imageTasksApi = {
       n: normalizeImageCount(input.n),
       size: requestSize(input.size),
       quality: input.quality || DEFAULT_IMAGE_QUALITY,
+      push_to_genbox: Boolean(input.pushToGenBox),
     })
     return normalizeTask(response)
   },
@@ -384,6 +400,14 @@ export const imageTasksApi = {
     const response = await apiClient.post<{ extra_timeout_secs: number }, ImageTask>(
       `/api/image-tasks/${encodeURIComponent(taskId)}/resume-poll`,
       { extra_timeout_secs: extraTimeoutSecs },
+    )
+    return normalizeTask(response)
+  },
+
+  retryGenBoxPush: async (taskId: string) => {
+    const response = await apiClient.post<Record<string, never>, ImageTask>(
+      `/api/image-tasks/${encodeURIComponent(taskId)}/retry-genbox-push`,
+      {},
     )
     return normalizeTask(response)
   },

@@ -1,0 +1,241 @@
+from __future__ import annotations
+
+import threading
+from collections.abc import Callable
+from pathlib import Path
+from typing import Any
+
+from services.config import DATA_DIR
+from services.genbox_push_service import GenBoxPushService, genbox_push_service
+from services.json_file import read_json_object, write_json_file
+from utils.timezone import beijing_now_str
+
+
+OUTBOX_FILE = DATA_DIR / "genbox_push_outbox.json"
+OUTBOX_STATUSES = {"queued", "sending", "succeeded", "failed"}
+
+
+class GenBoxPushOutbox:
+    """Persist requested generation Pushes without blocking image storage."""
+
+    def __init__(
+        self,
+        *,
+        state_file: Path = OUTBOX_FILE,
+        push_service: GenBoxPushService | Any = genbox_push_service,
+        worker_factory: Callable[..., threading.Thread] = threading.Thread,
+    ) -> None:
+        self.state_file = state_file
+        self.push_service = push_service
+        self.worker_factory = worker_factory
+        self._lock = threading.RLock()
+        self._worker: threading.Thread | None = None
+        self._recovered = False
+        # Prompt text is intentionally memory-only. It can enrich an immediate
+        # Push but is never written to durable transfer state or normal logs.
+        self._metadata: dict[str, dict[str, str]] = {}
+
+    @staticmethod
+    def _clean(value: object) -> str:
+        return str(value or "").strip()
+
+    @classmethod
+    def _entry_id(cls, relative_path: str, source_sha256: str) -> str:
+        return f"{relative_path}:{source_sha256}"
+
+    @staticmethod
+    def _safe_error(exc: Exception) -> str:
+        del exc
+        return "GenBox Push failed; the source image was retained. Check the destination and retry."
+
+    def _load_locked(self) -> dict[str, dict[str, Any]]:
+        raw = read_json_object(self.state_file, name=self.state_file.name)
+        items = raw.get("items") if isinstance(raw.get("items"), dict) else {}
+        items = {
+            str(key): dict(value)
+            for key, value in items.items()
+            if isinstance(value, dict) and str(value.get("status") or "") in OUTBOX_STATUSES
+        }
+        if not self._recovered:
+            self._recovered = True
+            changed = False
+            for item in items.values():
+                if item.get("status") == "sending":
+                    item.update({"status": "queued", "updated_at": beijing_now_str()})
+                    changed = True
+            if changed:
+                self._save_locked(items)
+        return items
+
+    def _save_locked(self, items: dict[str, dict[str, Any]]) -> None:
+        write_json_file(self.state_file, {"items": items})
+        try:
+            self.state_file.chmod(0o600)
+            self.state_file.with_suffix(self.state_file.suffix + ".bak").chmod(0o600)
+        except OSError:
+            pass
+
+    @staticmethod
+    def _public(item: dict[str, Any]) -> dict[str, object]:
+        return {
+            "status": str(item.get("status") or "queued"),
+            "attempts": max(0, int(item.get("attempts") or 0)),
+            "updated_at": str(item.get("updated_at") or ""),
+            "result": dict(item.get("result") or {}) if isinstance(item.get("result"), dict) else None,
+            "error": str(item.get("error") or ""),
+            "source_retained": True,
+        }
+
+    def enqueue(
+        self,
+        relative_path: str,
+        source_sha256: str,
+        *,
+        created_at: str = "",
+        prompt: str = "",
+        model: str = "",
+        start_worker: bool = True,
+    ) -> dict[str, object]:
+        path = self._clean(relative_path).replace("\\", "/").lstrip("/")
+        digest = self._clean(source_sha256).lower()
+        if not path or len(digest) != 64 or any(char not in "0123456789abcdef" for char in digest):
+            raise ValueError("Invalid generated image transfer identity.")
+        entry_id = self._entry_id(path, digest)
+        now = beijing_now_str()
+        with self._lock:
+            items = self._load_locked()
+            item = items.get(entry_id)
+            if item is None:
+                item = {
+                    "path": path,
+                    "source_sha256": digest,
+                    "created_at": self._clean(created_at),
+                    "model": self._clean(model),
+                    "status": "queued",
+                    "attempts": 0,
+                    "updated_at": now,
+                }
+                items[entry_id] = item
+                self._save_locked(items)
+            self._metadata[entry_id] = {
+                "prompt": self._clean(prompt),
+                "model": self._clean(model),
+                "created_at": self._clean(created_at),
+            }
+            result = self._public(item)
+            if start_worker and result["status"] == "queued":
+                self._ensure_worker_locked()
+            return result
+
+    def status_for_path(self, relative_path: str) -> dict[str, object] | None:
+        path = self._clean(relative_path).replace("\\", "/").lstrip("/")
+        if not path:
+            return None
+        with self._lock:
+            items = self._load_locked()
+            matches = [item for item in items.values() if item.get("path") == path]
+            if not matches:
+                return None
+            latest = max(matches, key=lambda item: str(item.get("updated_at") or ""))
+            return self._public(latest)
+
+    def retry_path(self, relative_path: str) -> dict[str, object] | None:
+        path = self._clean(relative_path).replace("\\", "/").lstrip("/")
+        with self._lock:
+            items = self._load_locked()
+            matches = [(entry_id, item) for entry_id, item in items.items() if item.get("path") == path]
+            if not matches:
+                return None
+            entry_id, item = max(matches, key=lambda pair: str(pair[1].get("updated_at") or ""))
+            if item.get("status") != "failed":
+                return None
+            item.update({"status": "queued", "error": "", "updated_at": beijing_now_str()})
+            items[entry_id] = item
+            self._save_locked(items)
+            self._ensure_worker_locked()
+            return self._public(item)
+
+    def resume(self, *, start_worker: bool = True) -> None:
+        """Recover interrupted transfers and resume any durable queued work."""
+        with self._lock:
+            items = self._load_locked()
+            if start_worker and any(item.get("status") == "queued" for item in items.values()):
+                self._ensure_worker_locked()
+
+    def _ensure_worker_locked(self) -> None:
+        if self._worker is not None and self._worker.is_alive():
+            return
+        self._worker = self.worker_factory(target=self._drain, name="genbox-push-outbox", daemon=True)
+        self._worker.start()
+
+    def _claim_next(self) -> tuple[str, dict[str, Any]] | None:
+        with self._lock:
+            items = self._load_locked()
+            candidates = [
+                (entry_id, item)
+                for entry_id, item in items.items()
+                if item.get("status") == "queued"
+            ]
+            if not candidates:
+                return None
+            entry_id, item = min(candidates, key=lambda pair: str(pair[1].get("updated_at") or ""))
+            item.update({"status": "sending", "attempts": int(item.get("attempts") or 0) + 1, "updated_at": beijing_now_str()})
+            items[entry_id] = item
+            self._save_locked(items)
+            return entry_id, dict(item)
+
+    def _finish(self, entry_id: str, *, result: dict[str, object] | None = None, error: str = "") -> None:
+        with self._lock:
+            items = self._load_locked()
+            item = items.get(entry_id)
+            if item is None:
+                self._metadata.pop(entry_id, None)
+                return
+            item.update({
+                "status": "succeeded" if result is not None else "failed",
+                "updated_at": beijing_now_str(),
+                "error": error,
+            })
+            if result is not None:
+                item["result"] = {
+                    "status": str(result.get("status") or ""),
+                    "sha256": str(result.get("sha256") or ""),
+                    "safe_to_delete_source": result.get("safe_to_delete_source") is True,
+                    "source_retained": True,
+                }
+            items[entry_id] = item
+            self._save_locked(items)
+            # The prompt is only needed by the immediate outbound request. Do
+            # not retain it in process memory after a terminal outcome.
+            self._metadata.pop(entry_id, None)
+
+    def _drain(self) -> None:
+        while True:
+            claimed = self._claim_next()
+            if claimed is None:
+                # Clear the worker reference while holding the same lock used by
+                # enqueue(). This closes the gap where a newly queued item could
+                # otherwise be left behind as this worker exits.
+                with self._lock:
+                    items = self._load_locked()
+                    if any(item.get("status") == "queued" for item in items.values()):
+                        continue
+                    if self._worker is threading.current_thread():
+                        self._worker = None
+                return
+            entry_id, item = claimed
+            metadata = self._metadata.get(entry_id, {})
+            try:
+                result = self.push_service.push_image(
+                    str(item["path"]),
+                    created_at=metadata.get("created_at") or str(item.get("created_at") or ""),
+                    prompt=metadata.get("prompt", ""),
+                    model=metadata.get("model") or str(item.get("model") or ""),
+                )
+            except Exception as exc:
+                self._finish(entry_id, error=self._safe_error(exc))
+            else:
+                self._finish(entry_id, result=result)
+
+
+genbox_push_outbox = GenBoxPushOutbox()

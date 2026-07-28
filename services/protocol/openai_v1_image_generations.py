@@ -12,6 +12,10 @@ from services.protocol.conversation import (
 from utils.image_tokens import count_image_output_items_tokens, image_usage
 
 
+def _push_requested(value: object) -> bool:
+    return value is True or str(value or "").strip().lower() == "true"
+
+
 def handle(body: dict[str, Any]) -> dict[str, Any] | Iterator[dict[str, Any]]:
     prompt = str(body.get("prompt") or "")
     model = str(body.get("model") or "gpt-image-2")
@@ -33,6 +37,7 @@ def handle(body: dict[str, Any]) -> dict[str, Any] | Iterator[dict[str, Any]]:
         progress_callback=progress_callback,
         call_id=str(body.get("_call_id") or ""),
         trace_image_perf=bool(body.get("_trace_image_perf")),
+        push_to_genbox=_push_requested(body.get("push_to_genbox")),
     ))
     if body.get("stream"):
         input_text_tokens = count_text_tokens(prompt, model)

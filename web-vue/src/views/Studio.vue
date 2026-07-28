@@ -90,6 +90,7 @@
         @reference-image="referenceGeneratedImage"
         @inpaint-image="openInpaintModal"
         @compare-image="openImageCompare"
+        @retry-genbox-push="retryGenboxPush"
       />
 
       <StudioComposer
@@ -108,6 +109,7 @@
         @update:image-size="imageForm.size = $event"
         @update:image-quality="imageForm.quality = $event"
         @update:image-count="imageForm.n = $event"
+        @update:push-to-gen-box="imageForm.pushToGenBox = $event"
         @submit="sendMessage"
         @stop="stopStreaming"
         @cancel-edit="cancelMessageEdit"
@@ -160,6 +162,7 @@ import { computed, defineAsyncComponent, onBeforeUnmount, ref } from 'vue'
 import { useSettingsStore } from '@/stores/settings'
 import { useToast } from '@/composables/useToast'
 import { useConfirmDialog } from '@/composables/useConfirmDialog'
+import { imageTasksApi } from '@/api/imageTasks'
 import { usePageRuntime } from '@/composables/usePageRuntime'
 import { preloadPromptLibrary } from '@/composables/usePromptLibraryRuntime'
 import StudioPromptPicker from '@/components/studio/StudioPromptPicker.vue'
@@ -443,6 +446,17 @@ function clearConversationNotice(conversationId: string) {
 
 function stopStreaming() {
   chatStreamRuntime.stop()
+}
+
+async function retryGenboxPush(taskId: string) {
+  try {
+    const task = await imageTasksApi.retryGenBoxPush(taskId)
+    imageTaskRuntime.merge([task])
+    imageTaskRuntime.schedulePoll()
+    toast.success('已重新加入 GenBox 推送队列；图片生成结果保持不变。')
+  } catch (error) {
+    toast.error(studioErrorMessage(error, '无法重新提交 GenBox 推送'))
+  }
 }
 
 async function appendFiles(files: File[]) {

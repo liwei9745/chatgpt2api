@@ -46,6 +46,17 @@ export function useStudioImageTaskRuntime(input: StudioImageTaskRuntimeInput) {
     return Array.from(new Set(ids)).slice(0, 80)
   })
   const pendingImageTaskIds = computed(() => input.conversationRuntimeIndex.value.pendingImageTaskIds)
+  const activeGenBoxPushTaskIds = computed(() => imageTasks.value
+    .filter((task) => task.data?.some((asset) => {
+      const status = asset.genbox_push?.status
+      return status === 'queued' || status === 'sending'
+    }))
+    .map((task) => task.id)
+    .filter(Boolean))
+  const refreshableImageTaskIds = computed(() => Array.from(new Set([
+    ...pendingImageTaskIds.value,
+    ...activeGenBoxPushTaskIds.value,
+  ])))
   const requestedImageTaskIds = computed(() => Array.from(new Set([
     ...activeImageTaskIds.value,
     ...pendingImageTaskIds.value,
@@ -193,7 +204,7 @@ export function useStudioImageTaskRuntime(input: StudioImageTaskRuntimeInput) {
   function schedulePoll() {
     input.pageRuntime.clearInterval(IMAGE_POLL_TIMER_KEY)
     if (!input.pageRuntime.canRun.value) return
-    if (!pendingImageTaskIds.value.length) return
+    if (!refreshableImageTaskIds.value.length) return
     input.pageRuntime.setInterval(IMAGE_POLL_TIMER_KEY, 4000, () => {
       void refresh(true)
     })
@@ -216,12 +227,12 @@ export function useStudioImageTaskRuntime(input: StudioImageTaskRuntimeInput) {
   }
 
   const stopRequestedImageTaskWatch = watch(requestedImageTaskIds, () => scheduleRefresh())
-  const stopPendingImageTaskWatch = watch(pendingImageTaskIds, schedulePoll)
+  const stopRefreshableImageTaskWatch = watch(refreshableImageTaskIds, schedulePoll)
 
   function dispose() {
     deactivate()
     stopRequestedImageTaskWatch()
-    stopPendingImageTaskWatch()
+    stopRefreshableImageTaskWatch()
   }
 
   return {

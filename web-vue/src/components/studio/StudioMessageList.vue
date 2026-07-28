@@ -26,6 +26,7 @@
           @reference-image="forwardReferenceImage"
           @inpaint-image="forwardInpaintImage"
           @compare-image="forwardCompareImage"
+          @retry-genbox-push="$emit('retry-genbox-push', $event)"
         />
       </div>
     </div>
@@ -138,6 +139,7 @@ const emit = defineEmits<{
   'reference-image': [asset: StudioImageAssetView, name: string, message: StudioMessage]
   'inpaint-image': [asset: StudioImageAssetView, name: string, message: StudioMessage]
   'compare-image': [source: StudioImageCompareSource, asset: StudioImageAssetView, name: string]
+  'retry-genbox-push': [taskId: string]
 }>()
 
 type MessageViewSignatureValue = string | number | boolean | null | undefined
@@ -342,6 +344,9 @@ function assetSignature(asset: ImageTaskAsset) {
     compactStringSignature(asset.url),
     compactStringSignature(asset.path),
     compactStringSignature(asset.b64_json),
+    compactStringSignature(asset.genbox_push?.status),
+    compactStringSignature(asset.genbox_push?.updated_at),
+    compactStringSignature(asset.genbox_push?.error),
     positiveDimension(asset.width) || '',
     positiveDimension(asset.height) || '',
   ].join('\u001f')
@@ -406,6 +411,7 @@ function buildImageAssetViews(assets: readonly ImageTaskAsset[]): StudioImageAss
       path: String(asset.path || ''),
       width: positiveDimension(asset.width),
       height: positiveDimension(asset.height),
+      genboxPush: asset.genbox_push,
     })
   }
   return views

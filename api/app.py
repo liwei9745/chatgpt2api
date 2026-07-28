@@ -17,6 +17,7 @@ from services.backup_service import backup_service
 from services.config import config
 from services.dashboard_metrics_service import dashboard_metrics_service
 from services.image_service import start_image_cleanup_scheduler
+from services.genbox_push_outbox import genbox_push_outbox
 from services.log_service import cleanup_old_logs, start_log_cleanup_scheduler
 from services.realtime_monitor_service import realtime_monitor_service
 from utils.log import logger
@@ -53,6 +54,7 @@ def create_app() -> FastAPI:
     @asynccontextmanager
     async def lifespan(_: FastAPI):
         _configure_threadpool()
+        genbox_push_outbox.resume()
         account_service.cleanup_auto_remove_accounts()
         stop_event = Event()
         thread = start_limited_account_watcher(stop_event)

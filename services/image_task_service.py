@@ -18,6 +18,7 @@ from services.image_failure import (
     image_failure,
     public_image_error_message,
 )
+from services.genbox_push_outbox import genbox_push_outbox
 from services.json_file import read_json_file, write_json_file
 from services.log_service import LOG_TYPE_CALL, collect_image_attempts, log_service
 from services.protocol import openai_v1_image_edit, openai_v1_image_generations
@@ -196,6 +197,17 @@ def _public_task(task: dict[str, Any]) -> dict[str, Any]:
         item["progress"] = task.get("progress")
     if task.get("duration_ms") is not None:
         item["duration_ms"] = task.get("duration_ms")
+    if isinstance(task.get("data"), list):
+        data: list[dict[str, Any]] = []
+        for asset in task["data"]:
+            copied = dict(asset) if isinstance(asset, dict) else {}
+            path = _clean(copied.get("path"))
+            if path:
+                state = genbox_push_outbox.status_for_path(path)
+                if state is not None:
+                    copied["genbox_push"] = state
+            data.append(copied)
+        item["data"] = data
     if task.get("status") in (TASK_STATUS_RUNNING, TASK_STATUS_QUEUED):
         if task.get("status") == TASK_STATUS_RUNNING:
             # RUNNING 状态仅在 started_ts 被设置后（image_stream_resolve_start）才计时
@@ -242,6 +254,7 @@ class ImageTaskService:
         n: int = 1,
         size: str | None = None,
         quality: str = "auto",
+        push_to_genbox: bool = False,
         base_url: str = "",
     ) -> dict[str, Any]:
         payload = {
@@ -252,6 +265,7 @@ class ImageTaskService:
             "quality": quality,
             "response_format": "url",
             "base_url": base_url,
+            "push_to_genbox": bool(push_to_genbox),
         }
         return self._submit(identity, client_task_id=client_task_id, mode="generate", payload=payload)
 
@@ -268,6 +282,7 @@ class ImageTaskService:
         base_url: str = "",
         images: list[tuple[bytes, str, str]] | None = None,
         masks: list[tuple[bytes, str, str]] | None = None,
+        push_to_genbox: bool = False,
     ) -> dict[str, Any]:
         payload = {
             "prompt": prompt,
@@ -279,6 +294,7 @@ class ImageTaskService:
             "quality": quality,
             "response_format": "url",
             "base_url": base_url,
+            "push_to_genbox": bool(push_to_genbox),
         }
         return self._submit(identity, client_task_id=client_task_id, mode="edit", payload=payload)
 
@@ -305,6 +321,25 @@ class ImageTaskService:
                 items.sort(key=lambda item: str(item.get("updated_at") or ""), reverse=True)
                 missing_ids = []
             return {"items": items, "missing_ids": missing_ids}
+
+    def retry_genbox_push(self, identity: dict[str, object], task_id: str) -> dict[str, Any]:
+        owner = _owner_id(identity)
+        key = _task_key(owner, _clean(task_id))
+        with self._lock:
+            task = self._tasks.get(key)
+            if task is None:
+                raise ValueError("image task not found")
+            paths = [
+                _clean(asset.get("path"))
+                for asset in task.get("data") or []
+                if isinstance(asset, dict) and _clean(asset.get("path"))
+            ]
+            if not paths:
+                raise ValueError("this image task has no stored images to push")
+            retried = [genbox_push_outbox.retry_path(path) for path in dict.fromkeys(paths)]
+            if not any(result is not None for result in retried):
+                raise ValueError("no GenBox Push transfer is available for this image task")
+            return _public_task(task)
 
     def _submit(
         self,

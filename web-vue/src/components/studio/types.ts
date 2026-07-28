@@ -65,6 +65,7 @@ export interface StudioImageAssetView {
   path: string
   width?: number
   height?: number
+  genboxPush?: import('@/api/imageTasks').ImageTaskAsset['genbox_push']
 }
 
 export interface StudioImageCompareSource {
@@ -83,6 +84,7 @@ export interface StudioImageForm {
   size: string
   quality: string
   n: number
+  pushToGenBox: boolean
 }
 
 export interface StudioPreviewImage {

@@ -32,6 +32,7 @@ from services.image_failure import (
     public_image_error_message,
     terminal_assistant_text,
 )
+from services.genbox_push_outbox import genbox_push_outbox
 from services.image_storage_service import image_storage_service
 from services.openai_backend_api import OpenAIBackendAPI
 from services.proxy_service import proxy_settings
@@ -334,11 +335,11 @@ def encode_images(images: Iterable[tuple[bytes, str, str]]) -> list[str]:
     return [base64.b64encode(data).decode("ascii") for data, _, _ in images if data]
 
 
-def save_image_bytes(image_data: bytes, base_url: str | None = None) -> str:
+def save_image_bytes(image_data: bytes, base_url: str | None = None) -> Any:
     last_error: Exception | None = None
     for attempt in range(2):
         try:
-            return image_storage_service.save(image_data, base_url).url
+            return image_storage_service.save(image_data, base_url)
         except Exception as exc:
             last_error = exc
             logger.warning({
@@ -468,6 +469,8 @@ def format_image_result(
     base_url: str | None = None,
     created: int | None = None,
     message: str = "",
+    model: str = "",
+    push_to_genbox: bool = False,
 ) -> dict[str, Any]:
     data: list[dict[str, Any]] = []
     image_urls: list[str] = []
@@ -477,10 +480,11 @@ def format_image_result(
             continue
         revised_prompt = str(item.get("revised_prompt") or prompt).strip() or prompt
         image_bytes = base64.b64decode(b64_json)
-        stored_url = save_image_bytes(image_bytes, base_url)
+        stored = save_image_bytes(image_bytes, base_url)
+        stored_url = stored.url
         if stored_url:
             image_urls.append(stored_url)
-        asset: dict[str, Any] = {"revised_prompt": revised_prompt}
+        asset: dict[str, Any] = {"revised_prompt": revised_prompt, "path": stored.rel}
         if response_format == "b64_json":
             asset["b64_json"] = b64_json
         else:
@@ -488,6 +492,14 @@ def format_image_result(
         dimensions = image_size_from_bytes(image_bytes)
         if dimensions:
             asset["width"], asset["height"] = dimensions
+        if push_to_genbox:
+            asset["genbox_push"] = genbox_push_outbox.enqueue(
+                stored.rel,
+                hashlib.sha256(image_bytes).hexdigest(),
+                created_at=str(created or int(time.time())),
+                prompt=revised_prompt,
+                model=model,
+            )
         data.append(asset)
     result: dict[str, Any] = {"created": created or int(time.time()), "data": data}
     if image_urls:
@@ -514,6 +526,7 @@ class ConversationRequest:
     call_id: str = ""
     trace_image_perf: bool = False
     monitor_attempt: int = 0
+    push_to_genbox: bool = False
 
 
 @dataclass
@@ -1546,6 +1559,8 @@ def _image_result_output_from_urls(
         request.response_format,
         request.base_url,
         int(time.time()),
+        model=request.model,
+        push_to_genbox=request.push_to_genbox,
     )
     data = formatted["data"]
     if not data:
@@ -1931,6 +1946,8 @@ def stream_codex_image_outputs(
         request.response_format,
         request.base_url,
         int(time.time()),
+        model=request.model,
+        push_to_genbox=request.push_to_genbox,
     )
     data = formatted["data"]
     if data:

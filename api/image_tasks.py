@@ -19,6 +19,7 @@ class ImageGenerationTaskRequest(BaseModel):
     n: int = Field(default=1, ge=1, le=4)
     size: str | None = None
     quality: str = "auto"
+    push_to_genbox: bool = False
 
 
 class ResumePollRequest(BaseModel):
@@ -27,6 +28,10 @@ class ResumePollRequest(BaseModel):
 
 def _parse_task_ids(value: str) -> list[str]:
     return [item.strip() for item in value.split(",") if item.strip()]
+
+
+def _push_requested(value: object) -> bool:
+    return value is True or str(value or "").strip().lower() == "true"
 
 
 def _image_quota_payload(stats: dict) -> dict[str, object]:
@@ -90,6 +95,7 @@ def create_router() -> APIRouter:
                 n=body.n,
                 size=body.size,
                 quality=body.quality,
+                push_to_genbox=body.push_to_genbox,
                 base_url=resolve_image_base_url(request),
             )
         except ValueError as exc:
@@ -123,6 +129,7 @@ def create_router() -> APIRouter:
                 base_url=resolve_image_base_url(request),
                 images=images,
                 masks=masks,
+                push_to_genbox=_push_requested(payload.get("push_to_genbox")),
             )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
@@ -142,6 +149,17 @@ def create_router() -> APIRouter:
                 task_id,
                 body.extra_timeout_secs,
             )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
+
+    @router.post("/api/image-tasks/{task_id}/retry-genbox-push")
+    async def retry_genbox_push(
+        task_id: str,
+        authorization: str | None = Header(default=None),
+    ):
+        identity = require_identity(authorization)
+        try:
+            return await run_in_threadpool(image_task_service.retry_genbox_push, identity, task_id)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
 

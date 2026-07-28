@@ -129,6 +129,16 @@
 
                 <div v-if="settingsOpen" class="studio-size-popover" @click.stop>
                   <div class="studio-size-section">
+                    <Checkbox
+                      :model-value="imageForm.pushToGenBox"
+                      :disabled="isSending"
+                      @update:model-value="$emit('update:pushToGenBox', Boolean($event))"
+                    >
+                      生成后推送到 GenBox
+                    </Checkbox>
+                    <p class="studio-size-hint">图片会先保存在本机；推送失败不会影响生成，也不会删除源图。</p>
+                  </div>
+                  <div class="studio-size-section">
                     <div class="studio-size-label">模型</div>
                     <GroupedSelectMenu
                       v-model="imageModelValue"
@@ -245,7 +255,7 @@
 <script setup lang="ts">
 import { Icon } from '@iconify/vue'
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
-import { Button } from 'nanocat-ui'
+import { Button, Checkbox } from 'nanocat-ui'
 import type { ActionMenuItem } from 'nanocat-ui'
 import FloatingActionMenu from '@/components/ai/FloatingActionMenu.vue'
 import GroupedSelectMenu from '@/components/ui/GroupedSelectMenu.vue'
@@ -288,6 +298,7 @@ const emit = defineEmits<{
   'update:imageSize': [size: string]
   'update:imageQuality': [quality: string]
   'update:imageCount': [count: number]
+  'update:pushToGenBox': [enabled: boolean]
   submit: []
   stop: []
   'cancel-edit': []
@@ -962,6 +973,13 @@ onBeforeUnmount(() => {
   color: hsl(var(--muted-foreground));
   font-size: 0.75rem;
   font-weight: 700;
+}
+
+.studio-size-hint {
+  margin: 0.35rem 0 0;
+  color: hsl(var(--muted-foreground));
+  font-size: 0.75rem;
+  line-height: 1.35;
 }
 
 .studio-choice-grid {

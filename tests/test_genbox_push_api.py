@@ -15,6 +15,7 @@ from api.app import create_app
 class StubPushService:
     def __init__(self) -> None:
         self.saved: dict[str, object] | None = None
+        self.pushed: tuple[str, dict[str, object]] | None = None
 
     def get_settings(self) -> dict[str, object]:
         return {
@@ -33,6 +34,7 @@ class StubPushService:
         return {"ok": True, "contract_version": "v1", "max_image_bytes": 1024}
 
     def push_image(self, path: str, **kwargs: object) -> dict[str, object]:
+        self.pushed = (path, kwargs)
         return {
             "status": "imported",
             "sha256": "a" * 64,
@@ -77,6 +79,20 @@ class GenBoxPushApiTests(unittest.TestCase):
         self.assertEqual(probe.status_code, 200)
         self.assertEqual(pushed.status_code, 200)
         self.assertTrue(pushed.json()["result"]["source_retained"])
+
+    def test_image_push_forwards_server_owned_metadata(self) -> None:
+        response = self.client.post("/api/genbox-push/images", headers=self.headers, json={
+            "path": "2026/07/28/image.png",
+            "created_at": "2026-07-28 12:00:00",
+            "prompt": "local prompt",
+            "model": "local-model",
+        })
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(self.stub.pushed, (
+            "2026/07/28/image.png",
+            {"created_at": "2026-07-28 12:00:00", "prompt": "local prompt", "model": "local-model"},
+        ))
 
 
 if __name__ == "__main__":

@@ -197,6 +197,22 @@
                           <span>对比</span>
                         </Button>
                       </div>
+                      <div v-if="asset.genboxPush" class="studio-genbox-push-status" :class="`is-${asset.genboxPush.status}`">
+                        <Icon :icon="genboxPushIcon(asset.genboxPush.status)" class="h-3.5 w-3.5" />
+                        <span>{{ genboxPushLabel(asset.genboxPush) }}</span>
+                        <Button
+                          v-if="asset.genboxPush.status === 'failed' && message.taskId"
+                          size="xs"
+                          variant="outline"
+                          root-class="studio-result-action"
+                          title="重试推送到 GenBox"
+                          aria-label="重试推送到 GenBox"
+                          @click="$emit('retry-genbox-push', message.taskId)"
+                        >
+                          <Icon icon="lucide:refresh-cw" class="h-3.5 w-3.5" />
+                          <span>重试</span>
+                        </Button>
+                      </div>
                     </div>
                   </div>
 
@@ -299,7 +315,21 @@ defineEmits<{
   'reference-image': [asset: StudioImageAssetView, name: string, message: StudioMessage]
   'inpaint-image': [asset: StudioImageAssetView, name: string, message: StudioMessage]
   'compare-image': [source: StudioImageCompareSource, asset: StudioImageAssetView, name: string]
+  'retry-genbox-push': [taskId: string]
 }>()
+
+function genboxPushIcon(status: string) {
+  if (status === 'succeeded') return 'lucide:circle-check'
+  if (status === 'failed') return 'lucide:circle-alert'
+  return 'lucide:loader-circle'
+}
+
+function genboxPushLabel(state: NonNullable<StudioImageAssetView['genboxPush']>) {
+  if (state.status === 'succeeded') return '已推送到 GenBox，源图已保留'
+  if (state.status === 'failed') return state.error || '推送失败，源图已保留'
+  if (state.status === 'sending') return '正在推送到 GenBox'
+  return '已加入 GenBox 推送队列'
+}
 
 function actionsForMessage(message: StudioMessageView): StudioMessageAction[] {
   const actions: StudioMessageAction[] = []
@@ -1212,6 +1242,33 @@ function isCodeMessage(message: StudioMessageView) {
   flex-wrap: wrap;
   align-items: center;
   gap: 0.35rem;
+}
+
+.studio-genbox-push-status {
+  display: flex;
+  min-width: 0;
+  flex: 1 1 100%;
+  align-items: center;
+  gap: 0.3rem;
+  color: hsl(var(--muted-foreground));
+  line-height: 1.35;
+}
+
+.studio-genbox-push-status.is-succeeded {
+  color: rgb(21 128 61);
+}
+
+.studio-genbox-push-status.is-failed {
+  color: rgb(190 24 93);
+}
+
+.studio-genbox-push-status.is-queued svg,
+.studio-genbox-push-status.is-sending svg {
+  animation: studio-genbox-push-spin 1s linear infinite;
+}
+
+@keyframes studio-genbox-push-spin {
+  to { transform: rotate(360deg); }
 }
 
 .studio-result-action {
