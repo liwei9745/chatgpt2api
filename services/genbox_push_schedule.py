@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 import hashlib
+import os
 import threading
+import time
 import uuid
 from collections.abc import Callable
 from datetime import datetime, timedelta
@@ -54,6 +57,7 @@ class GenBoxPushScheduleService:
         self.now = now
         self.worker_factory = worker_factory
         self._lock = _file_lock(state_file)
+        self._lease_lock_file = state_file.with_suffix(state_file.suffix + ".lease-lock")
         self._stop = threading.Event()
         self._worker: threading.Thread | None = None
 
@@ -99,6 +103,34 @@ class GenBoxPushScheduleService:
                 path.chmod(0o600)
             except OSError:
                 pass
+
+    @contextmanager
+    def _lease_file_guard(self):
+        """Serialize lease changes between separate sender processes."""
+        descriptor: int | None = None
+        try:
+            try:
+                descriptor = os.open(self._lease_lock_file, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            except FileExistsError:
+                try:
+                    # The guard is held only while reading or writing one JSON
+                    # record. A stale file can therefore only be a crashed
+                    # process, not a long-running Push operation.
+                    if time.time() - self._lease_lock_file.stat().st_mtime > 30:
+                        self._lease_lock_file.unlink()
+                        descriptor = os.open(self._lease_lock_file, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                except OSError:
+                    pass
+            yield descriptor is not None
+        finally:
+            if descriptor is not None:
+                try:
+                    os.close(descriptor)
+                finally:
+                    try:
+                        self._lease_lock_file.unlink()
+                    except OSError:
+                        pass
 
     @staticmethod
     def _validate(payload: dict[str, object], current: dict[str, object]) -> dict[str, object]:
@@ -176,12 +208,22 @@ class GenBoxPushScheduleService:
         self._save_locked(state)
         return token
 
+    def _claim_lease(self, now: datetime) -> str | None:
+        with self._lease_file_guard() as guarded:
+            if not guarded:
+                return None
+            with self._lock:
+                return self._acquire_lease(self._load_locked(), now)
+
     def _release_lease(self, token: str) -> None:
-        with self._lock:
-            state = self._load_locked()
-            if str(state["lease"].get("token") or "") == token:
-                state["lease"] = {}
-                self._save_locked(state)
+        with self._lease_file_guard() as guarded:
+            if not guarded:
+                return
+            with self._lock:
+                state = self._load_locked()
+                if str(state["lease"].get("token") or "") == token:
+                    state["lease"] = {}
+                    self._save_locked(state)
 
     def _sync_batches_locked(self, state: dict[str, Any], now: datetime) -> None:
         for item in state["items"].values():
@@ -230,11 +272,9 @@ class GenBoxPushScheduleService:
 
     def run_now(self) -> dict[str, object]:
         now = self.now().astimezone(BEIJING_TZ)
-        with self._lock:
-            state = self._load_locked()
-            token = self._acquire_lease(state, now)
-            if token is None:
-                raise ValueError("Another automatic Push scan is already running. Wait for it to finish.")
+        token = self._claim_lease(now)
+        if token is None:
+            raise ValueError("Another automatic Push scan is already running. Wait for it to finish.")
         try:
             with self._lock:
                 state = self._load_locked()
@@ -301,17 +341,20 @@ class GenBoxPushScheduleService:
 
     def run_due_once(self) -> dict[str, object] | None:
         now = self.now().astimezone(BEIJING_TZ)
-        with self._lock:
-            state = self._load_locked()
-            schedule = state["schedule"]
-            if not schedule.get("enabled") or now.weekday() != int(schedule.get("weekday") or 0):
+        with self._lease_file_guard() as guarded:
+            if not guarded:
                 return None
-            if now.strftime("%H:%M") < str(schedule.get("time") or "09:00"):
-                return None
-            if str(schedule.get("last_scheduled_date") or "") == now.date().isoformat():
-                return None
-            schedule["last_scheduled_date"] = now.date().isoformat()
-            self._save_locked(state)
+            with self._lock:
+                state = self._load_locked()
+                schedule = state["schedule"]
+                if not schedule.get("enabled") or now.weekday() != int(schedule.get("weekday") or 0):
+                    return None
+                if now.strftime("%H:%M") < str(schedule.get("time") or "09:00"):
+                    return None
+                if str(schedule.get("last_scheduled_date") or "") == now.date().isoformat():
+                    return None
+                schedule["last_scheduled_date"] = now.date().isoformat()
+                self._save_locked(state)
         try:
             return self.run_now()
         except Exception:
@@ -324,11 +367,9 @@ class GenBoxPushScheduleService:
 
     def _resume_pending(self) -> None:
         now = self.now().astimezone(BEIJING_TZ)
-        with self._lock:
-            state = self._load_locked()
-            token = self._acquire_lease(state, now)
-            if token is None:
-                return
+        token = self._claim_lease(now)
+        if token is None:
+            return
         try:
             with self._lock:
                 state = self._load_locked()

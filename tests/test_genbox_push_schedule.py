@@ -90,10 +90,14 @@ class GenBoxPushScheduleTests(unittest.TestCase):
         self.assertTrue(second["source_retained"])
 
     def test_lease_blocks_another_worker_and_expired_lease_recovers(self) -> None:
-        with self.service._lock:
-            state = self.service._load_locked()
-            token = self.service._acquire_lease(state, self.current)
         other = self._service()
+        with self.service._lease_file_guard() as guarded:
+            self.assertTrue(guarded)
+            with self.assertRaisesRegex(ValueError, "already running"):
+                other.run_now()
+
+        token = self.service._claim_lease(self.current)
+        self.assertIsNotNone(token)
         with self.assertRaisesRegex(ValueError, "already running"):
             other.run_now()
         self.service._release_lease(str(token))
