@@ -34,6 +34,14 @@ class GenBoxPushSettings:
     timeout_secs: int
 
 
+@dataclass(frozen=True)
+class GenBoxPushTransferContext:
+    """An in-memory configuration snapshot for one coordinated Push."""
+
+    settings: GenBoxPushSettings
+    scope: str
+
+
 def _clean(value: object) -> str:
     return str(value or "").strip()
 
@@ -219,11 +227,23 @@ class GenBoxPushService:
         """Return the current content identity without contacting GenBox."""
         return hashlib.sha256(self.image_reader(relative_path)).hexdigest()
 
-    def transfer_scope(self) -> str:
-        """Use only a one-way, non-secret destination identity for sharing."""
-        settings = self._configured_settings()
+    @staticmethod
+    def _transfer_scope_for(settings: GenBoxPushSettings) -> str:
         identity = f"{settings.base_url}\n{settings.source_id}\n{settings.push_key}".encode("utf-8")
         return hashlib.sha256(identity).hexdigest()
+
+    def capture_transfer_context(self) -> GenBoxPushTransferContext:
+        """Capture the destination used to key and execute one coordinated Push."""
+        with self._lock:
+            settings = self._configured_settings()
+            return GenBoxPushTransferContext(
+                settings=settings,
+                scope=self._transfer_scope_for(settings),
+            )
+
+    def transfer_scope(self) -> str:
+        """Use only a one-way, non-secret destination identity for sharing."""
+        return self.capture_transfer_context().scope
 
     @staticmethod
     def _content_type(relative_path: str) -> str:
@@ -250,9 +270,20 @@ class GenBoxPushService:
         prompt: str = "",
         model: str = "",
         expected_sha256: str | None = None,
+        _transfer_context: GenBoxPushTransferContext | None = None,
     ) -> dict[str, object]:
         with self._lock:
             settings = self._configured_settings()
+            if _transfer_context is not None:
+                context_scope = self._transfer_scope_for(_transfer_context.settings)
+                if (
+                    _transfer_context.scope != context_scope
+                    or self._transfer_scope_for(settings) != _transfer_context.scope
+                ):
+                    raise GenBoxPushError(
+                        "The GenBox Push configuration changed before this image could be sent; it was retained. Retry the send."
+                    )
+                settings = _transfer_context.settings
             payload = self.image_reader(relative_path)
             digest = hashlib.sha256(payload).hexdigest()
             if expected_sha256 is not None and digest != expected_sha256:

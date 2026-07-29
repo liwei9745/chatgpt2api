@@ -51,6 +51,23 @@ class FailingPushService:
         }
 
 
+class ContextAwarePushService:
+    def __init__(self) -> None:
+        self.received_contexts: list[object] = []
+
+    def capture_transfer_context(self) -> object:
+        return type("Context", (), {"scope": "test-scope"})()
+
+    def push_image(self, _path: str, **kwargs: object) -> dict[str, object]:
+        self.received_contexts.append(kwargs["_transfer_context"])
+        return {
+            "status": "imported",
+            "sha256": str(kwargs["expected_sha256"]),
+            "safe_to_delete_source": False,
+            "source_retained": True,
+        }
+
+
 class GenBoxPushTransferCoordinatorTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = Path(tempfile.mkdtemp())
@@ -197,6 +214,18 @@ class GenBoxPushTransferCoordinatorTests(unittest.TestCase):
         self.assertEqual(sender.calls, 2)
         self.assertEqual(result["sha256"], digest)
         self.assertNotIn("untrusted transport detail", str(coordinator._inflight))
+
+    def test_coordinator_passes_the_captured_destination_context_to_the_send(self) -> None:
+        path = "2026/07/28/shared.png"
+        digest = hashlib.sha256(b"synthetic-shared-image").hexdigest()
+        sender = ContextAwarePushService()
+        coordinator = GenBoxPushTransferCoordinator()
+
+        result = coordinator.push_image(sender, path, digest)
+
+        self.assertEqual(result["sha256"], digest)
+        self.assertEqual(len(sender.received_contexts), 1)
+        self.assertEqual(getattr(sender.received_contexts[0], "scope", ""), "test-scope")
 
 
 if __name__ == "__main__":

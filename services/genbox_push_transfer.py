@@ -39,7 +39,15 @@ class GenBoxPushTransferCoordinator:
         return Path(*parts).as_posix()
 
     @staticmethod
-    def _key(push_service: Any, relative_path: str, source_sha256: str) -> str:
+    def _capture_context(push_service: Any) -> tuple[object | None, str]:
+        capture = getattr(push_service, "capture_transfer_context", None)
+        if callable(capture):
+            context = capture()
+            scope = str(getattr(context, "scope", ""))
+            if not scope:
+                raise GenBoxPushError("The GenBox Push destination is unavailable; retry after checking its configuration.")
+            return context, scope
+
         scope = getattr(push_service, "transfer_scope", None)
         if callable(scope):
             destination_scope = str(scope())
@@ -48,7 +56,7 @@ class GenBoxPushTransferCoordinator:
             # Their object identity still lets all local entry points share one
             # coordinator without claiming a cross-instance guarantee.
             destination_scope = f"service:{id(push_service)}"
-        return "\n".join((destination_scope, relative_path, source_sha256))
+        return None, destination_scope
 
     @staticmethod
     def _safe_failure() -> GenBoxPushError:
@@ -86,7 +94,8 @@ class GenBoxPushTransferCoordinator:
             prompt=prompt,
             model=model,
         )
-        key = self._key(push_service, path, digest)
+        context, destination_scope = self._capture_context(push_service)
+        key = "\n".join((destination_scope, path, digest))
         owner = False
         with self._lock:
             transfer = self._inflight.get(key)
@@ -113,13 +122,15 @@ class GenBoxPushTransferCoordinator:
                     transfer.waiters -= 1
 
         try:
-            result = push_service.push_image(
-                path,
-                created_at=created_at,
-                prompt=prompt,
-                model=model,
-                expected_sha256=digest,
-            )
+            kwargs: dict[str, object] = {
+                "created_at": created_at,
+                "prompt": prompt,
+                "model": model,
+                "expected_sha256": digest,
+            }
+            if context is not None:
+                kwargs["_transfer_context"] = context
+            result = push_service.push_image(path, **kwargs)
             if str(result.get("sha256") or "").lower() != digest:
                 raise self._safe_failure()
             transfer.result = {

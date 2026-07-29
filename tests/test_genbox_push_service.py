@@ -231,6 +231,16 @@ class GenBoxPushServiceTests(unittest.TestCase):
         self.assertNotEqual(before, after)
         self.assertNotIn("rotated-local-test-key", after)
 
+    def test_captured_transfer_context_refuses_a_rotated_destination_before_request(self) -> None:
+        self.configure()
+        context = self.service.capture_transfer_context()
+        self.service.update_settings({"push_key": "rotated-local-test-key"})
+
+        with self.assertRaisesRegex(GenBoxPushError, "configuration changed"):
+            self.service.push_image("2026/07/28/image.png", _transfer_context=context)
+
+        self.assertEqual(self.factory.sessions, [])
+
 
 if __name__ == "__main__":
     unittest.main()
