@@ -8,6 +8,7 @@ from api.support import require_admin
 from services.genbox_push_batch import genbox_push_batch_service
 from services.genbox_push_schedule import genbox_push_schedule_service
 from services.genbox_push_service import GenBoxPushError, genbox_push_service
+from services.genbox_push_transfer import GenBoxPushTransferCoordinator, genbox_push_transfer_coordinator
 
 
 class GenBoxPushSettingsRequest(BaseModel):
@@ -78,9 +79,13 @@ def create_router() -> APIRouter:
     async def push_image(body: GenBoxPushImageRequest, authorization: str | None = Header(default=None)):
         require_admin(authorization)
         try:
+            path = GenBoxPushTransferCoordinator.normalize_relative_path(body.path)
+            source_sha256 = await run_in_threadpool(genbox_push_service.source_sha256, path)
             result = await run_in_threadpool(
-                genbox_push_service.push_image,
-                body.path,
+                genbox_push_transfer_coordinator.push_image,
+                genbox_push_service,
+                path,
+                source_sha256,
                 created_at=body.created_at,
                 prompt=body.prompt,
                 model=body.model,

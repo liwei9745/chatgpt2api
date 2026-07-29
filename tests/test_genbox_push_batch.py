@@ -21,11 +21,11 @@ class FakePushService:
         self.failures = failures or set()
         self.calls: list[str] = []
 
-    def push_image(self, path: str) -> dict[str, object]:
+    def push_image(self, path: str, **kwargs: object) -> dict[str, object]:
         self.calls.append(path)
         if path in self.failures:
             raise RuntimeError("untrusted remote detail")
-        return {"status": "imported", "source_retained": True}
+        return {"status": "imported", "sha256": str(kwargs.get("expected_sha256") or ""), "source_retained": True}
 
 
 class GenBoxPushBatchServiceTests(unittest.TestCase):

@@ -213,6 +213,24 @@ class GenBoxPushServiceTests(unittest.TestCase):
 
         self.assertIs(result["safe_to_delete_source"], False)
 
+    def test_expected_source_hash_refuses_changed_content_before_any_request(self) -> None:
+        self.configure()
+
+        with self.assertRaisesRegex(GenBoxPushError, "changed"):
+            self.service.push_image("2026/07/28/image.png", expected_sha256="0" * 64)
+
+        self.assertEqual(self.factory.sessions, [])
+        self.assertFalse((self.tmp / "state.json").exists())
+
+    def test_transfer_scope_changes_when_push_key_changes_without_exposing_it(self) -> None:
+        self.configure()
+        before = self.service.transfer_scope()
+        self.service.update_settings({"push_key": "rotated-local-test-key"})
+        after = self.service.transfer_scope()
+
+        self.assertNotEqual(before, after)
+        self.assertNotIn("rotated-local-test-key", after)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -7,6 +7,7 @@ from typing import Any
 
 from services.config import DATA_DIR
 from services.genbox_push_service import GenBoxPushService, genbox_push_service
+from services.genbox_push_transfer import GenBoxPushTransferCoordinator, genbox_push_transfer_coordinator
 from services.json_file import read_json_object, write_json_file
 from utils.timezone import beijing_now_str
 
@@ -23,10 +24,12 @@ class GenBoxPushOutbox:
         *,
         state_file: Path = OUTBOX_FILE,
         push_service: GenBoxPushService | Any = genbox_push_service,
+        transfer_coordinator: GenBoxPushTransferCoordinator = genbox_push_transfer_coordinator,
         worker_factory: Callable[..., threading.Thread] = threading.Thread,
     ) -> None:
         self.state_file = state_file
         self.push_service = push_service
+        self.transfer_coordinator = transfer_coordinator
         self.worker_factory = worker_factory
         self._lock = threading.RLock()
         self._worker: threading.Thread | None = None
@@ -226,8 +229,10 @@ class GenBoxPushOutbox:
             entry_id, item = claimed
             metadata = self._metadata.get(entry_id, {})
             try:
-                result = self.push_service.push_image(
+                result = self.transfer_coordinator.push_image(
+                    self.push_service,
                     str(item["path"]),
+                    str(item["source_sha256"]),
                     created_at=metadata.get("created_at") or str(item.get("created_at") or ""),
                     prompt=metadata.get("prompt", ""),
                     model=metadata.get("model") or str(item.get("model") or ""),

@@ -215,6 +215,16 @@ class GenBoxPushService:
             "max_image_bytes": int(payload.get("max_image_bytes") or 0),
         }
 
+    def source_sha256(self, relative_path: str) -> str:
+        """Return the current content identity without contacting GenBox."""
+        return hashlib.sha256(self.image_reader(relative_path)).hexdigest()
+
+    def transfer_scope(self) -> str:
+        """Use only a one-way, non-secret destination identity for sharing."""
+        settings = self._configured_settings()
+        identity = f"{settings.base_url}\n{settings.source_id}\n{settings.push_key}".encode("utf-8")
+        return hashlib.sha256(identity).hexdigest()
+
     @staticmethod
     def _content_type(relative_path: str) -> str:
         suffix = Path(relative_path).suffix.lower()
@@ -239,12 +249,15 @@ class GenBoxPushService:
         created_at: str = "",
         prompt: str = "",
         model: str = "",
+        expected_sha256: str | None = None,
     ) -> dict[str, object]:
         with self._lock:
             settings = self._configured_settings()
-            probe = self._probe(settings)
             payload = self.image_reader(relative_path)
             digest = hashlib.sha256(payload).hexdigest()
+            if expected_sha256 is not None and digest != expected_sha256:
+                raise GenBoxPushError("The source image changed before it could be sent; it was retained.")
+            probe = self._probe(settings)
             max_bytes = int(probe.get("max_image_bytes") or 0)
             if max_bytes and len(payload) > max_bytes:
                 raise GenBoxPushError("图片超过 GenBox 当前允许的大小")

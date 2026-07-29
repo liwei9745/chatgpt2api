@@ -10,6 +10,7 @@ from typing import Any
 
 from services.config import DATA_DIR
 from services.genbox_push_service import GenBoxPushService, genbox_push_service
+from services.genbox_push_transfer import GenBoxPushTransferCoordinator, genbox_push_transfer_coordinator
 from services.image_storage_service import image_storage_service
 from services.json_file import read_json_object, write_json_file
 from utils.timezone import beijing_now_str
@@ -31,6 +32,7 @@ class GenBoxPushBatchService:
         *,
         state_file: Path = BATCH_FILE,
         push_service: GenBoxPushService | Any = genbox_push_service,
+        transfer_coordinator: GenBoxPushTransferCoordinator = genbox_push_transfer_coordinator,
         image_reader: Callable[[str], bytes] = image_storage_service.get_bytes,
         image_exists: Callable[[str], bool] = image_storage_service.exists,
         image_lister: Callable[..., list[dict[str, object]]] = image_storage_service.list_items,
@@ -38,6 +40,7 @@ class GenBoxPushBatchService:
     ) -> None:
         self.state_file = state_file
         self.push_service = push_service
+        self.transfer_coordinator = transfer_coordinator
         self.image_reader = image_reader
         self.image_exists = image_exists
         self.image_lister = image_lister
@@ -315,10 +318,14 @@ class GenBoxPushBatchService:
             batch_id, item_id, item = claimed
             try:
                 # A gallery item may have changed since the user selected it.
-                # Reject that race rather than send a different source image.
+                # Reject that race before joining a shared transfer.
                 if hashlib.sha256(self.image_reader(str(item["path"]))).hexdigest() != item["source_sha256"]:
                     raise ValueError("source changed")
-                self.push_service.push_image(str(item["path"]))
+                self.transfer_coordinator.push_image(
+                    self.push_service,
+                    str(item["path"]),
+                    str(item["source_sha256"]),
+                )
             except Exception as exc:
                 self._finish(batch_id, item_id, error=self._safe_error(exc))
             else:

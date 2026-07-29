@@ -16,6 +16,7 @@ class StubPushService:
     def __init__(self) -> None:
         self.saved: dict[str, object] | None = None
         self.pushed: tuple[str, dict[str, object]] | None = None
+        self.source_path: str | None = None
 
     def get_settings(self) -> dict[str, object]:
         return {
@@ -32,6 +33,10 @@ class StubPushService:
 
     def probe(self) -> dict[str, object]:
         return {"ok": True, "contract_version": "v1", "max_image_bytes": 1024}
+
+    def source_sha256(self, path: str) -> str:
+        self.source_path = path
+        return "a" * 64
 
     def push_image(self, path: str, **kwargs: object) -> dict[str, object]:
         self.pushed = (path, kwargs)
@@ -82,7 +87,7 @@ class GenBoxPushApiTests(unittest.TestCase):
 
     def test_image_push_forwards_server_owned_metadata(self) -> None:
         response = self.client.post("/api/genbox-push/images", headers=self.headers, json={
-            "path": "2026/07/28/image.png",
+            "path": "/2026\\07\\28/image.png",
             "created_at": "2026-07-28 12:00:00",
             "prompt": "local prompt",
             "model": "local-model",
@@ -91,8 +96,14 @@ class GenBoxPushApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(self.stub.pushed, (
             "2026/07/28/image.png",
-            {"created_at": "2026-07-28 12:00:00", "prompt": "local prompt", "model": "local-model"},
+            {
+                "created_at": "2026-07-28 12:00:00",
+                "prompt": "local prompt",
+                "model": "local-model",
+                "expected_sha256": "a" * 64,
+            },
         ))
+        self.assertEqual(self.stub.source_path, "2026/07/28/image.png")
 
 
 if __name__ == "__main__":

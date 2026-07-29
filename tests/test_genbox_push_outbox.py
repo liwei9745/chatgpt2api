@@ -18,13 +18,13 @@ class FakePushService:
         self.error = error
         self.calls: list[dict[str, str]] = []
 
-    def push_image(self, path: str, *, created_at: str = "", prompt: str = "", model: str = "") -> dict[str, object]:
+    def push_image(self, path: str, *, created_at: str = "", prompt: str = "", model: str = "", expected_sha256: str | None = None) -> dict[str, object]:
         self.calls.append({"path": path, "created_at": created_at, "prompt": prompt, "model": model})
         if self.error:
             raise self.error
         return {
             "status": "imported",
-            "sha256": "a" * 64,
+            "sha256": expected_sha256 or "a" * 64,
             "safe_to_delete_source": True,
             "source_retained": True,
         }
