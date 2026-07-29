@@ -1,8 +1,9 @@
 # GenBox Push Sender (Development Image)
 
-This branch adds the first local-only sender capability for the GenBox Push v1
-contract. It is intentionally limited to an administrator selecting one already
-stored image for delivery.
+This branch adds local sender capabilities for the GenBox Push v1 contract.
+An administrator can configure one destination, push an already stored image,
+start a selected batch, or save a scheduled incremental Push. Live VPS and
+cross-project acceptance remain separate evidence gates.
 
 ## What It Does
 
@@ -20,7 +21,8 @@ stored image for delivery.
 
 - It does not delete or alter the source image, even when the receiver says it
   is eligible for deletion.
-- It does not add automatic per-generation Push, batch Push, or scheduling.
+- It does not use a configured Push destination until the administrator
+  explicitly saves the settings and starts the relevant Push action.
 - It does not connect to a remote GenBox during image build or test.
 - It does not expose a general remote command path.
 
@@ -43,6 +45,28 @@ a URL, or copied to ordinary logs.
 The destination URL is an administrator-controlled trust boundary. Configure
 only a GenBox endpoint that you own or have explicitly approved; the sender
 accepts HTTP(S) syntax but never follows redirects to another origin.
+
+## Configuration Input
+
+The settings page accepts either a GenBox service root such as
+`https://genbox.example` or the final Push endpoint copied by GenBox, such as
+`https://genbox.example/api/sync/push`. The sender normalizes the latter before
+probing or uploading, so it requests exactly one `/api/sync/push/status` or
+`/api/sync/push` path. A URL that embeds that endpoint and adds another suffix
+is rejected.
+
+For the guided GenBox flow, paste the three exact lines copied from GenBox:
+
+```text
+GenBox Push URL: https://genbox.example/api/sync/push
+Source ID: gbxps-example
+Push Key: gpk-example
+```
+
+Selecting "fill configuration" parses those three fields into the form and
+immediately clears the pasted text. It does not save, enable, probe, or send a
+Push request. The Push key remains masked in the form until the owner explicitly
+saves the configuration, and it is never placed in a URL or ordinary log.
 
 ## Immutable Image Delivery
 

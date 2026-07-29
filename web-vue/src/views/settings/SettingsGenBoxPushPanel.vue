@@ -4,8 +4,20 @@
       <div class="settings-check-item">
         <Checkbox v-model="form.enabled">启用 GenBox 推送</Checkbox>
       </div>
+      <FormField label="粘贴 GenBox 配置">
+        <textarea
+          v-model="pastedConfiguration"
+          rows="4"
+          class="ui-textarea-sm font-mono"
+          placeholder="GenBox Push URL: https://genbox.example/api/sync/push&#10;Source ID: gbxps-example&#10;Push Key: gpk-example"
+        ></textarea>
+        <div class="mt-2 flex flex-wrap items-center gap-2">
+          <Button size="sm" variant="outline" @click="applyPastedConfiguration">填入配置</Button>
+          <span class="text-xs text-muted-foreground">填入后还需要点击“保存连接设置”；不会自动启用或保存。</span>
+        </div>
+      </FormField>
       <div class="grid gap-4 md:grid-cols-2">
-        <FormField label="GenBox 地址"><Input v-model.trim="form.base_url" block placeholder="https://genbox.example" /></FormField>
+        <FormField label="GenBox Push 地址"><Input v-model.trim="form.base_url" block placeholder="https://genbox.example/api/sync/push" /></FormField>
         <FormField label="来源标识"><Input v-model.trim="form.source_id" block placeholder="chatgpt2api-dev" /></FormField>
         <FormField label="推送密钥"><Input v-model="form.push_key" type="password" block :placeholder="keyPlaceholder" /></FormField>
         <FormField label="连接等待（秒）"><Input v-model="form.timeout_secs" type="number" min="5" max="120" block /></FormField>
@@ -47,6 +59,7 @@ import StateBlock from '@/components/ai/StateBlock.vue'
 import { genboxPushApi } from '@/api/genboxPush'
 
 const form = reactive({ enabled: false, base_url: '', source_id: '', push_key: '', timeout_secs: 20 })
+const pastedConfiguration = ref('')
 const scheduleForm = reactive({ enabled: false, weekday: 0, time: '09:00', start_date: '', end_date: '' })
 const weekdays = [
   { value: 0, label: '星期一' }, { value: 1, label: '星期二' }, { value: 2, label: '星期三' },
@@ -62,6 +75,37 @@ const scheduleTone = ref<'success' | 'error'>('success')
 const isScheduleSaving = ref(false)
 const isScheduleRunning = ref(false)
 const keyPlaceholder = computed(() => hasPushKey.value ? '密钥已保存；留空则不修改' : '从 GenBox 获取的推送密钥')
+
+function applyPastedConfiguration() {
+  const values = new Map<string, string>()
+  const labels = new Set(['GenBox Push URL', 'Source ID', 'Push Key'])
+  for (const rawLine of pastedConfiguration.value.split(/\r?\n/)) {
+    const line = rawLine.trim()
+    if (!line) continue
+    const match = /^(GenBox Push URL|Source ID|Push Key):\s*(.+)$/.exec(line)
+    if (!match || !labels.has(match[1]) || values.has(match[1])) {
+      pastedConfiguration.value = ''
+      messageTone.value = 'error'
+      message.value = '请粘贴 GenBox 复制的完整三行配置。'
+      return
+    }
+    values.set(match[1], match[2].trim())
+  }
+  pastedConfiguration.value = ''
+  const baseUrl = values.get('GenBox Push URL') || ''
+  const sourceId = values.get('Source ID') || ''
+  const pushKey = values.get('Push Key') || ''
+  if (!baseUrl || !sourceId || !pushKey || values.size !== 3) {
+    messageTone.value = 'error'
+    message.value = '请粘贴 GenBox 复制的完整三行配置。'
+    return
+  }
+  form.base_url = baseUrl
+  form.source_id = sourceId
+  form.push_key = pushKey
+  messageTone.value = 'success'
+  message.value = '配置已填入。请核对后点击“保存连接设置”。'
+}
 
 async function load() {
   try {

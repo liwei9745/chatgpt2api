@@ -55,6 +55,14 @@ def _normalize_base_url(value: object) -> str:
         raise ValueError("GenBox 地址必须是有效的 HTTP 或 HTTPS 地址")
     if parsed.query or parsed.fragment:
         raise ValueError("GenBox 地址不能包含查询参数或片段")
+    if parsed.params:
+        raise ValueError("GenBox address cannot include path parameters")
+    push_endpoint = "/api/sync/push"
+    path = parsed.path or ""
+    if push_endpoint in path and not path.endswith(push_endpoint):
+        raise ValueError("GenBox Push address must end with /api/sync/push")
+    if path.endswith(push_endpoint):
+        base_url = parsed._replace(path=path[: -len(push_endpoint)].rstrip("/")).geturl().rstrip("/")
     return base_url
 
 
