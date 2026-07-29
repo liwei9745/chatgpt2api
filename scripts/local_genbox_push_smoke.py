@@ -215,6 +215,7 @@ import threading
 from PIL import Image
 
 from services.genbox_push_service import GenBoxPushService
+from services.genbox_push_batch import GenBoxPushBatchService
 from services.genbox_push_transfer import GenBoxPushTransferCoordinator
 
 relative_path = "local-smoke/synthetic.png"
@@ -289,6 +290,32 @@ assert len(coordinated_results) == 2, coordinated_results
 assert gated.calls == 1, gated.calls
 first = coordinated_results[0]
 second = service.push_image(relative_path, prompt="local synthetic smoke image", model="local-smoke")
+
+# Simulate a process stop after the receiver has accepted the image but before
+# the batch worker persisted its terminal status. Restart recovery must retry
+# the durable item safely; the receiver then returns its idempotent outcome.
+batch_state_file = Path("/tmp/local-smoke-batch-state.json")
+batch_state_file.write_text(json.dumps({"batches": {"resume": {
+    "created_at": "2026-07-29 00:00:00",
+    "updated_at": "2026-07-29 00:00:00",
+    "items": {"item": {
+        "path": relative_path,
+        "source_sha256": digest,
+        "status": "sending",
+        "attempts": 1,
+        "updated_at": "2026-07-29 00:00:00",
+    }},
+}}}), encoding="utf-8")
+resumed_batch = GenBoxPushBatchService(state_file=batch_state_file, push_service=service)
+resumed_batch.resume(start_worker=False)
+assert resumed_batch.get("resume")["queued"] == 1
+resumed_batch._drain()
+resumed = resumed_batch.get("resume")
+assert resumed["status"] == "succeeded", resumed
+assert resumed["succeeded"] == 1, resumed
+for path in (batch_state_file, batch_state_file.with_suffix(batch_state_file.suffix + ".bak")):
+    path.unlink(missing_ok=True)
+
 assert image_path.is_file(), "sender source image was deleted"
 assert first["status"] == "imported", first
 assert second["status"] == "already-imported", second
@@ -302,6 +329,7 @@ print("LOCAL_SMOKE_RESULT=" + json.dumps({
     "first_status": first["status"],
     "second_status": second["status"],
     "coordinated_physical_calls": gated.calls,
+    "resumed_batch_status": resumed["status"],
     "source_sha256": first["sha256"],
     "source_retained": first["source_retained"] and second["source_retained"],
 }, sort_keys=True))
@@ -414,6 +442,8 @@ def run_smoke(sender_image: str, receiver_image: str) -> dict[str, object]:
             raise SmokeError("Sender result did not prove initial import and idempotent retry.")
         if result.get("coordinated_physical_calls") != 1:
             raise SmokeError("Sender result did not prove one physical Push for concurrent matching requests.")
+        if result.get("resumed_batch_status") != "succeeded":
+            raise SmokeError("Sender result did not prove interrupted batch recovery.")
         if result.get("source_retained") is not True:
             raise SmokeError("Sender result did not prove source retention.")
         probe = result.get("probe")

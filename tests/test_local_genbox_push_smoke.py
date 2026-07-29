@@ -31,11 +31,13 @@ class LocalGenBoxPushSmokeTests(unittest.TestCase):
         self.assertIn('Image.new("RGB", (2, 2), (18, 52, 86))', job)
         self.assertIn("GenBoxPushTransferCoordinator", job)
         self.assertIn("assert gated.calls == 1", job)
+        self.assertIn("GenBoxPushBatchService", job)
+        self.assertIn('assert resumed["status"] == "succeeded"', job)
         self.assertIn('assert first["status"] == "imported"', job)
         self.assertIn('assert second["status"] == "already-imported"', job)
         self.assertIn('assert first["sha256"] == hashlib.sha256(payload).hexdigest()', job)
         self.assertIn('assert image_path.is_file()', job)
-        self.assertNotIn("unlink(", job)
+        self.assertNotIn("image_path.unlink(", job)
 
     def test_runtime_uses_inspected_image_ids_without_pulling(self) -> None:
         source = MODULE_PATH.read_text(encoding="utf-8")
