@@ -1,6 +1,12 @@
 .git
 .gitignore
+
+# Local secrets and runtime state must never enter a Docker build context.
+.env
+.env.*
+!.env.example
 config.json
+config.local*.json
 .idea
 .venv
 __pycache__
@@ -9,6 +15,17 @@ __pycache__
 *.pyd
 logs
 runtime
+storage/
+data/
+images/
+image_thumbnails/
+*.db
+*.sqlite
+*.sqlite3
+*.pem
+*.key
+*.p12
+*.pfx
 standalone
 test
 tests
