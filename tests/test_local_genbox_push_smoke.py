@@ -25,10 +25,12 @@ class LocalGenBoxPushSmokeTests(unittest.TestCase):
         self.assertEqual(args.sender_image, "sender:test")
         self.assertEqual(args.receiver_image, "receiver:test")
 
-    def test_sender_job_asserts_idempotency_and_source_retention(self) -> None:
+    def test_sender_job_asserts_coordination_idempotency_and_source_retention(self) -> None:
         job = smoke._sender_job_source()
 
         self.assertIn('Image.new("RGB", (2, 2), (18, 52, 86))', job)
+        self.assertIn("GenBoxPushTransferCoordinator", job)
+        self.assertIn("assert gated.calls == 1", job)
         self.assertIn('assert first["status"] == "imported"', job)
         self.assertIn('assert second["status"] == "already-imported"', job)
         self.assertIn('assert first["sha256"] == hashlib.sha256(payload).hexdigest()', job)

@@ -210,10 +210,12 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import threading
 
 from PIL import Image
 
 from services.genbox_push_service import GenBoxPushService
+from services.genbox_push_transfer import GenBoxPushTransferCoordinator
 
 relative_path = "local-smoke/synthetic.png"
 image_path = Path("/app/data/images") / relative_path
@@ -233,7 +235,59 @@ assert settings["has_push_key"] is True
 assert "push_key" not in settings
 
 probe = service.probe()
-first = service.push_image(relative_path, prompt="local synthetic smoke image", model="local-smoke")
+
+class GatedPushService:
+    def __init__(self, delegate):
+        self.delegate = delegate
+        self.calls = 0
+        self.started = threading.Event()
+        self.release = threading.Event()
+
+    def transfer_scope(self):
+        return self.delegate.transfer_scope()
+
+    def push_image(self, *args, **kwargs):
+        self.calls += 1
+        self.started.set()
+        assert self.release.wait(timeout=10), "coordinated Push was not released"
+        return self.delegate.push_image(*args, **kwargs)
+
+coordinator = GenBoxPushTransferCoordinator()
+gated = GatedPushService(service)
+digest = hashlib.sha256(payload).hexdigest()
+coordinated_results = []
+coordinated_errors = []
+
+def coordinated_push():
+    try:
+        coordinated_results.append(coordinator.push_image(
+            gated,
+            relative_path,
+            digest,
+            prompt="local synthetic smoke image",
+            model="local-smoke",
+        ))
+    except BaseException as exc:
+        coordinated_errors.append(exc)
+
+owner = threading.Thread(target=coordinated_push)
+follower = threading.Thread(target=coordinated_push)
+owner.start()
+assert gated.started.wait(timeout=5), "coordinated Push did not start"
+follower.start()
+for _ in range(100):
+    if any(transfer.waiters for transfer in coordinator._inflight.values()):
+        break
+    threading.Event().wait(0.01)
+else:
+    raise AssertionError("duplicate request did not join the coordinated Push")
+gated.release.set()
+owner.join(timeout=15)
+follower.join(timeout=15)
+assert not coordinated_errors, coordinated_errors
+assert len(coordinated_results) == 2, coordinated_results
+assert gated.calls == 1, gated.calls
+first = coordinated_results[0]
 second = service.push_image(relative_path, prompt="local synthetic smoke image", model="local-smoke")
 assert image_path.is_file(), "sender source image was deleted"
 assert first["status"] == "imported", first
@@ -247,6 +301,7 @@ print("LOCAL_SMOKE_RESULT=" + json.dumps({
     "probe": probe,
     "first_status": first["status"],
     "second_status": second["status"],
+    "coordinated_physical_calls": gated.calls,
     "source_sha256": first["sha256"],
     "source_retained": first["source_retained"] and second["source_retained"],
 }, sort_keys=True))
@@ -357,6 +412,8 @@ def run_smoke(sender_image: str, receiver_image: str) -> dict[str, object]:
         result = _parse_sender_result(sender.stdout)
         if result.get("first_status") != "imported" or result.get("second_status") != "already-imported":
             raise SmokeError("Sender result did not prove initial import and idempotent retry.")
+        if result.get("coordinated_physical_calls") != 1:
+            raise SmokeError("Sender result did not prove one physical Push for concurrent matching requests.")
         if result.get("source_retained") is not True:
             raise SmokeError("Sender result did not prove source retention.")
         probe = result.get("probe")
