@@ -6,12 +6,15 @@ from pathlib import Path
 import tempfile
 import threading
 import unittest
+from datetime import datetime
 
 os.environ.setdefault("CHATGPT2API_AUTH_KEY", "local-test-admin-key")
 
 from services.genbox_push_batch import GenBoxPushBatchService
 from services.genbox_push_outbox import GenBoxPushOutbox
+from services.genbox_push_schedule import GenBoxPushScheduleService
 from services.genbox_push_transfer import GenBoxPushTransferCoordinator
+from utils.timezone import BEIJING_TZ
 
 
 class BlockingPushService:
@@ -64,7 +67,7 @@ class GenBoxPushTransferCoordinatorTests(unittest.TestCase):
             threading.Event().wait(0.01)
         self.fail("the duplicate request did not join the in-flight transfer")
 
-    def test_outbox_and_batch_share_one_physical_send_and_cached_result(self) -> None:
+    def test_outbox_and_batch_share_one_inflight_physical_send(self) -> None:
         path = "2026/07/28/shared.png"
         image = b"synthetic-shared-image"
         digest = hashlib.sha256(image).hexdigest()
@@ -140,6 +143,46 @@ class GenBoxPushTransferCoordinatorTests(unittest.TestCase):
         self.assertEqual(len(sender.calls), 1)
         self.assertEqual(sender.calls[0]["path"], path)
         self.assertEqual(follower_result[0]["sha256"], digest)
+
+    def test_schedule_and_manual_batch_share_one_physical_send(self) -> None:
+        path = "2026/07/27/scheduled.png"
+        image = b"synthetic-scheduled-image"
+        sender = BlockingPushService()
+        coordinator = GenBoxPushTransferCoordinator()
+        batches = GenBoxPushBatchService(
+            state_file=self.tmp / "batches.json",
+            push_service=sender,
+            transfer_coordinator=coordinator,
+            image_reader=lambda current_path: image if current_path == path else b"",
+            image_exists=lambda current_path: current_path == path,
+        )
+        schedule = GenBoxPushScheduleService(
+            state_file=self.tmp / "schedule.json",
+            batch_service=batches,
+            push_service=object(),
+            image_reader=lambda current_path: image if current_path == path else b"",
+            image_exists=lambda current_path: current_path == path,
+            image_lister=lambda _base_url, **_filters: [{"path": path}],
+            now=lambda: datetime(2026, 7, 27, 10, 0, tzinfo=BEIJING_TZ),
+        )
+
+        manual = batches.create([path], start_worker=False)
+        manual_thread = threading.Thread(target=batches._drain)
+        manual_thread.start()
+        self.assertTrue(sender.started.wait(timeout=1))
+
+        schedule.run_now()
+        self._wait_for_follower(coordinator)
+        self.assertEqual(len(sender.calls), 1)
+        sender.release.set()
+        manual_thread.join(timeout=2)
+        if batches._worker is not None:
+            batches._worker.join(timeout=2)
+
+        synced = schedule.run_now()
+        self.assertEqual(len(sender.calls), 1)
+        self.assertEqual(batches.get(str(manual["id"]))["status"], "succeeded")
+        self.assertEqual(synced["succeeded"], 1)
 
     def test_failed_transfer_releases_claim_for_a_clean_retry(self) -> None:
         path = "2026/07/28/shared.png"
