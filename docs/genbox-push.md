@@ -43,3 +43,14 @@ a URL, or copied to ordinary logs.
 The destination URL is an administrator-controlled trust boundary. Configure
 only a GenBox endpoint that you own or have explicitly approved; the sender
 accepts HTTP(S) syntax but never follows redirects to another origin.
+
+## Immutable Image Delivery
+
+The repository's Docker publish workflow is manual. It publishes only after a
+maintainer types `publish` into its confirmation field. The workflow summary
+prints an immutable `ghcr.io/...@sha256:...` reference. Use that exact reference
+for a clean GenBox isolated deployment. Local Docker tags, a mutable tag such
+as `latest`, and an unverified registry address are not deployment inputs.
+
+Publishing an image is a separate owner action. Building or testing an image
+locally does not create a registry artifact or authorize deployment.
