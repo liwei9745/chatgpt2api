@@ -29,6 +29,7 @@ class LocalGenBoxPushSmokeTests(unittest.TestCase):
         job = smoke._sender_job_source()
 
         self.assertIn('Image.new("RGB", (2, 2), (18, 52, 86))', job)
+        self.assertIn('os.environ["LOCAL_SMOKE_RECEIVER_URL"] + "/api/sync/push"', job)
         self.assertIn("GenBoxPushTransferCoordinator", job)
         self.assertIn("assert gated.calls == 1", job)
         self.assertIn("GenBoxPushBatchService", job)

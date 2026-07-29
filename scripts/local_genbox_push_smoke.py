@@ -227,7 +227,7 @@ payload = image_path.read_bytes()
 service = GenBoxPushService()
 settings = service.update_settings({
     "enabled": True,
-    "base_url": os.environ["LOCAL_SMOKE_RECEIVER_URL"],
+    "base_url": os.environ["LOCAL_SMOKE_RECEIVER_URL"] + "/api/sync/push",
     "source_id": os.environ["LOCAL_SMOKE_SOURCE_ID"],
     "push_key": os.environ["LOCAL_SMOKE_PUSH_KEY"],
     "timeout_secs": 20,
