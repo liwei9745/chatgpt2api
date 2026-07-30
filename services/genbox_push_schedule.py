@@ -181,8 +181,17 @@ class GenBoxPushScheduleService:
         }
 
     def get_settings(self) -> dict[str, object]:
-        with self._lock:
-            return self._public(self._load_locked())
+        # A manual scan creates normal batches that finish asynchronously. Refresh
+        # their projections here so a disabled weekly schedule still reports the
+        # completed outcome instead of leaving the Settings view at "queued".
+        now = self.now().astimezone(BEIJING_TZ)
+        with self._lease_file_guard() as guarded:
+            with self._lock:
+                state = self._load_locked()
+                if guarded:
+                    self._sync_batches_locked(state, now)
+                    self._save_locked(state)
+                return self._public(state)
 
     def update_settings(self, payload: dict[str, object]) -> dict[str, object]:
         with self._lock:

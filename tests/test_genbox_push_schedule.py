@@ -32,6 +32,7 @@ class FakePushService:
 class FakeBatchService:
     def __init__(self, *, failed: bool = False) -> None:
         self.failed = failed
+        self.status = "succeeded"
         self.calls: list[str] = []
         self.batches: dict[str, dict[str, object]] = {}
 
@@ -39,7 +40,7 @@ class FakeBatchService:
         path = paths[0]
         batch_id = f"batch-{len(self.calls) + 1}"
         self.calls.append(path)
-        status = "failed" if self.failed else "succeeded"
+        status = "failed" if self.failed else self.status
         self.batches[batch_id] = {"id": batch_id, "status": status}
         return self.batches[batch_id]
 
@@ -155,6 +156,18 @@ class GenBoxPushScheduleTests(unittest.TestCase):
         self.assertFalse(disabled["enabled"])
         self.assertEqual(disabled["succeeded"], 1)
         self.assertTrue(disabled["source_retained"])
+
+    def test_get_settings_refreshes_finished_manual_scan_when_weekly_schedule_is_disabled(self) -> None:
+        self.batch.status = "queued"
+        queued = self.service.run_now()
+        self.assertEqual(queued["queued"], 1)
+
+        self.batch.batches["batch-1"]["status"] = "succeeded"
+        refreshed = self.service.get_settings()
+
+        self.assertFalse(refreshed["enabled"])
+        self.assertEqual(refreshed["queued"], 0)
+        self.assertEqual(refreshed["succeeded"], 1)
 
 
 class StubScheduleService:

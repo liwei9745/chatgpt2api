@@ -53,7 +53,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, reactive, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
 import { Button, Checkbox, FormField, FormSection, Input } from 'nanocat-ui'
 import StateBlock from '@/components/ai/StateBlock.vue'
 import { genboxPushApi } from '@/api/genboxPush'
@@ -74,6 +74,10 @@ const scheduleMessage = ref('')
 const scheduleTone = ref<'success' | 'error'>('success')
 const isScheduleSaving = ref(false)
 const isScheduleRunning = ref(false)
+const SCHEDULE_POLL_DELAY_MS = 1000
+const SCHEDULE_POLL_LIMIT = 60
+let schedulePollTimer: ReturnType<typeof setTimeout> | undefined
+let schedulePollRemaining = 0
 const keyPlaceholder = computed(() => hasPushKey.value ? '密钥已保存；留空则不修改' : '从 GenBox 获取的推送密钥')
 
 function applyPastedConfiguration() {
@@ -123,6 +127,11 @@ async function load() {
       start_date: scheduleResponse.schedule.start_date,
       end_date: scheduleResponse.schedule.end_date,
     })
+    if (scheduleResponse.schedule.queued > 0) {
+      setScheduleMessage(scheduleResponse.schedule, '已恢复正在进行的扫描。')
+      schedulePollRemaining = SCHEDULE_POLL_LIMIT
+      startSchedulePolling()
+    }
   } catch (error: any) {
     messageTone.value = 'error'
     message.value = error?.message || '无法读取 GenBox 推送设置'
@@ -132,6 +141,29 @@ async function load() {
 function setScheduleMessage(schedule: { queued: number; succeeded: number; failed: number; last_error: string }, success: string) {
   scheduleTone.value = schedule.last_error ? 'error' : 'success'
   scheduleMessage.value = schedule.last_error || `${success} 已完成 ${schedule.succeeded} 张，等待中 ${schedule.queued} 张，失败 ${schedule.failed} 张；源图仍保留。`
+}
+
+function stopSchedulePolling() {
+  if (schedulePollTimer !== undefined) clearTimeout(schedulePollTimer)
+  schedulePollTimer = undefined
+  schedulePollRemaining = 0
+}
+
+function startSchedulePolling() {
+  if (schedulePollTimer !== undefined || schedulePollRemaining <= 0) return
+  schedulePollTimer = window.setTimeout(async () => {
+    schedulePollTimer = undefined
+    try {
+      const response = await genboxPushApi.getSchedule()
+      setScheduleMessage(response.schedule, '本次扫描正在推送。')
+      schedulePollRemaining -= 1
+      if (response.schedule.queued > 0 && schedulePollRemaining > 0) startSchedulePolling()
+    } catch (error: any) {
+      scheduleTone.value = 'error'
+      scheduleMessage.value = error?.message || '无法更新自动推送进度'
+      stopSchedulePolling()
+    }
+  }, SCHEDULE_POLL_DELAY_MS)
 }
 
 async function saveSchedule() {
@@ -150,10 +182,15 @@ async function saveSchedule() {
 
 async function runScheduleNow() {
   isScheduleRunning.value = true
+  stopSchedulePolling()
   scheduleMessage.value = ''
   try {
     const response = await genboxPushApi.runScheduleNow()
     setScheduleMessage(response.schedule, '本次扫描已加入可恢复的推送任务。')
+    if (response.schedule.queued > 0) {
+      schedulePollRemaining = SCHEDULE_POLL_LIMIT
+      startSchedulePolling()
+    }
   } catch (error: any) {
     scheduleTone.value = 'error'
     scheduleMessage.value = error?.message || '无法开始本次自动推送扫描'
@@ -195,6 +232,7 @@ async function probe() {
 }
 
 onMounted(load)
+onBeforeUnmount(stopSchedulePolling)
 </script>
 
 <style scoped>
