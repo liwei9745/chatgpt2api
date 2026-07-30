@@ -12,7 +12,7 @@ on:
         type: string
 
 env:
-  IMAGE_NAME: chatgpt2api
+  IMAGE_NAME: chatgpt2api-genbox-p5
 
 jobs:
   docker:
