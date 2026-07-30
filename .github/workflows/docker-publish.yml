@@ -16,7 +16,7 @@ env:
 
 jobs:
   docker:
-    if: ${{ inputs.confirm_publish == 'publish' }}
+    if: ${{ github.event_name == 'push' || inputs.confirm_publish == 'publish' }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
