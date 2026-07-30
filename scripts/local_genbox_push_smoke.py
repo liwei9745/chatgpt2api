@@ -209,6 +209,7 @@ def _sender_job_source() -> str:
 import hashlib
 import json
 import os
+from datetime import datetime, timedelta
 from pathlib import Path
 import threading
 
@@ -216,7 +217,9 @@ from PIL import Image
 
 from services.genbox_push_service import GenBoxPushService
 from services.genbox_push_batch import GenBoxPushBatchService
+from services.genbox_push_schedule import GenBoxPushScheduleService
 from services.genbox_push_transfer import GenBoxPushTransferCoordinator
+from utils.timezone import BEIJING_TZ
 
 relative_path = "local-smoke/synthetic.png"
 image_path = Path("/app/data/images") / relative_path
@@ -317,6 +320,53 @@ assert resumed["already_imported"] == 1, resumed
 for path in (batch_state_file, batch_state_file.with_suffix(batch_state_file.suffix + ".bak")):
     path.unlink(missing_ok=True)
 
+# Use the durable scheduler with the real sender service and receiver. Its
+# overlap scan must discover a file that appears after the first scan without
+# requeuing the file already confirmed in the first batch.
+schedule_clock = datetime(2026, 7, 30, 10, 0, tzinfo=BEIJING_TZ)
+scheduled_paths = []
+for name, color in (("scheduled-first.png", (90, 22, 47)), ("scheduled-late.png", (44, 108, 35))):
+    scheduled_path = Path("/app/data/images/local-smoke") / name
+    Image.new("RGB", (2, 2), color).save(scheduled_path, format="PNG")
+
+def scheduled_lister(_base_url, **_filters):
+    return [{"path": path} for path in scheduled_paths]
+
+scheduled_batches = GenBoxPushBatchService(
+    state_file=Path("/tmp/local-smoke-scheduled-batches.json"),
+    push_service=service,
+)
+scheduled = GenBoxPushScheduleService(
+    state_file=Path("/tmp/local-smoke-schedule.json"),
+    batch_service=scheduled_batches,
+    push_service=service,
+    image_lister=scheduled_lister,
+    now=lambda: schedule_clock,
+)
+scheduled_paths.append("local-smoke/scheduled-first.png")
+
+def run_schedule_until(expected_succeeded):
+    deadline = threading.Event()
+    result = scheduled.run_now()
+    for _ in range(100):
+        if result["succeeded"] == expected_succeeded:
+            return result
+        deadline.wait(0.05)
+        result = scheduled.run_now()
+    raise AssertionError(result)
+
+first_schedule = run_schedule_until(1)
+schedule_clock += timedelta(days=1)
+scheduled_paths.append("local-smoke/scheduled-late.png")
+second_schedule = run_schedule_until(2)
+for path in (
+    Path("/tmp/local-smoke-schedule.json"),
+    Path("/tmp/local-smoke-schedule.json.bak"),
+    Path("/tmp/local-smoke-scheduled-batches.json"),
+    Path("/tmp/local-smoke-scheduled-batches.json.bak"),
+):
+    path.unlink(missing_ok=True)
+
 assert image_path.is_file(), "sender source image was deleted"
 assert first["status"] == "imported", first
 assert second["status"] == "already-imported", second
@@ -332,6 +382,7 @@ print("LOCAL_SMOKE_RESULT=" + json.dumps({
     "coordinated_physical_calls": gated.calls,
     "resumed_batch_status": resumed["status"],
     "resumed_batch_item_status": resumed["items"][0]["status"],
+    "scheduled_late_item_count": second_schedule["succeeded"],
     "source_sha256": first["sha256"],
     "source_retained": first["source_retained"] and second["source_retained"],
 }, sort_keys=True))
@@ -359,10 +410,10 @@ def _assert_receiver_import(receiver_name: str, source_sha256: str) -> None:
         "import io; from pathlib import Path; from PIL import Image; "
         f"expected = '{source_sha256}'; "
         "files = [path for path in Path('/app/storage/gallery').rglob('*.png') if path.is_file()]; "
-        "assert len(files) == 1, files; payload = files[0].read_bytes(); "
-        "image = Image.open(io.BytesIO(payload)); "
-        "assert image.size == (2, 2); "
-        "assert image.text.get('SourceSHA256') == expected"
+        "assert len(files) == 3, files; "
+        "images = [Image.open(io.BytesIO(path.read_bytes())) for path in files]; "
+        "assert all(image.size == (2, 2) for image in images); "
+        "assert expected in {image.text.get('SourceSHA256') for image in images}"
     )
     check = _run(
         [
@@ -377,7 +428,7 @@ def _assert_receiver_import(receiver_name: str, source_sha256: str) -> None:
         timeout=30,
     )
     if check.returncode:
-        raise SmokeError("GenBox receiver did not retain one synthetic image with the expected source SHA-256 and dimensions.")
+        raise SmokeError("GenBox receiver did not retain the expected synthetic imports with their dimensions and source hash.")
 
 
 def run_smoke(sender_image: str, receiver_image: str) -> dict[str, object]:
@@ -446,6 +497,8 @@ def run_smoke(sender_image: str, receiver_image: str) -> dict[str, object]:
             raise SmokeError("Sender result did not prove one physical Push for concurrent matching requests.")
         if result.get("resumed_batch_status") != "succeeded":
             raise SmokeError("Sender result did not prove interrupted batch recovery.")
+        if result.get("scheduled_late_item_count") != 2:
+            raise SmokeError("Sender result did not prove scheduled late-image discovery.")
         if result.get("source_retained") is not True:
             raise SmokeError("Sender result did not prove source retention.")
         probe = result.get("probe")
