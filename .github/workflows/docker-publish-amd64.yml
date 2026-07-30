@@ -1,0 +1,65 @@
+name: Publish Experimental GenBox Sender Image (amd64)
+
+on:
+  push:
+    tags:
+      - "v*-genbox-amd64-*"
+  workflow_dispatch:
+    inputs:
+      confirm_publish:
+        description: Type publish to confirm registry delivery
+        required: true
+        type: string
+
+env:
+  IMAGE_NAME: chatgpt2api
+
+jobs:
+  docker:
+    if: ${{ github.event_name == 'push' || inputs.confirm_publish == 'publish' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=sha
+
+      - name: Build and push amd64 image
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          target: app
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+
+      - name: Publish immutable deployment reference
+        run: |
+          echo "## GenBox experimental amd64 deployment image" >> "$GITHUB_STEP_SUMMARY"
+          echo "\`\`\`text" >> "$GITHUB_STEP_SUMMARY"
+          echo "ghcr.io/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}@${{ steps.build.outputs.digest }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "\`\`\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "Use this digest only after confirming the isolated target is linux/amd64." >> "$GITHUB_STEP_SUMMARY"
