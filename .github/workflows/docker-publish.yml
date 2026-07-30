@@ -1,6 +1,9 @@
 name: Publish Immutable GenBox Sender Image
 
 on:
+  push:
+    tags:
+      - "v*-genbox-*"
   workflow_dispatch:
     inputs:
       confirm_publish:
