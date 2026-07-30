@@ -112,6 +112,11 @@ def create_router() -> APIRouter:
             _raise_push_error(exc)
         return {"preview": preview}
 
+    @router.get("/api/genbox-push/batches/latest-recoverable")
+    async def get_latest_recoverable_batch(authorization: str | None = Header(default=None)):
+        require_admin(authorization)
+        return {"batch": await run_in_threadpool(genbox_push_batch_service.get_latest_recoverable)}
+
     @router.get("/api/genbox-push/batches/{batch_id}")
     async def get_batch(batch_id: str, authorization: str | None = Header(default=None)):
         require_admin(authorization)

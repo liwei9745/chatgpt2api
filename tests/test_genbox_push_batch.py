@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import multiprocessing
 import os
 from pathlib import Path
 import tempfile
+import threading
 import unittest
 
 os.environ.setdefault("CHATGPT2API_AUTH_KEY", "local-test-admin-key")
@@ -14,6 +16,13 @@ from fastapi.testclient import TestClient
 from api import genbox_push
 from api.app import create_app
 from services.genbox_push_batch import GenBoxPushBatchService
+from services.genbox_push_service import GenBoxPushError
+
+
+def _claim_from_separate_process(state_file: str, start: object, results: object) -> None:
+    service = GenBoxPushBatchService(state_file=Path(state_file), push_service=object())
+    start.wait(timeout=5)
+    results.put(service._claim_next() is not None)
 
 
 class FakePushService:
@@ -64,6 +73,33 @@ class GenBoxPushBatchServiceTests(unittest.TestCase):
         self.assertEqual(completed["succeeded"], 2)
         self.assertTrue(completed["source_retained"])
         self.assertEqual(self.sender.calls, ["2026/07/28/one.png", "2026/07/28/two.png"])
+
+    def test_batch_preserves_already_imported_receipt_outcome(self) -> None:
+        class DuplicatePushService(FakePushService):
+            def push_image(self, path: str, **kwargs: object) -> dict[str, object]:
+                self.calls.append(path)
+                return {
+                    "status": "already-imported",
+                    "sha256": str(kwargs.get("expected_sha256") or ""),
+                    "source_retained": True,
+                }
+
+        duplicate_sender = DuplicatePushService()
+        batches = GenBoxPushBatchService(
+            state_file=self.tmp / "duplicates.json",
+            push_service=duplicate_sender,
+            image_reader=self.images.__getitem__,
+            image_exists=lambda path: path in self.images,
+        )
+        batch = batches.create(["2026/07/28/one.png"], start_worker=False)
+        batches._drain()
+
+        completed = batches.get(str(batch["id"]))
+        self.assertEqual(completed["status"], "succeeded")
+        self.assertEqual(completed["succeeded"], 0)
+        self.assertEqual(completed["already_imported"], 1)
+        self.assertEqual(completed["items"][0]["status"], "already-imported")
+        self.assertEqual(completed["items"][0]["receipt_status"], "already-imported")
 
     def test_cancel_only_stops_queued_images(self) -> None:
         batch = self.batches.create(["2026/07/28/one.png", "2026/07/28/two.png"], start_worker=False)
@@ -130,6 +166,113 @@ class GenBoxPushBatchServiceTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "end date"):
             self.batches.preview_date_range("2026-07-31", "2026-07-01")
 
+    def test_latest_recoverable_batch_ignores_finished_batches(self) -> None:
+        finished = self.batches.create(["2026/07/28/one.png"], start_worker=False)
+        self.batches._drain()
+        active = self.batches.create(["2026/07/28/two.png"], start_worker=False)
+
+        latest = self.batches.get_latest_recoverable()
+        self.assertNotEqual(latest["id"], finished["id"])
+        self.assertEqual(latest["id"], active["id"])
+
+    def test_shared_state_allows_only_one_worker_to_claim_an_item(self) -> None:
+        batch = self.batches.create(["2026/07/28/one.png"], start_worker=False)
+        second_worker = GenBoxPushBatchService(
+            state_file=self.tmp / "batches.json",
+            push_service=self.sender,
+            image_reader=self.images.__getitem__,
+            image_exists=lambda path: path in self.images,
+        )
+        barrier = threading.Barrier(2)
+        claimed: list[object] = []
+
+        def claim(service: GenBoxPushBatchService) -> None:
+            barrier.wait()
+            claimed.append(service._claim_next())
+
+        first = threading.Thread(target=claim, args=(self.batches,))
+        second = threading.Thread(target=claim, args=(second_worker,))
+        first.start()
+        second.start()
+        first.join(timeout=2)
+        second.join(timeout=2)
+
+        self.assertFalse(first.is_alive())
+        self.assertFalse(second.is_alive())
+        self.assertEqual(sum(item is not None for item in claimed), 1)
+        state = self.batches.get(str(batch["id"]))
+        self.assertEqual(state["sending"], 1)
+
+    def test_separate_processes_cannot_claim_the_same_item(self) -> None:
+        batch = self.batches.create(["2026/07/28/one.png"], start_worker=False)
+        context = multiprocessing.get_context("spawn")
+        start = context.Event()
+        results = context.Queue()
+        workers = [
+            context.Process(target=_claim_from_separate_process, args=(str(self.tmp / "batches.json"), start, results))
+            for _ in range(2)
+        ]
+        for worker in workers:
+            worker.start()
+        start.set()
+        for worker in workers:
+            worker.join(timeout=10)
+
+        self.assertTrue(all(not worker.is_alive() for worker in workers))
+        self.assertEqual([worker.exitcode for worker in workers], [0, 0])
+        self.assertEqual(sum(results.get(timeout=2) for _ in workers), 1)
+        self.assertEqual(self.batches.get(str(batch["id"]))["sending"], 1)
+
+    def test_retryable_failure_has_a_bounded_automatic_retry(self) -> None:
+        class TemporaryFailurePushService(FakePushService):
+            def push_image(self, path: str, **kwargs: object) -> dict[str, object]:
+                self.calls.append(path)
+                if len(self.calls) < 3:
+                    raise GenBoxPushError("temporary", retryable=True)
+                return {
+                    "status": "imported",
+                    "sha256": str(kwargs.get("expected_sha256") or ""),
+                    "source_retained": True,
+                }
+
+        sender = TemporaryFailurePushService()
+        batches = GenBoxPushBatchService(
+            state_file=self.tmp / "retry.json",
+            push_service=sender,
+            image_reader=self.images.__getitem__,
+            image_exists=lambda path: path in self.images,
+            retry_delay_seconds=lambda _attempt: 0,
+        )
+        batch = batches.create(["2026/07/28/one.png"], start_worker=False)
+        batches._drain()
+
+        completed = batches.get(str(batch["id"]))
+        self.assertEqual(completed["succeeded"], 1)
+        self.assertEqual(completed["failed"], 0)
+        self.assertEqual(completed["items"][0]["attempts"], 3)
+
+    def test_retryable_failure_stops_after_the_attempt_limit(self) -> None:
+        class AlwaysTemporaryFailurePushService(FakePushService):
+            def push_image(self, path: str, **kwargs: object) -> dict[str, object]:
+                self.calls.append(path)
+                raise GenBoxPushError("temporary", retryable=True)
+
+        sender = AlwaysTemporaryFailurePushService()
+        batches = GenBoxPushBatchService(
+            state_file=self.tmp / "retry-limit.json",
+            push_service=sender,
+            image_reader=self.images.__getitem__,
+            image_exists=lambda path: path in self.images,
+            retry_delay_seconds=lambda _attempt: 0,
+        )
+        batch = batches.create(["2026/07/28/one.png"], start_worker=False)
+        batches._drain()
+
+        failed = batches.get(str(batch["id"]))
+        self.assertEqual(failed["failed"], 1)
+        self.assertEqual(failed["items"][0]["attempts"], 3)
+        self.assertFalse(failed["items"][0]["retryable"])
+
 
 class StubBatchService:
     def __init__(self) -> None:
@@ -151,6 +294,9 @@ class StubBatchService:
 
     def retry_failed(self, batch_id: str) -> dict[str, object] | None:
         return self._batch() if batch_id == "batch" else None
+
+    def get_latest_recoverable(self) -> dict[str, object] | None:
+        return self._batch()
 
     @staticmethod
     def preview_date_range(start_date: str, end_date: str) -> dict[str, object]:
@@ -188,6 +334,9 @@ class GenBoxPushBatchApiTests(unittest.TestCase):
         self.assertNotIn("prompt", created.text)
         self.assertNotIn("push_key", created.text)
         self.assertEqual(self.client.get("/api/genbox-push/batches/batch", headers=self.headers).status_code, 200)
+        latest = self.client.get("/api/genbox-push/batches/latest-recoverable", headers=self.headers)
+        self.assertEqual(latest.status_code, 200)
+        self.assertEqual(latest.json()["batch"]["id"], "batch")
         self.assertEqual(self.client.post("/api/genbox-push/batches/batch/cancel", headers=self.headers).status_code, 200)
         self.assertEqual(self.client.post("/api/genbox-push/batches/batch/retry-failed", headers=self.headers).status_code, 200)
         self.assertEqual(self.client.get("/api/genbox-push/batches/missing", headers=self.headers).status_code, 404)

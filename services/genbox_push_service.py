@@ -22,7 +22,9 @@ SUCCESS_STATUSES = {"imported", "already-imported", "duplicate-local"}
 
 
 class GenBoxPushError(RuntimeError):
-    pass
+    def __init__(self, message: str, *, retryable: bool = False) -> None:
+        super().__init__(message)
+        self.retryable = retryable
 
 
 @dataclass(frozen=True)
@@ -187,6 +189,8 @@ class GenBoxPushService:
         status = int(getattr(response, "status_code", 0) or 0)
         if status in {401, 403}:
             return GenBoxPushError("GenBox 拒绝了推送身份，请检查来源标识或推送密钥")
+        if status in {408, 429} or status >= 500:
+            return GenBoxPushError(f"GenBox 暂时不可用（HTTP {status}）", retryable=True)
         if status:
             return GenBoxPushError(f"GenBox 拒绝了本次推送（HTTP {status}）")
         return GenBoxPushError("无法连接到 GenBox")
@@ -207,7 +211,7 @@ class GenBoxPushService:
                 allow_redirects=False,
             )
         except Exception as exc:
-            raise GenBoxPushError("无法连接到 GenBox，请检查私网或地址") from exc
+            raise GenBoxPushError("无法连接到 GenBox，请检查私网或地址", retryable=True) from exc
         finally:
             close = getattr(session, "close", None)
             if callable(close):
@@ -324,7 +328,7 @@ class GenBoxPushService:
                     allow_redirects=False,
                 )
             except Exception as exc:
-                raise GenBoxPushError("图片尚未发送成功，源图已保留") from exc
+                raise GenBoxPushError("图片尚未发送成功，源图已保留", retryable=True) from exc
             finally:
                 multipart.close()
                 close = getattr(session, "close", None)

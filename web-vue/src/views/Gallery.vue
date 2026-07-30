@@ -512,6 +512,7 @@ function clearGalleryTimers() {
 }
 
 function activateGalleryView(refresh = false) {
+  galleryOperations.activate()
   if (refresh) {
     void loadGallery()
   }

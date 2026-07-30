@@ -312,7 +312,8 @@ assert resumed_batch.get("resume")["queued"] == 1
 resumed_batch._drain()
 resumed = resumed_batch.get("resume")
 assert resumed["status"] == "succeeded", resumed
-assert resumed["succeeded"] == 1, resumed
+assert resumed["succeeded"] + resumed["already_imported"] == 1, resumed
+assert resumed["already_imported"] == 1, resumed
 for path in (batch_state_file, batch_state_file.with_suffix(batch_state_file.suffix + ".bak")):
     path.unlink(missing_ok=True)
 
@@ -330,6 +331,7 @@ print("LOCAL_SMOKE_RESULT=" + json.dumps({
     "second_status": second["status"],
     "coordinated_physical_calls": gated.calls,
     "resumed_batch_status": resumed["status"],
+    "resumed_batch_item_status": resumed["items"][0]["status"],
     "source_sha256": first["sha256"],
     "source_retained": first["source_retained"] and second["source_retained"],
 }, sort_keys=True))

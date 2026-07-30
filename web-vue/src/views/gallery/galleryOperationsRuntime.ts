@@ -321,17 +321,27 @@ export function useGalleryOperationsRuntime(options: GalleryOperationsRuntimeOpt
     operationProgress.title = '推送到 GenBox'
     operationProgress.subtitle = `已选择 ${batch.total} 张图片；源图会保留`
     operationProgress.total = batch.total
-    operationProgress.current = batch.succeeded + batch.failed + batch.cancelled
-    operationProgress.statusLabel = batch.failed ? `失败 ${batch.failed}` : '已处理'
+    operationProgress.current = batch.succeeded + batch.already_imported + batch.failed + batch.cancelled
+    operationProgress.statusLabel = batch.failed
+      ? `失败 ${batch.failed}`
+      : batch.retrying
+        ? `重试中 ${batch.retrying}`
+      : batch.already_imported
+        ? `已存在 ${batch.already_imported}`
+        : '已处理'
     operationProgress.message = batch.status === 'queued'
-      ? '已加入推送队列。你可以继续浏览图片。'
+      ? batch.retrying
+        ? '部分图片会在短暂等待后自动重试；源图仍保留。'
+        : '已加入推送队列。你可以继续浏览图片。'
       : batch.status === 'sending'
         ? '正在推送到 GenBox；关闭此窗口不会取消任务。'
         : batch.status === 'cancelled'
           ? '剩余未开始的图片已取消；源图仍保留。'
           : batch.failed
             ? '部分图片未完成。可仅重试失败项；源图仍保留。'
-            : '图片已推送完成；源图仍保留。'
+            : batch.already_imported
+              ? '图片已在 GenBox 中确认存在；不会重复导入，源图仍保留。'
+              : '图片已推送完成；源图仍保留。'
     operationProgress.error = batch.failed
       ? '部分图片暂时未能推送。不会影响本地源图。'
       : ''
@@ -362,6 +372,24 @@ export function useGalleryOperationsRuntime(options: GalleryOperationsRuntimeOpt
     options.runtime.setInterval('gallery:genbox-push-batch', 1000, () => {
       void refreshPushBatch()
     })
+  }
+
+  async function restorePushBatch() {
+    if (!options.runtime.canRun.value) return
+    try {
+      const response = await genboxPushApi.getLatestRecoverableBatch()
+      if (!response.batch) return
+      applyPushBatch(response.batch)
+      if (response.batch.status === 'queued' || response.batch.status === 'sending') {
+        startPushBatchPolling(response.batch.id)
+      }
+    } catch {
+      // Recovery is opportunistic. A fresh batch can still be created normally.
+    }
+  }
+
+  function activate() {
+    void restorePushBatch()
   }
 
   async function handlePushSelected() {
@@ -475,6 +503,7 @@ export function useGalleryOperationsRuntime(options: GalleryOperationsRuntimeOpt
     activePushBatch,
     cancelPushBatch,
     retryFailedPushBatch,
+    activate,
     deactivate,
   }
 }

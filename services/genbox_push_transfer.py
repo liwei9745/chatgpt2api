@@ -59,8 +59,11 @@ class GenBoxPushTransferCoordinator:
         return None, destination_scope
 
     @staticmethod
-    def _safe_failure() -> GenBoxPushError:
-        return GenBoxPushError("GenBox Push failed; the source image was retained. Check the destination and retry.")
+    def _safe_failure(*, retryable: bool = False) -> GenBoxPushError:
+        return GenBoxPushError(
+            "GenBox Push failed; the source image was retained. Check the destination and retry.",
+            retryable=retryable,
+        )
 
     def _metadata_fingerprint(self, *, created_at: str, prompt: str, model: str) -> tuple[str, bool]:
         metadata = "\n".join((created_at, prompt, model))
@@ -140,6 +143,9 @@ class GenBoxPushTransferCoordinator:
                 "source_retained": True,
             }
             return dict(transfer.result)
+        except GenBoxPushError as exc:
+            transfer.error = self._safe_failure(retryable=exc.retryable)
+            raise transfer.error
         except Exception:
             transfer.error = self._safe_failure()
             raise transfer.error

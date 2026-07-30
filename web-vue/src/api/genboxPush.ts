@@ -21,7 +21,7 @@ export interface GenBoxPushImageResult {
   source_retained: true
 }
 
-export type GenBoxPushBatchItemStatus = 'queued' | 'sending' | 'succeeded' | 'failed' | 'cancelled'
+export type GenBoxPushBatchItemStatus = 'queued' | 'sending' | 'succeeded' | 'already-imported' | 'failed' | 'cancelled'
 
 export interface GenBoxPushBatchItem {
   id: string
@@ -30,6 +30,9 @@ export interface GenBoxPushBatchItem {
   attempts: number
   updated_at: string
   error: string
+  receipt_status: 'imported' | 'already-imported' | 'duplicate-local' | ''
+  retryable: boolean
+  next_retry_at: string
   source_retained: true
 }
 
@@ -42,6 +45,8 @@ export interface GenBoxPushBatch {
   queued: number
   sending: number
   succeeded: number
+  already_imported: number
+  retrying: number
   failed: number
   cancelled: number
   items: GenBoxPushBatchItem[]
@@ -95,6 +100,8 @@ export const genboxPushApi = {
     ),
   getBatch: (batchId: string) =>
     apiClient.get<never, { batch: GenBoxPushBatch }>(`/api/genbox-push/batches/${encodeURIComponent(batchId)}`),
+  getLatestRecoverableBatch: () =>
+    apiClient.get<never, { batch: GenBoxPushBatch | null }>('/api/genbox-push/batches/latest-recoverable'),
   cancelBatch: (batchId: string) =>
     apiClient.post<Record<string, never>, { batch: GenBoxPushBatch }>(`/api/genbox-push/batches/${encodeURIComponent(batchId)}/cancel`, {}),
   retryFailedBatch: (batchId: string) =>
