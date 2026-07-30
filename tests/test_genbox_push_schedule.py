@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta
+import multiprocessing
 import os
 from pathlib import Path
 import tempfile
@@ -14,6 +15,13 @@ from api import genbox_push
 from api.app import create_app
 from services.genbox_push_schedule import GenBoxPushScheduleService
 from utils.timezone import BEIJING_TZ
+
+
+def _claim_schedule_lease_from_separate_process(state_file: str, start: object, results: object) -> None:
+    service = GenBoxPushScheduleService(state_file=Path(state_file))
+    now = datetime(2026, 7, 27, 10, 0, tzinfo=BEIJING_TZ)
+    start.wait(timeout=5)
+    results.put(service._claim_lease(now) is not None)
 
 
 class FakePushService:
@@ -102,6 +110,27 @@ class GenBoxPushScheduleTests(unittest.TestCase):
             other.run_now()
         self.service._release_lease(str(token))
         self.assertEqual(other.run_now()["succeeded"], 1)
+
+    def test_separate_processes_cannot_claim_the_same_schedule_lease(self) -> None:
+        context = multiprocessing.get_context("spawn")
+        start = context.Event()
+        results = context.Queue()
+        workers = [
+            context.Process(
+                target=_claim_schedule_lease_from_separate_process,
+                args=(str(self.tmp / "schedule.json"), start, results),
+            )
+            for _ in range(2)
+        ]
+        for worker in workers:
+            worker.start()
+        start.set()
+        for worker in workers:
+            worker.join(timeout=10)
+
+        self.assertTrue(all(not worker.is_alive() for worker in workers))
+        self.assertEqual([worker.exitcode for worker in workers], [0, 0])
+        self.assertEqual(sum(results.get(timeout=2) for _ in workers), 1)
 
     def test_failed_batch_retries_only_with_a_bounded_attempt_count(self) -> None:
         self.batch.failed = True
