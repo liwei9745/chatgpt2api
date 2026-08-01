@@ -241,6 +241,28 @@ class GenBoxPushServiceTests(unittest.TestCase):
 
         self.assertIs(result["safe_to_delete_source"], False)
 
+    def test_malformed_receipt_status_type_is_rejected_without_server_error(self) -> None:
+        self.configure()
+        digest = hashlib.sha256(self.image).hexdigest()
+        self.factory.responses.extend([
+            FakeResponse(200, {
+                "ok": True,
+                "contract_version": "v1",
+                "source_id": "chatgpt2api-dev",
+                "max_image_bytes": 4096,
+            }),
+            FakeResponse(200, {
+                "ok": True,
+                "contract_version": "v1",
+                "source_id": "chatgpt2api-dev",
+                "sha256": digest,
+                "status": ["imported"],
+            }),
+        ])
+
+        with self.assertRaises(GenBoxPushError):
+            self.service.push_image("2026/07/28/image.png")
+
     def test_expected_source_hash_refuses_changed_content_before_any_request(self) -> None:
         self.configure()
 

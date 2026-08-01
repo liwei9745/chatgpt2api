@@ -87,6 +87,14 @@ def _cleanup_relative_path(path: object) -> str:
     return value
 
 
+def _is_filesystem_alias(file_stat: os.stat_result) -> bool:
+    if stat.S_ISLNK(file_stat.st_mode):
+        return True
+    reparse_flag = int(getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0) or 0)
+    attributes = int(getattr(file_stat, "st_file_attributes", 0) or 0)
+    return bool(reparse_flag and attributes & reparse_flag)
+
+
 def _image_dimensions(payload: bytes) -> tuple[int, int] | None:
     try:
         with Image.open(io.BytesIO(payload)) as image:
@@ -199,6 +207,9 @@ class ImageStorageService:
 
     def settings(self) -> dict[str, object]:
         return config.get_image_storage_settings()
+
+    def local_root(self) -> Path:
+        return config.images_dir
 
     def mode(self) -> str:
         return _clean(self.settings().get("mode")) or "local"
@@ -397,17 +408,27 @@ class ImageStorageService:
         root = config.images_dir
         try:
             root_stat = root.lstat()
-            if not stat.S_ISDIR(root_stat.st_mode) or root.is_symlink():
+            if not stat.S_ISDIR(root_stat.st_mode) or _is_filesystem_alias(root_stat):
                 return {"ok": False, "reason": "storage-root-invalid"}
             candidate = root / safe_rel
             relative_check = candidate.relative_to(root)
             if relative_check.as_posix() != safe_rel:
                 return {"ok": False, "reason": "path-outside-root"}
-            file_stat = candidate.lstat()
+            current = root
+            components = Path(safe_rel).parts
+            file_stat = None
+            for index, component in enumerate(components):
+                current = current / component
+                component_stat = current.lstat()
+                if _is_filesystem_alias(component_stat):
+                    return {"ok": False, "reason": "path-alias"}
+                if index < len(components) - 1 and not stat.S_ISDIR(component_stat.st_mode):
+                    return {"ok": False, "reason": "source-missing"}
+                file_stat = component_stat
         except (OSError, ValueError):
             return {"ok": False, "reason": "source-missing"}
-        if stat.S_ISLNK(file_stat.st_mode):
-            return {"ok": False, "reason": "path-alias"}
+        if file_stat is None:
+            return {"ok": False, "reason": "source-missing"}
         if not stat.S_ISREG(file_stat.st_mode):
             return {"ok": False, "reason": "source-not-regular"}
         if int(getattr(file_stat, "st_nlink", 1) or 1) != 1:
@@ -449,7 +470,7 @@ class ImageStorageService:
             after_stat.st_dev != file_stat.st_dev
             or after_stat.st_ino != file_stat.st_ino
             or after_stat.st_size != file_stat.st_size
-            or stat.S_ISLNK(after_stat.st_mode)
+            or _is_filesystem_alias(after_stat)
             or int(getattr(after_stat, "st_nlink", 1) or 1) != 1
         ):
             return {"ok": False, "reason": "source-changed"}
@@ -514,7 +535,7 @@ class ImageStorageService:
             except Exception:
                 # The source is already gone, but the durable cleanup record
                 # remains in ``deleting`` so recovery can report ambiguity.
-                return VerifiedDeleteResult("delete_failed", "index-write-failed", int(identity.get("size_bytes") or 0))
+                return VerifiedDeleteResult("delete_unknown", "index-write-failed", int(identity.get("size_bytes") or 0))
             return VerifiedDeleteResult("deleted", "deleted", int(identity.get("size_bytes") or 0))
         finally:
             if lock is not None:

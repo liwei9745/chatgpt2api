@@ -198,6 +198,13 @@ class GenBoxPushService:
 
     @staticmethod
     def _response_json(response: Any) -> dict[str, object]:
+        headers = getattr(response, "headers", {}) or {}
+        try:
+            content_length = int(headers.get("content-length") or headers.get("Content-Length") or 0)
+        except (TypeError, ValueError):
+            content_length = 0
+        if content_length > MAX_RECEIPT_BYTES:
+            raise GenBoxPushError("GenBox returned an oversized receipt; the source image was retained.")
         content = getattr(response, "content", None)
         if isinstance(content, (bytes, bytearray)) and len(content) > MAX_RECEIPT_BYTES:
             raise GenBoxPushError("GenBox returned an oversized receipt; the source image was retained.")
@@ -248,9 +255,9 @@ class GenBoxPushService:
         if not bool(getattr(response, "ok", False)):
             raise self._request_error(response)
         payload = self._response_json(response)
-        if payload.get("ok") is not True or payload.get("contract_version") != PUSH_CONTRACT_VERSION:
+        if payload.get("ok") is not True or not isinstance(payload.get("contract_version"), str) or payload.get("contract_version") != PUSH_CONTRACT_VERSION:
             raise GenBoxPushError("GenBox 不支持当前推送协议")
-        if payload.get("source_id") != settings.source_id:
+        if not isinstance(payload.get("source_id"), str) or payload.get("source_id") != settings.source_id:
             raise GenBoxPushError("GenBox 返回的来源标识不匹配")
         return payload
 
@@ -398,12 +405,17 @@ class GenBoxPushService:
             if not bool(getattr(response, "ok", False)):
                 raise self._request_error(response)
             receipt = self._response_json(response)
+            status = receipt.get("status")
             if (
                 receipt.get("ok") is not True
+                or not isinstance(receipt.get("contract_version"), str)
                 or receipt.get("contract_version") != PUSH_CONTRACT_VERSION
+                or not isinstance(receipt.get("source_id"), str)
                 or receipt.get("source_id") != settings.source_id
+                or not isinstance(receipt.get("sha256"), str)
                 or receipt.get("sha256") != digest
-                or receipt.get("status") not in SUCCESS_STATUSES
+                or not isinstance(status, str)
+                or status not in SUCCESS_STATUSES
             ):
                 raise GenBoxPushError("GenBox 回执校验失败，源图已保留")
             result = {

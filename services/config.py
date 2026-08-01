@@ -15,6 +15,7 @@ DATA_DIR = BASE_DIR / "data"
 CONFIG_FILE = BASE_DIR / "config.json"
 VERSION_FILE = BASE_DIR / "VERSION"
 BACKUP_STATE_FILE = DATA_DIR / "backup_state.json"
+CLEANUP_STATE_FILE = DATA_DIR / "genbox_push_cleanup.json"
 
 DEFAULT_BACKUP_INCLUDE = {
     "config": True,
@@ -581,9 +582,15 @@ class ConfigStore:
 
     def cleanup_old_images(self) -> int:
         cutoff = time.time() - self.image_retention_days * 86400
+        protected = self.receipt_protected_image_paths()
         removed = 0
         for path in self.images_dir.rglob("*"):
-            if path.is_file() and path.stat().st_mtime < cutoff:
+            rel = ""
+            try:
+                rel = path.relative_to(self.images_dir).as_posix()
+            except ValueError:
+                pass
+            if path.is_file() and rel not in protected and path.stat().st_mtime < cutoff:
                 path.unlink()
                 removed += 1
         for path in sorted((p for p in self.images_dir.rglob("*") if p.is_dir()), key=lambda p: len(p.parts), reverse=True):
@@ -592,6 +599,28 @@ class ConfigStore:
             except OSError:
                 pass
         return removed
+
+    def receipt_protected_image_paths(self) -> set[str]:
+        """Return Push-tracked sources that automatic retention must preserve."""
+        if CLEANUP_STATE_FILE.exists():
+            try:
+                if not CLEANUP_STATE_FILE.is_file():
+                    return {"*"}
+            except OSError:
+                return {"*"}
+        raw = read_json_object(CLEANUP_STATE_FILE, name=CLEANUP_STATE_FILE.name)
+        if CLEANUP_STATE_FILE.exists() and not isinstance(raw.get("records"), dict):
+            return {"*"}
+        records = raw.get("records") if isinstance(raw.get("records"), dict) else {}
+        protected: set[str] = set()
+        for record in records.values():
+            if not isinstance(record, dict) or record.get("cleanup_status") == "deleted":
+                continue
+            path = str(record.get("remote_path") or "").strip().replace("\\", "/")
+            parts = path.split("/")
+            if path and not path.startswith("/") and all(part and part not in {".", ".."} for part in parts):
+                protected.add(path)
+        return protected
 
     @property
     def base_url(self) -> str:

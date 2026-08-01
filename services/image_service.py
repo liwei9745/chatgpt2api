@@ -525,9 +525,12 @@ def delete_to_target(target_free_mb: int, dry_run: bool = False) -> dict:
     for p in files:
         if current_free + freed // (1024 * 1024) >= target_free_mb:
             break
+        rel = p.relative_to(config.images_dir).as_posix()
+        protected = config.receipt_protected_image_paths()
+        if "*" in protected or rel in protected:
+            continue
         size = p.stat().st_size
         if not dry_run:
-            rel = p.relative_to(config.images_dir).as_posix()
             for tp in (_thumbnail_path(rel), config.image_thumbnails_dir / _safe_relative_path(rel)):
                 if tp.is_file():
                     tp.unlink()

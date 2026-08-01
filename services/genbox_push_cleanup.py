@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import hashlib
+import hmac
 import os
 import threading
 import uuid
@@ -61,6 +62,10 @@ class CleanupEnvironmentGate:
 
     def __init__(self, environ: dict[str, str] | None = None) -> None:
         self.environ = environ if environ is not None else os.environ
+        self._storage_root_provider: Callable[[], Path] | None = None
+
+    def bind_storage_root(self, provider: Callable[[], Path]) -> None:
+        self._storage_root_provider = provider
 
     def environment_class(self) -> str:
         return _clean(
@@ -69,15 +74,45 @@ class CleanupEnvironmentGate:
             or self.environ.get("CHATGPT2API_ENVIRONMENT")
         ).lower()
 
+    def _runtime_identity_matches(self) -> bool:
+        configured_root = _clean(self.environ.get("CHATGPT2API_CLEANUP_STORAGE_ROOT"))
+        if not configured_root or self._storage_root_provider is None:
+            return False
+        try:
+            roots_match = Path(configured_root).resolve() == Path(self._storage_root_provider()).resolve()
+        except (OSError, RuntimeError, TypeError):
+            roots_match = False
+        return bool(
+            _clean(self.environ.get("CHATGPT2API_CLEANUP_INSTANCE_ROLE")) == "isolated-development"
+            and _clean(self.environ.get("CHATGPT2API_CLEANUP_INSTANCE_ID"))
+            and _clean(self.environ.get("CHATGPT2API_CLEANUP_CAPABILITY"))
+            and roots_match
+        )
+
+    def destination_trusted(self, destination_scope: str) -> bool:
+        trusted = _clean(self.environ.get("CHATGPT2API_CLEANUP_TRUSTED_DESTINATION_SCOPE"))
+        trust_kind = _clean(self.environ.get("CHATGPT2API_CLEANUP_TRUSTED_DESTINATION_KIND"))
+        return (
+            trust_kind in {"https", "private-verified"}
+            and bool(trusted)
+            and hmac.compare_digest(trusted, _clean(destination_scope))
+        )
+
     def can_execute(self) -> bool:
-        return self.environment_class() == "isolated-vps" and _bool_env(
-            self.environ.get("CHATGPT2API_CLEANUP_EXECUTE")
-            or self.environ.get("GENBOX_CLEANUP_EXECUTE")
+        return (
+            self.environment_class() == "isolated-vps"
+            and _bool_env(
+                self.environ.get("CHATGPT2API_CLEANUP_EXECUTE")
+                or self.environ.get("GENBOX_CLEANUP_EXECUTE")
+            )
+            and self._runtime_identity_matches()
         )
 
     def reason(self) -> str:
         if self.environment_class() != "isolated-vps":
             return "development-disabled"
+        if not self._runtime_identity_matches():
+            return "runtime-identity-unverified"
         return "cleanup-execute-disabled"
 
 
@@ -130,6 +165,15 @@ class GenBoxPushCleanupService:
         self.environment_gate = environment_gate or CleanupEnvironmentGate()
         self.now = now
         self._lock = ProcessReentrantLock(state_file.with_suffix(state_file.suffix + ".state.lock"))
+        self.environment_gate.bind_storage_root(lambda: self.image_storage_root())
+
+    def image_storage_root(self) -> Path:
+        provider = getattr(self.image_storage, "local_root", None)
+        if callable(provider):
+            return Path(provider())
+        from services.config import config
+
+        return config.images_dir
 
     def _load_state_locked(self) -> dict[str, dict[str, Any]]:
         raw = read_json_object(self.state_file, name=self.state_file.name)
@@ -254,6 +298,8 @@ class GenBoxPushCleanupService:
         current_scope = self._current_destination_scope()
         if not current_scope or current_scope != str(record.get("destination_scope") or ""):
             return "retained", "destination-scope-changed", 0
+        if not self.environment_gate.destination_trusted(current_scope):
+            return "retained", "destination-unverified", 0
         result = self.image_storage.verify_local_identity(
             str(record.get("remote_path") or ""),
             str(record.get("source_sha256") or ""),
@@ -273,6 +319,7 @@ class GenBoxPushCleanupService:
             "deleted": 0,
             "retained": 0,
             "failed": 0,
+            "already_deleted": 0,
             "potential_bytes": 0,
             "reclaimed_bytes": 0,
             "items": [],
@@ -330,7 +377,15 @@ class GenBoxPushCleanupService:
             summary["candidates"] = int(summary["candidates"]) + 1
             current_status = str(record.get("cleanup_status") or "")
             if current_status == "deleted":
-                decision, reason, size = "retained", "already-deleted", 0
+                summary["already_deleted"] = int(summary.get("already_deleted", 0)) + 1
+                summary["items"].append({
+                    **self._public_record(record),
+                    "decision": "already-deleted",
+                    "decision_reason": "already-deleted",
+                    "size_bytes": 0,
+                    "reclaimed_bytes": 0,
+                })
+                continue
             elif not self.policy_enabled():
                 decision, reason, size = "retained", "cleanup-policy-disabled", 0
             else:
@@ -370,6 +425,8 @@ class GenBoxPushCleanupService:
             claim = source_claim(str(record.get("remote_path") or ""), str(record.get("source_sha256") or ""))
             if not claim.acquire(timeout_secs=0):
                 reason = "source-busy"
+                summary["eligible"] = max(0, int(summary["eligible"]) - 1)
+                summary["potential_bytes"] = max(0, int(summary["potential_bytes"]) - size)
                 summary["retained"] = int(summary["retained"]) + 1
                 item_result.update({"decision": "retained", "decision_reason": reason, "size_bytes": 0})
                 summary["items"].append(item_result)
@@ -418,6 +475,13 @@ class GenBoxPushCleanupService:
                         self._append_audit_locked(self._audit_event(operation_id=operation_id, mode=mode, record=current, prior_status="deleting", decision="delete_failed", reason=deletion.reason, size_bytes=deletion.size_bytes))
                         summary["failed"] = int(summary["failed"]) + 1
                         item_result.update({"decision": "delete_failed", "decision_reason": deletion.reason, "size_bytes": deletion.size_bytes})
+                    elif deletion.status == "delete_unknown":
+                        current.update({"cleanup_status": "delete_unknown", "decision_reason": deletion.reason, "decided_at": self.now()})
+                        live[key] = current
+                        self._save_state_locked(live)
+                        self._append_audit_locked(self._audit_event(operation_id=operation_id, mode=mode, record=current, prior_status="deleting", decision="delete_unknown", reason=deletion.reason, size_bytes=deletion.size_bytes))
+                        summary["failed"] = int(summary["failed"]) + 1
+                        item_result.update({"decision": "delete_unknown", "decision_reason": deletion.reason, "size_bytes": deletion.size_bytes, "source_retained": False})
                     else:
                         current.update({"cleanup_status": "retained", "decision_reason": deletion.reason, "decided_at": self.now()})
                         live[key] = current
@@ -458,10 +522,23 @@ class GenBoxPushCleanupService:
                 if identity.get("ok"):
                     record.update({"cleanup_status": "retained", "decision_reason": "interrupted-before-delete", "decided_at": self.now()})
                     recovered["retained"] += 1
+                    decision = "retained"
+                    reason = "interrupted-before-delete"
                 else:
                     record.update({"cleanup_status": "delete_unknown", "decision_reason": "interrupted-ambiguous", "decided_at": self.now()})
                     recovered["unknown"] += 1
+                    decision = "delete_unknown"
+                    reason = "interrupted-ambiguous"
                 records[key] = record
+                self._append_audit_locked(self._audit_event(
+                    operation_id=f"recovery-{uuid.uuid4().hex}",
+                    mode="recovery",
+                    record=record,
+                    prior_status="deleting",
+                    decision=decision,
+                    reason=reason,
+                    size_bytes=int(record.get("size_bytes") or 0),
+                ))
                 changed = True
             if changed:
                 self._save_state_locked(records)

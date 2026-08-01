@@ -18,6 +18,7 @@ from services.config import config
 from services.genbox_push_cleanup import CleanupEnvironmentGate, GenBoxPushCleanupService
 from services.image_storage_service import ImageStorageService
 from services.json_file import write_json_file
+from services.source_claim import source_claim
 
 
 def _request(*headers: tuple[str, str]) -> Request:
@@ -67,6 +68,14 @@ class GenBoxPushCleanupTests(unittest.TestCase):
         self.gate = CleanupEnvironmentGate({
             "CHATGPT2API_CLEANUP_ENVIRONMENT": "isolated-vps",
             "CHATGPT2API_CLEANUP_EXECUTE": "1",
+            "CHATGPT2API_CLEANUP_INSTANCE_ROLE": "isolated-development",
+            "CHATGPT2API_CLEANUP_INSTANCE_ID": "synthetic-isolated-sender",
+            "CHATGPT2API_CLEANUP_STORAGE_ROOT": str(self.images.resolve()),
+            "CHATGPT2API_CLEANUP_CAPABILITY": "synthetic-capability-32-bytes-000000000000",
+            "CHATGPT2API_CLEANUP_TRUSTED_DESTINATION_KIND": "private-verified",
+            "CHATGPT2API_CLEANUP_TRUSTED_DESTINATION_SCOPE": hashlib.sha256(
+                b"https://genbox.test\nchatgpt2api-dev\nsynthetic-push-key"
+            ).hexdigest(),
         })
         self.service = GenBoxPushCleanupService(
             state_file=self.state,
@@ -189,6 +198,24 @@ class GenBoxPushCleanupTests(unittest.TestCase):
             self.assertTrue(source.exists())
             self.assertEqual(result["items"][0]["decision_reason"], "path-alias")
 
+        outside = self.tmp / "outside"
+        outside.mkdir(parents=True, exist_ok=True)
+        (outside / "parent-source.png").write_bytes(b"parent")
+        parent_alias = self.images / "2026/08/01/alias-parent"
+        try:
+            parent_alias.symlink_to(outside, target_is_directory=True)
+        except (OSError, NotImplementedError):
+            parent_alias = None
+        if parent_alias is not None:
+            digest = hashlib.sha256(b"parent").hexdigest()
+            self.service.record_receipt(
+                destination_scope=self._scope(), source_id="chatgpt2api-dev", remote_path="2026/08/01/alias-parent/parent-source.png",
+                source_sha256=digest, receipt_status="imported", safe_to_delete_source=True, size_bytes=6,
+            )
+            result = self.service.execute()
+            self.assertTrue((outside / "parent-source.png").exists())
+            self.assertTrue(any(item["decision_reason"] == "path-alias" for item in result["items"]))
+
         hard = self.images / "2026/08/01/hard.png"
         hard.write_bytes(b"hard")
         alias = self.images / "2026/08/01/hard-alias.png"
@@ -257,6 +284,26 @@ class GenBoxPushCleanupTests(unittest.TestCase):
                 "environment": "isolated-vps",
             })
 
+    def test_automatic_retention_protects_unresolved_push_source(self) -> None:
+        from services.config import config
+
+        with patch("services.config.read_json_object", return_value={
+            "records": {
+                "source": {
+                    "remote_path": "2026/08/01/protected.png",
+                    "cleanup_status": "eligible",
+                },
+                "deleted": {
+                    "remote_path": "2026/08/01/already-deleted.png",
+                    "cleanup_status": "deleted",
+                },
+            }
+        }):
+            protected = config.receipt_protected_image_paths()
+
+        self.assertIn("2026/08/01/protected.png", protected)
+        self.assertNotIn("2026/08/01/already-deleted.png", protected)
+
     def test_restart_recovery_retains_existing_source_after_deleting_intent(self) -> None:
         target = self._record()
         records = json.loads(self.state.read_text(encoding="utf-8"))["records"]
@@ -312,6 +359,37 @@ class GenBoxPushCleanupTests(unittest.TestCase):
         self.assertFalse(target.exists())
         self.assertEqual(sum(int(result["deleted"]) for result in results), 1)
         self.assertEqual(sum(int(result["reclaimed_bytes"]) for result in results), len(b"synthetic-image"))
+
+    def test_source_busy_does_not_leave_eligible_bytes_in_summary(self) -> None:
+        target = self._record()
+        self._enable_policy()
+        digest = hashlib.sha256(b"synthetic-image").hexdigest()
+        claim = source_claim("2026/08/01/image.png", digest)
+        self.assertTrue(claim.acquire(timeout_secs=0))
+        try:
+            result = self.service.execute()
+        finally:
+            claim.release()
+
+        self.assertEqual(result["eligible"], 0)
+        self.assertEqual(result["potential_bytes"], 0)
+        self.assertEqual(result["retained"], 1)
+        self.assertEqual(result["items"][0]["decision_reason"], "source-busy")
+        self.assertTrue(target.exists())
+
+    def test_deleted_record_remains_terminal_on_repeat_preview(self) -> None:
+        target = self._record()
+        self._enable_policy()
+        first = self.service.execute()
+        self.assertEqual(first["deleted"], 1)
+        self.assertFalse(target.exists())
+
+        second = self.service.preview()
+
+        self.assertEqual(second["already_deleted"], 1)
+        self.assertEqual(second["items"][0]["decision"], "already-deleted")
+        records = json.loads(self.state.read_text(encoding="utf-8"))["records"]
+        self.assertEqual(next(iter(records.values()))["cleanup_status"], "deleted")
 
 
 if __name__ == "__main__":
