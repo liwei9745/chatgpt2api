@@ -38,7 +38,6 @@ class GenBoxPushOutbox:
         # lock allows two processes to claim the same queued item concurrently.
         self._lock = ProcessReentrantLock(state_file.with_suffix(state_file.suffix + ".state.lock"))
         self._worker: threading.Thread | None = None
-        self._recovered = False
         # Prompt text is intentionally memory-only. It can enrich an immediate
         # Push but is never written to durable transfer state or normal logs.
         self._metadata: dict[str, dict[str, str]] = {}
@@ -68,22 +67,20 @@ class GenBoxPushOutbox:
             for key, value in items.items()
             if isinstance(value, dict) and str(value.get("status") or "") in OUTBOX_STATUSES
         }
-        if not self._recovered:
-            self._recovered = True
-            changed = False
-            for entry_id, item in items.items():
-                if item.get("status") != "sending":
-                    continue
-                item_lock = self._item_lock(entry_id)
-                if not item_lock.acquire(timeout_secs=0):
-                    continue
-                try:
-                    item.update({"status": "queued", "updated_at": beijing_now_str()})
-                    changed = True
-                finally:
-                    item_lock.release()
-            if changed:
-                self._save_locked(items)
+        changed = False
+        for entry_id, item in items.items():
+            if item.get("status") != "sending":
+                continue
+            item_lock = self._item_lock(entry_id)
+            if not item_lock.acquire(timeout_secs=0):
+                continue
+            try:
+                item.update({"status": "queued", "updated_at": beijing_now_str()})
+                changed = True
+            finally:
+                item_lock.release()
+        if changed:
+            self._save_locked(items)
         return items
 
     def _save_locked(self, items: dict[str, dict[str, Any]]) -> None:

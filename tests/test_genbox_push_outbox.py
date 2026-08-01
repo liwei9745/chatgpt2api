@@ -164,7 +164,9 @@ class GenBoxPushOutboxTests(unittest.TestCase):
         self.assertTrue(all(not worker.is_alive() for worker in workers))
         self.assertEqual([worker.exitcode for worker in workers], [0, 0])
         self.assertEqual(sum(results.get(timeout=2) for _ in workers), 1)
-        self.assertEqual(outbox.status_for_path("2026/07/28/synthetic.png")["status"], "sending")
+        recovered = outbox.status_for_path("2026/07/28/synthetic.png")
+        self.assertEqual(recovered["status"], "queued")
+        self.assertEqual(recovered["attempts"], 1)
 
     def test_already_imported_outcome_is_public(self) -> None:
         class DuplicatePushService(FakePushService):
