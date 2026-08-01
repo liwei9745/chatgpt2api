@@ -160,20 +160,33 @@ class CleanupEnvironmentGate:
             or (parsed_trusted.path or "").rstrip("/") != (parsed_configured.path or "").rstrip("/")
         ):
             return False
-        try:
-            host = parsed_configured.hostname or ""
-            address = ipaddress.ip_address(host)
-            if address.is_loopback or address.is_unspecified or address.is_reserved or address.is_multicast:
-                return False
-            if trust_kind == "private-verified" and not (address.is_private or address.is_link_local):
-                return False
-        except ValueError:
-            if not host or trust_kind not in {"https", "private-verified"}:
-                return False
         if trust_kind == "private-verified":
+            host = parsed_configured.hostname or ""
             verified_host = _clean(self.environ.get("CHATGPT2API_CLEANUP_TRUSTED_PRIVATE_HOST")).lower()
             if not verified_host or verified_host != host.lower():
                 return False
+            try:
+                address = ipaddress.ip_address(host)
+            except ValueError:
+                return False
+            private_cgnat = ipaddress.ip_network("100.64.0.0/10")
+            if (
+                address.is_loopback
+                or address.is_unspecified
+                or address.is_reserved
+                or address.is_multicast
+                or not (address.is_private or address.is_link_local or address in private_cgnat)
+            ):
+                return False
+        else:
+            host = parsed_configured.hostname or ""
+            try:
+                address = ipaddress.ip_address(host)
+                if address.is_loopback or address.is_unspecified or address.is_reserved or address.is_multicast:
+                    return False
+            except ValueError:
+                if not host:
+                    return False
         return hmac.compare_digest(trusted, _clean(destination_scope))
 
     def can_execute(self) -> bool:
@@ -540,10 +553,20 @@ class GenBoxPushCleanupService:
                     decision, reason, size = self._inspect(current)
                     if decision != "eligible":
                         current.update({"cleanup_status": "retained", "decision_reason": reason, "decided_at": self.now()})
-                        self._save_state_locked(live)
                         self._append_audit_locked(self._audit_event(operation_id=operation_id, mode=mode, record=current, prior_status=current_status, decision="retained", reason=reason, size_bytes=size))
+                        self._save_state_locked(live)
                         summary["retained"] = int(summary["retained"]) + 1
                         item_result.update({"decision": "retained", "decision_reason": reason, "size_bytes": size})
+                        summary["items"].append(item_result)
+                        continue
+                    if not dry_run and not self.policy_enabled():
+                        current.update({"cleanup_status": "retained", "decision_reason": "cleanup-policy-disabled", "decided_at": self.now()})
+                        self._append_audit_locked(self._audit_event(operation_id=operation_id, mode=mode, record=current, prior_status=current_status, decision="retained", reason="cleanup-policy-disabled", size_bytes=0))
+                        self._save_state_locked(live)
+                        summary["eligible"] = max(0, int(summary["eligible"]) - 1)
+                        summary["potential_bytes"] = max(0, int(summary["potential_bytes"]) - size)
+                        summary["retained"] = int(summary["retained"]) + 1
+                        item_result.update({"decision": "retained", "decision_reason": "cleanup-policy-disabled", "size_bytes": 0})
                         summary["items"].append(item_result)
                         continue
                     intent = dict(current)
@@ -563,30 +586,30 @@ class GenBoxPushCleanupService:
                     if deletion.status == "deleted":
                         current.update({"cleanup_status": "deleted", "decision_reason": "deleted", "decided_at": self.now(), "size_bytes": deletion.size_bytes})
                         live[key] = current
-                        self._save_state_locked(live)
                         self._append_audit_locked(self._audit_event(operation_id=operation_id, mode=mode, record=current, prior_status="deleting", decision="deleted", reason="deleted", size_bytes=deletion.size_bytes, reclaimed_bytes=deletion.size_bytes))
+                        self._save_state_locked(live)
                         summary["deleted"] = int(summary["deleted"]) + 1
                         summary["reclaimed_bytes"] = int(summary["reclaimed_bytes"]) + deletion.size_bytes
                         item_result.update({"decision": "deleted", "decision_reason": "deleted", "size_bytes": deletion.size_bytes, "reclaimed_bytes": deletion.size_bytes, "source_retained": False})
                     elif deletion.status == "delete_failed":
                         current.update({"cleanup_status": "delete_failed", "decision_reason": deletion.reason, "decided_at": self.now()})
                         live[key] = current
-                        self._save_state_locked(live)
                         self._append_audit_locked(self._audit_event(operation_id=operation_id, mode=mode, record=current, prior_status="deleting", decision="delete_failed", reason=deletion.reason, size_bytes=deletion.size_bytes))
+                        self._save_state_locked(live)
                         summary["failed"] = int(summary["failed"]) + 1
                         item_result.update({"decision": "delete_failed", "decision_reason": deletion.reason, "size_bytes": deletion.size_bytes})
                     elif deletion.status == "delete_unknown":
                         current.update({"cleanup_status": "delete_unknown", "decision_reason": deletion.reason, "decided_at": self.now()})
                         live[key] = current
-                        self._save_state_locked(live)
                         self._append_audit_locked(self._audit_event(operation_id=operation_id, mode=mode, record=current, prior_status="deleting", decision="delete_unknown", reason=deletion.reason, size_bytes=deletion.size_bytes))
+                        self._save_state_locked(live)
                         summary["failed"] = int(summary["failed"]) + 1
                         item_result.update({"decision": "delete_unknown", "decision_reason": deletion.reason, "size_bytes": deletion.size_bytes, "source_retained": True, "source_state": "unknown"})
                     else:
                         current.update({"cleanup_status": "retained", "decision_reason": deletion.reason, "decided_at": self.now()})
                         live[key] = current
-                        self._save_state_locked(live)
                         self._append_audit_locked(self._audit_event(operation_id=operation_id, mode=mode, record=current, prior_status="deleting", decision="retained", reason=deletion.reason, size_bytes=deletion.size_bytes))
+                        self._save_state_locked(live)
                         summary["retained"] = int(summary["retained"]) + 1
                         item_result.update({"decision": "retained", "decision_reason": deletion.reason, "size_bytes": deletion.size_bytes})
                     summary["items"].append(item_result)

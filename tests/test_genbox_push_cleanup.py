@@ -80,7 +80,7 @@ class GenBoxPushCleanupTests(unittest.TestCase):
             "CHATGPT2API_CLEANUP_STORAGE_ROOT": str(self.images.resolve()),
             "CHATGPT2API_CLEANUP_CAPABILITY": "synthetic-capability-32-bytes-000000000000",
             "CHATGPT2API_CLEANUP_MARKER_SHA256": marker_hash,
-            "CHATGPT2API_CLEANUP_TRUSTED_DESTINATION_KIND": "private-verified",
+            "CHATGPT2API_CLEANUP_TRUSTED_DESTINATION_KIND": "https",
             "CHATGPT2API_CLEANUP_TRUSTED_DESTINATION_URL": "https://genbox.test",
             "CHATGPT2API_CLEANUP_TRUSTED_PRIVATE_HOST": "genbox.test",
             "CHATGPT2API_CLEANUP_TRUSTED_DESTINATION_SCOPE": hashlib.sha256(
@@ -283,12 +283,53 @@ class GenBoxPushCleanupTests(unittest.TestCase):
     def test_private_verified_hostname_requires_server_attestation(self) -> None:
         target = self._record()
         self._enable_policy()
+        self.gate.environ["CHATGPT2API_CLEANUP_TRUSTED_DESTINATION_KIND"] = "private-verified"
         self.gate.environ["CHATGPT2API_CLEANUP_TRUSTED_PRIVATE_HOST"] = "other.internal"
 
         result = self.service.execute()
 
         self.assertTrue(target.exists())
         self.assertEqual(result["items"][0]["decision_reason"], "destination-unverified")
+
+    def test_policy_flip_after_inspection_retains_source(self) -> None:
+        target = self._record()
+        self._enable_policy()
+        original_inspect = self.service._inspect
+
+        def flip_policy(record):
+            result = original_inspect(record)
+            write_json_file(self.settings, {
+                "enabled": True,
+                "cleanup_enabled": False,
+                "base_url": "https://genbox.test",
+                "source_id": "chatgpt2api-dev",
+                "push_key": "synthetic-push-key",
+            })
+            return result
+
+        with patch.object(self.service, "_inspect", side_effect=flip_policy):
+            result = self.service.execute()
+
+        self.assertTrue(target.exists())
+        self.assertEqual(result["items"][0]["decision_reason"], "cleanup-policy-disabled")
+
+    def test_terminal_audit_failure_leaves_durable_deleting_intent(self) -> None:
+        target = self._record()
+        self._enable_policy()
+        original_append = self.service._append_audit_locked
+
+        def fail_terminal(event):
+            if event.get("decision") == "deleting":
+                return original_append(event)
+            raise OSError("synthetic audit failure")
+
+        with patch.object(self.service, "_append_audit_locked", side_effect=fail_terminal):
+            result = self.service.execute()
+
+        self.assertFalse(target.exists())
+        self.assertEqual(result["items"][0]["decision"], "delete_unknown")
+        records = json.loads(self.state.read_text(encoding="utf-8"))["records"]
+        self.assertEqual(next(iter(records.values()))["cleanup_status"], "deleting")
 
     def test_missing_isolated_marker_blocks_execute(self) -> None:
         target = self._record()
