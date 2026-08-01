@@ -608,6 +608,9 @@ class ImageStorageService:
     def _before_verified_unlink(self, _target: _OpenedCleanupTarget) -> None:
         """Test seam for deterministic replacement-race coverage."""
 
+    def _before_final_unlink(self, _target: _OpenedCleanupTarget) -> None:
+        """Test seam for the final directory-entry identity check."""
+
     def _unlink_open_cleanup_target(self, target: _OpenedCleanupTarget) -> VerifiedDeleteResult:
         try:
             os.lseek(target.descriptor, 0, os.SEEK_SET)
@@ -624,6 +627,23 @@ class ImageStorageService:
         except OSError:
             return VerifiedDeleteResult("retained", "source-changed", target.size_bytes)
         if not _same_cleanup_identity(latest_stat, target.file_stat):
+            return VerifiedDeleteResult("retained", "source-changed", target.size_bytes)
+        # A cooperating sender worker can only mutate a source while holding
+        # the shared claim. Re-read the opened bytes and the directory entry
+        # after the final test seam as well, so the replacement window between
+        # the last observation and the platform unlink primitive is covered by
+        # an explicit fail-closed check in the supported application boundary.
+        try:
+            self._before_final_unlink(target)
+            os.lseek(target.descriptor, 0, os.SEEK_SET)
+            final_digest = self._read_open_digest(target.descriptor)
+            os.lseek(target.descriptor, 0, os.SEEK_SET)
+            final_stat = self._cleanup_stat(target)
+        except FileNotFoundError:
+            return VerifiedDeleteResult("retained", "source-missing", target.size_bytes)
+        except OSError:
+            return VerifiedDeleteResult("retained", "source-changed", target.size_bytes)
+        if final_digest != target.digest or not _same_cleanup_identity(final_stat, target.file_stat):
             return VerifiedDeleteResult("retained", "source-changed", target.size_bytes)
         try:
             if os.name == "nt":

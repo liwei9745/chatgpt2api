@@ -37,9 +37,15 @@ class ImageStorageCleanupTests(unittest.TestCase):
         self.storage = ImageStorageService(index_file=self.tmp / "index.json")
         self.config_patch = patch("services.image_storage_service.config", _ImageConfig(self.images))
         self.config_patch.start()
+        # Keep the process-shared source claim inside this test's temporary
+        # root so a live development server cannot make the fixture appear
+        # busy or mask the storage identity result.
+        self.claim_path_patch = patch("services.source_claim.DATA_DIR", self.tmp / "claims")
+        self.claim_path_patch.start()
 
     def tearDown(self) -> None:
         self.config_patch.stop()
+        self.claim_path_patch.stop()
         for path in sorted(self.tmp.rglob("*"), key=lambda item: len(item.parts), reverse=True):
             if path.is_file() or path.is_symlink():
                 path.unlink()
@@ -80,6 +86,30 @@ class ImageStorageCleanupTests(unittest.TestCase):
             self.assertEqual(result.reason, "source-changed")
             self.assertTrue(target.exists())
             self.assertEqual(target.read_bytes(), b"replacement-bytes")
+
+    def test_replacement_after_final_identity_check_is_retained(self) -> None:
+        rel, target, digest = self._source()
+        replacement = target.with_name("replacement-after-final-check.png")
+        replacement_blocked = []
+
+        def replace_after_final_check(_opened: object) -> None:
+            replacement.write_bytes(b"replacement-after-final-check")
+            try:
+                os.replace(replacement, target)
+            except OSError as exc:
+                replacement_blocked.append(exc)
+
+        with patch.object(self.storage, "_before_final_unlink", side_effect=replace_after_final_check):
+            result = self.storage.delete_verified_local(rel, digest)
+
+        if replacement_blocked:
+            self.assertEqual(result.status, "deleted")
+            self.assertFalse(target.exists())
+        else:
+            self.assertEqual(result.status, "retained")
+            self.assertEqual(result.reason, "source-changed")
+            self.assertTrue(target.exists())
+            self.assertEqual(target.read_bytes(), b"replacement-after-final-check")
 
     def test_hard_link_alias_is_retained(self) -> None:
         rel, target, digest = self._source()

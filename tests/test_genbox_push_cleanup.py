@@ -9,9 +9,11 @@ import tempfile
 import threading
 import time
 import unittest
+from contextlib import ExitStack
 from unittest.mock import patch
 
 from fastapi import HTTPException
+from fastapi.testclient import TestClient
 from starlette.requests import Request
 
 os.environ.setdefault("CHATGPT2API_AUTH_KEY", "local-test-admin-key")
@@ -53,6 +55,11 @@ class _ImageConfig:
         return ""
 
 
+class _NoopThread:
+    def join(self, timeout: float | None = None) -> None:
+        del timeout
+
+
 def _cleanup_process_worker(
     images: str,
     settings: str,
@@ -63,8 +70,10 @@ def _cleanup_process_worker(
     result_queue,
 ) -> None:
     import services.image_storage_service as storage_module
+    import services.source_claim as claim_module
 
     storage_module.config = _ImageConfig(Path(images))
+    claim_module.DATA_DIR = Path(state).parent / "claims"
     storage = ImageStorageService(index_file=Path(index))
     service = GenBoxPushCleanupService(
         state_file=Path(state),
@@ -85,8 +94,10 @@ def _cleanup_crash_worker(
     environment: dict[str, str],
 ) -> None:
     import services.image_storage_service as storage_module
+    import services.source_claim as claim_module
 
     storage_module.config = _ImageConfig(Path(images))
+    claim_module.DATA_DIR = Path(state).parent / "claims"
     storage = ImageStorageService(index_file=Path(index))
     storage._before_verified_unlink = lambda _target: os._exit(17)
     service = GenBoxPushCleanupService(
@@ -145,9 +156,15 @@ class GenBoxPushCleanupTests(unittest.TestCase):
         )
         self.config_patch = patch("services.image_storage_service.config", _ImageConfig(self.images))
         self.config_patch.start()
+        # Keep all process-shared source claims inside this test's temporary
+        # root. A live development server must not make a synthetic item look
+        # busy or alter the recovery outcome.
+        self.claim_path_patch = patch("services.source_claim.DATA_DIR", self.tmp / "claims")
+        self.claim_path_patch.start()
 
     def tearDown(self) -> None:
         self.config_patch.stop()
+        self.claim_path_patch.stop()
         for path in sorted(self.tmp.rglob("*"), key=lambda item: len(item.parts), reverse=True):
             if path.is_file() or path.is_symlink():
                 path.unlink()
@@ -599,8 +616,41 @@ class GenBoxPushCleanupTests(unittest.TestCase):
 
         self.assertEqual(worker.exitcode, 17)
         self.assertTrue(target.exists())
-        recovered = self.service.recover_inflight()
-        self.assertEqual(recovered, {"retained": 1, "unknown": 0})
+
+        # Exercise the actual FastAPI lifespan hook rather than calling the
+        # recovery method directly. Unrelated schedulers are replaced by
+        # no-op collaborators so the test cannot touch live data or workers.
+        with ExitStack() as stack:
+            for target_name in (
+                "genbox_push_outbox.resume",
+                "genbox_push_batch_service.resume",
+                "genbox_push_schedule_service.resume",
+                "account_service.cleanup_auto_remove_accounts",
+                "backup_service.start",
+                "backup_service.stop",
+                "config.cleanup_old_images",
+                "cleanup_old_logs",
+                "dashboard_metrics_service.flush",
+                "genbox_push_schedule_service.stop",
+            ):
+                stack.enter_context(patch(f"api.app.{target_name}"))
+            for target_name in (
+                "start_limited_account_watcher",
+                "start_image_cleanup_scheduler",
+                "start_log_cleanup_scheduler",
+            ):
+                stack.enter_context(patch(f"api.app.{target_name}", return_value=_NoopThread()))
+            stack.enter_context(patch("api.app.genbox_push_cleanup_service", self.service))
+            from api.app import create_app
+
+            with TestClient(create_app()):
+                pass
+
+        raw = json.loads(self.state.read_text(encoding="utf-8"))
+        records = raw.get("records") or {}
+        recovered = next(iter(records.values()))
+        self.assertEqual(recovered["cleanup_status"], "retained")
+        self.assertEqual(recovered["decision_reason"], "interrupted-before-delete")
         self.assertTrue(target.exists())
 
     def test_mixed_execute_results_reconcile_totals(self) -> None:

@@ -5,10 +5,14 @@ import json
 import os
 from pathlib import Path
 from typing import Any
+import threading
+import time
 import unittest
 from unittest.mock import patch
 
-from curl_cffi import CurlMime
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+from curl_cffi import CurlMime, requests
 
 
 os.environ.setdefault("CHATGPT2API_AUTH_KEY", "local-test-admin-key")
@@ -81,10 +85,16 @@ class GenBoxPushServiceTests(unittest.TestCase):
             image_reader=lambda path: self.image if path == "2026/07/28/image.png" else b"",
             session_factory=self.factory,
         )
+        self.claim_path_patch = patch("services.source_claim.DATA_DIR", self.tmp / "claims")
+        self.claim_path_patch.start()
 
     def tearDown(self) -> None:
-        for path in self.tmp.iterdir():
-            path.unlink()
+        self.claim_path_patch.stop()
+        for path in sorted(self.tmp.rglob("*"), key=lambda item: len(item.parts), reverse=True):
+            if path.is_file() or path.is_symlink():
+                path.unlink()
+            elif path.is_dir():
+                path.rmdir()
         self.tmp.rmdir()
 
     def _get_tmp_dir(self) -> str:
@@ -301,6 +311,100 @@ class GenBoxPushServiceTests(unittest.TestCase):
         with patch("services.genbox_push_service.time.monotonic", side_effect=lambda: next(ticks)):
             with self.assertRaisesRegex(GenBoxPushError, "timed out"):
                 self.service.probe()
+
+    def test_real_slow_drip_push_retains_source_and_state(self) -> None:
+        source_rel = "2026/07/28/image.png"
+        source = self.tmp / source_rel
+        source.parent.mkdir(parents=True, exist_ok=True)
+        source.write_bytes(self.image)
+        self.service.image_reader = lambda path: source.read_bytes() if path == source_rel else b""
+
+        digest = hashlib.sha256(self.image).hexdigest()
+        received = {"post": 0}
+
+        class SlowReceiptHandler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, *_args: object) -> None:
+                return None
+
+            def _send_json(self, payload: dict[str, object]) -> None:
+                body = json.dumps(payload).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                self.wfile.flush()
+
+            def do_GET(self) -> None:
+                if self.path.endswith("/api/sync/push/status"):
+                    self._send_json({
+                        "ok": True,
+                        "contract_version": "v1",
+                        "source_id": "chatgpt2api-dev",
+                        "max_image_bytes": 4096,
+                    })
+                    return
+                self.send_error(404)
+
+            def do_POST(self) -> None:
+                received["post"] += 1
+                try:
+                    length = int(self.headers.get("Content-Length") or 0)
+                    if length:
+                        self.rfile.read(length)
+                    body = json.dumps({
+                        "ok": True,
+                        "contract_version": "v1",
+                        "source_id": "chatgpt2api-dev",
+                        "sha256": digest,
+                        "status": "imported",
+                        "safe_to_delete_source": False,
+                    }).encode("utf-8")
+                    first, rest = body[:12], body[12:]
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Transfer-Encoding", "chunked")
+                    self.end_headers()
+
+                    def write_chunk(chunk: bytes) -> None:
+                        self.wfile.write(f"{len(chunk):X}\r\n".encode("ascii"))
+                        self.wfile.write(chunk + b"\r\n")
+                        self.wfile.flush()
+
+                    write_chunk(first)
+                    time.sleep(0.25)
+                    write_chunk(rest)
+                    self.wfile.write(b"0\r\n\r\n")
+                    self.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError):
+                    return
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), SlowReceiptHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            self.service.update_settings({
+                "enabled": True,
+                "base_url": f"http://127.0.0.1:{server.server_port}",
+                "source_id": "chatgpt2api-dev",
+                "push_key": "secret-not-for-responses",
+                "timeout_secs": 5,
+            })
+            self.service.session_factory = requests.Session
+            with patch("services.genbox_push_service.MAX_RECEIPT_SECONDS", 0.1):
+                with self.assertRaisesRegex(GenBoxPushError, "timed out"):
+                    self.service.push_image(source_rel)
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+
+        self.assertEqual(received["post"], 1)
+        self.assertTrue(source.exists())
+        self.assertFalse((self.tmp / "state.json").exists())
+        self.assertFalse((self.tmp / "genbox_push_cleanup.json").exists())
 
     def test_streaming_malformed_receipt_is_retained(self) -> None:
         self.configure()
