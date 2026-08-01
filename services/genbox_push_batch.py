@@ -42,6 +42,7 @@ class GenBoxPushBatchService:
         image_lister: Callable[..., list[dict[str, object]]] = image_storage_service.list_items,
         worker_factory: Callable[..., threading.Thread] = threading.Thread,
         retry_delay_seconds: Callable[[int], float] | None = None,
+        sending_recovery_grace_seconds: float = SENDING_RECOVERY_GRACE_SECONDS,
     ) -> None:
         self.state_file = state_file
         self.push_service = push_service
@@ -51,6 +52,7 @@ class GenBoxPushBatchService:
         self.image_lister = image_lister
         self.worker_factory = worker_factory
         self.retry_delay_seconds = retry_delay_seconds or self._default_retry_delay_seconds
+        self.sending_recovery_grace_seconds = max(0.0, float(sending_recovery_grace_seconds))
         self._lock = ProcessReentrantLock(state_file.with_suffix(state_file.suffix + ".state.lock"))
         self._worker: threading.Thread | None = None
         self._retry_wakeup = threading.Event()
@@ -88,8 +90,7 @@ class GenBoxPushBatchService:
     def _retry_at(self, attempts: int) -> str:
         return (beijing_now() + timedelta(seconds=self.retry_delay_seconds(attempts))).isoformat()
 
-    @staticmethod
-    def _sending_is_stale(item: dict[str, Any]) -> bool:
+    def _sending_is_stale(self, item: dict[str, Any]) -> bool:
         try:
             updated_at = datetime.fromisoformat(str(item.get("updated_at") or ""))
         except ValueError:
@@ -97,7 +98,7 @@ class GenBoxPushBatchService:
         if updated_at.tzinfo is not None:
             updated_at = updated_at.astimezone(beijing_now().tzinfo).replace(tzinfo=None)
         now = beijing_now().replace(tzinfo=None)
-        return updated_at <= now - timedelta(seconds=SENDING_RECOVERY_GRACE_SECONDS)
+        return updated_at <= now - timedelta(seconds=self.sending_recovery_grace_seconds)
 
     def _load_locked(self) -> dict[str, dict[str, Any]]:
         raw = read_json_object(self.state_file, name=self.state_file.name)
@@ -122,6 +123,9 @@ class GenBoxPushBatchService:
                 item_lock = self._item_lock(batch_id, item_id)
                 if item_lock.acquire(timeout_secs=0):
                     try:
+                        # A live sender holds this lock through transfer. A free
+                        # lock after the recovery grace means the previous
+                        # process stopped and this durable item can be resumed.
                         item.update({"status": "queued", "updated_at": beijing_now_str()})
                         changed = True
                         batch_changed = True
@@ -436,7 +440,7 @@ class GenBoxPushBatchService:
                         for batch in batches.values()
                         for item in batch["items"].values()
                     )
-                    if pending and (retrying or sending):
+                    if (pending and retrying) or sending:
                         self._retry_wakeup.clear()
                         wait_for_recovery = True
                     elif pending:

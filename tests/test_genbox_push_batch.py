@@ -4,6 +4,7 @@ import hashlib
 import json
 import multiprocessing
 import os
+from datetime import datetime
 from pathlib import Path
 import tempfile
 import threading
@@ -229,6 +230,38 @@ class GenBoxPushBatchServiceTests(unittest.TestCase):
         state = recovered.get("batch")
         self.assertEqual(state["failed"], 1)
         self.assertNotIn("source changed", json.dumps(state))
+
+    def test_immediate_restart_recovers_a_free_sending_item_and_continues(self) -> None:
+        digest = hashlib.sha256(b"one").hexdigest()
+        state_file = self.tmp / "immediate-restart.json"
+        state_file.write_text(json.dumps({"batches": {"batch": {
+            "created_at": datetime.now().astimezone().isoformat(),
+            "updated_at": datetime.now().astimezone().isoformat(),
+            "items": {"item": {
+                "path": "2026/07/28/one.png", "source_sha256": digest,
+                "status": "sending", "attempts": 1,
+                "updated_at": datetime.now().astimezone().isoformat(),
+            }},
+        }}}), encoding="utf-8")
+        recovered = GenBoxPushBatchService(
+            state_file=state_file,
+            push_service=self.sender,
+            image_reader=self.images.__getitem__,
+            image_exists=lambda path: path in self.images,
+            sending_recovery_grace_seconds=0,
+        )
+
+        recovered.resume()
+        worker = recovered._worker
+        self.assertIsNotNone(worker)
+        assert worker is not None
+        worker.join(timeout=2)
+
+        self.assertFalse(worker.is_alive())
+        completed = recovered.get("batch")
+        self.assertEqual(completed["succeeded"], 1)
+        self.assertEqual(completed["items"][0]["attempts"], 2)
+        self.assertEqual(self.sender.calls, ["2026/07/28/one.png"])
 
     def test_date_range_preview_uses_server_index_and_rejects_invalid_bounds(self) -> None:
         preview = self.batches.preview_date_range("2026-07-01", "2026-07-31")
