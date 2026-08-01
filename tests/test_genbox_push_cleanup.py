@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import tempfile
+import threading
 import unittest
 from unittest.mock import patch
 
@@ -255,6 +256,62 @@ class GenBoxPushCleanupTests(unittest.TestCase):
                 "receipt": {"safe_to_delete_source": True},
                 "environment": "isolated-vps",
             })
+
+    def test_restart_recovery_retains_existing_source_after_deleting_intent(self) -> None:
+        target = self._record()
+        records = json.loads(self.state.read_text(encoding="utf-8"))["records"]
+        key, record = next(iter(records.items()))
+        record["cleanup_status"] = "deleting"
+        record["decision_reason"] = "deletion-intent"
+        records[key] = record
+        write_json_file(self.state, {"record_version": 1, "records": records})
+
+        result = self.service.recover_inflight()
+
+        self.assertEqual(result, {"retained": 1, "unknown": 0})
+        self.assertTrue(target.exists())
+        recovered = json.loads(self.state.read_text(encoding="utf-8"))["records"][key]
+        self.assertEqual(recovered["cleanup_status"], "retained")
+        self.assertEqual(recovered["decision_reason"], "interrupted-before-delete")
+
+    def test_restart_recovery_marks_missing_target_unknown_without_deleting_another_file(self) -> None:
+        target = self._record()
+        records = json.loads(self.state.read_text(encoding="utf-8"))["records"]
+        key, record = next(iter(records.items()))
+        record["cleanup_status"] = "deleting"
+        records[key] = record
+        write_json_file(self.state, {"record_version": 1, "records": records})
+        target.unlink()
+        substitute = self.images / "2026/08/01/substitute.png"
+        substitute.write_bytes(b"substitute")
+
+        result = self.service.recover_inflight()
+
+        self.assertEqual(result, {"retained": 0, "unknown": 1})
+        self.assertTrue(substitute.exists())
+        recovered = json.loads(self.state.read_text(encoding="utf-8"))["records"][key]
+        self.assertEqual(recovered["cleanup_status"], "delete_unknown")
+
+    def test_concurrent_execute_has_one_terminal_delete(self) -> None:
+        target = self._record()
+        self._enable_policy()
+        results: list[dict[str, object]] = []
+        barrier = threading.Barrier(2)
+
+        def run() -> None:
+            barrier.wait()
+            results.append(self.service.execute())
+
+        workers = [threading.Thread(target=run) for _ in range(2)]
+        for worker in workers:
+            worker.start()
+        for worker in workers:
+            worker.join(timeout=5)
+
+        self.assertEqual(len(results), 2)
+        self.assertFalse(target.exists())
+        self.assertEqual(sum(int(result["deleted"]) for result in results), 1)
+        self.assertEqual(sum(int(result["reclaimed_bytes"]) for result in results), len(b"synthetic-image"))
 
 
 if __name__ == "__main__":
