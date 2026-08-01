@@ -82,6 +82,7 @@ class GenBoxPushCleanupTests(unittest.TestCase):
             "CHATGPT2API_CLEANUP_MARKER_SHA256": marker_hash,
             "CHATGPT2API_CLEANUP_TRUSTED_DESTINATION_KIND": "private-verified",
             "CHATGPT2API_CLEANUP_TRUSTED_DESTINATION_URL": "https://genbox.test",
+            "CHATGPT2API_CLEANUP_TRUSTED_PRIVATE_HOST": "genbox.test",
             "CHATGPT2API_CLEANUP_TRUSTED_DESTINATION_SCOPE": hashlib.sha256(
                 b"https://genbox.test\nchatgpt2api-dev\nsynthetic-push-key"
             ).hexdigest(),
@@ -279,6 +280,16 @@ class GenBoxPushCleanupTests(unittest.TestCase):
         self.assertTrue(target.exists())
         self.assertEqual(result["items"][0]["decision_reason"], "destination-unverified")
 
+    def test_private_verified_hostname_requires_server_attestation(self) -> None:
+        target = self._record()
+        self._enable_policy()
+        self.gate.environ["CHATGPT2API_CLEANUP_TRUSTED_PRIVATE_HOST"] = "other.internal"
+
+        result = self.service.execute()
+
+        self.assertTrue(target.exists())
+        self.assertEqual(result["items"][0]["decision_reason"], "destination-unverified")
+
     def test_missing_isolated_marker_blocks_execute(self) -> None:
         target = self._record()
         self._enable_policy()
@@ -457,6 +468,29 @@ class GenBoxPushCleanupTests(unittest.TestCase):
 
         self.assertEqual(second["unknown"], 1)
         self.assertEqual(second["items"][0]["decision"], "delete-unknown-terminal")
+        self.assertTrue(second["items"][0]["source_retained"])
+        self.assertTrue(target.exists())
+
+    def test_delete_unknown_cannot_be_overwritten_by_same_identity_receipt(self) -> None:
+        target = self._record()
+        self._enable_policy()
+        self.storage._save_index({"2026/08/01/image.png": {"rel": "2026/08/01/image.png", "local": True, "webdav": False}})
+        with patch.object(self.storage, "_save_index", side_effect=OSError("synthetic index failure")):
+            self.service.execute()
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(b"synthetic-image")
+        digest = hashlib.sha256(b"synthetic-image").hexdigest()
+        existing = self.service.record_receipt(
+            destination_scope=self._scope(),
+            source_id="chatgpt2api-dev",
+            remote_path="2026/08/01/image.png",
+            source_sha256=digest,
+            receipt_status="imported",
+            safe_to_delete_source=True,
+            size_bytes=len(b"synthetic-image"),
+        )
+
+        self.assertEqual(existing["cleanup_status"], "delete_unknown")
         self.assertTrue(target.exists())
 
     def test_persisted_malformed_receipt_is_retained(self) -> None:

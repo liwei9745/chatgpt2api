@@ -170,6 +170,10 @@ class CleanupEnvironmentGate:
         except ValueError:
             if not host or trust_kind not in {"https", "private-verified"}:
                 return False
+        if trust_kind == "private-verified":
+            verified_host = _clean(self.environ.get("CHATGPT2API_CLEANUP_TRUSTED_PRIVATE_HOST")).lower()
+            if not verified_host or verified_host != host.lower():
+                return False
         return hmac.compare_digest(trusted, _clean(destination_scope))
 
     def can_execute(self) -> bool:
@@ -337,7 +341,7 @@ class GenBoxPushCleanupService:
         with self._lock:
             records = self._load_state_locked()
             existing = records.get(key)
-            if isinstance(existing, dict) and existing.get("cleanup_status") in {"deleted", "deleting"}:
+            if isinstance(existing, dict) and existing.get("cleanup_status") in {"deleted", "deleting", "delete_unknown"}:
                 return dict(existing)
             records[key] = record
             self._save_state_locked(records)
@@ -478,7 +482,8 @@ class GenBoxPushCleanupService:
                     "decision_reason": "delete-unknown-terminal",
                     "size_bytes": 0,
                     "reclaimed_bytes": 0,
-                    "source_retained": False,
+                    "source_retained": True,
+                    "source_state": "unknown",
                 })
                 continue
             elif not self.policy_enabled():
@@ -576,7 +581,7 @@ class GenBoxPushCleanupService:
                         self._save_state_locked(live)
                         self._append_audit_locked(self._audit_event(operation_id=operation_id, mode=mode, record=current, prior_status="deleting", decision="delete_unknown", reason=deletion.reason, size_bytes=deletion.size_bytes))
                         summary["failed"] = int(summary["failed"]) + 1
-                        item_result.update({"decision": "delete_unknown", "decision_reason": deletion.reason, "size_bytes": deletion.size_bytes, "source_retained": False})
+                        item_result.update({"decision": "delete_unknown", "decision_reason": deletion.reason, "size_bytes": deletion.size_bytes, "source_retained": True, "source_state": "unknown"})
                     else:
                         current.update({"cleanup_status": "retained", "decision_reason": deletion.reason, "decided_at": self.now()})
                         live[key] = current
