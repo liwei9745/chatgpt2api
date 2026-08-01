@@ -7,10 +7,11 @@
 - Added receipt-gated, opt-in source cleanup records with SHA-256 binding,
   isolated-runtime identity checks, path-alias protection, restart recovery,
   bounded receipt parsing, and conservative `delete_unknown` handling.
-- Verified locally with the full test suite (`85 passed`), compile checks, and
-  a reproducible Docker build. Cleanup remains disabled by default and is not
-  yet an experimental release image; an independent adversarial review and
-  isolated dry-run/explicit synthetic execute gate are still required.
+- Verified locally with the full test suite (`94 passed, 1 skipped`), compile
+  checks, and a reproducible Docker build. Cleanup remains disabled by default
+  and is not yet an experimental release image. Independent review still
+  blocks publication on destination/policy rotation races, unlink TOCTOU, and
+  missing isolated evidence.
 
 ## 2.7.0 - 2026-07-18
 
