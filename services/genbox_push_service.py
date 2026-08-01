@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import re
 import threading
@@ -211,6 +212,27 @@ class GenBoxPushService:
         text = getattr(response, "text", None)
         if isinstance(text, str) and len(text.encode("utf-8")) > MAX_RECEIPT_BYTES:
             raise GenBoxPushError("GenBox returned an oversized receipt; the source image was retained.")
+        iterator = getattr(response, "iter_content", None)
+        if callable(iterator):
+            chunks: list[bytes] = []
+            total = 0
+            try:
+                for chunk in iterator(chunk_size=64 * 1024):
+                    if not chunk:
+                        continue
+                    payload_chunk = bytes(chunk)
+                    total += len(payload_chunk)
+                    if total > MAX_RECEIPT_BYTES:
+                        raise GenBoxPushError("GenBox returned an oversized receipt; the source image was retained.")
+                    chunks.append(payload_chunk)
+                payload = json.loads(b"".join(chunks).decode("utf-8"))
+            except GenBoxPushError:
+                raise
+            except Exception as exc:
+                raise GenBoxPushError("GenBox returned an unreadable response; the source image was retained.") from exc
+            if not isinstance(payload, dict):
+                raise GenBoxPushError("GenBox returned an unreadable response; the source image was retained.")
+            return payload
         try:
             payload = response.json()
         except Exception as exc:
@@ -244,6 +266,7 @@ class GenBoxPushService:
                 headers=self._headers(settings),
                 timeout=settings.timeout_secs,
                 allow_redirects=False,
+                stream=True,
             )
         except Exception as exc:
             raise GenBoxPushError("无法连接到 GenBox，请检查私网或地址", retryable=True) from exc
@@ -393,6 +416,7 @@ class GenBoxPushService:
                     },
                     timeout=settings.timeout_secs,
                     allow_redirects=False,
+                    stream=True,
                 )
             except Exception as exc:
                 raise GenBoxPushError("图片尚未发送成功，源图已保留", retryable=True) from exc
