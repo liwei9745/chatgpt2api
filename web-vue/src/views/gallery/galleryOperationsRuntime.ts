@@ -1,4 +1,4 @@
-import { reactive, ref, type Ref } from 'vue'
+import { computed, reactive, ref, type Ref } from 'vue'
 
 import { galleryApi, type GalleryFile, type ImageStorageStats } from '@/api/gallery'
 import { genboxPushApi, type GenBoxPushBatch } from '@/api/genboxPush'
@@ -62,6 +62,16 @@ export function useGalleryOperationsRuntime(options: GalleryOperationsRuntimeOpt
     message: '',
     error: '',
     busy: false,
+  })
+
+  const pushBatchReceiptItems = computed(() => {
+    if (operationProgress.title !== '推送到 GenBox') return []
+    return (activePushBatch.value?.items || []).map((item) => ({
+      id: item.id,
+      filename: batchReceiptFilename(item.path),
+      status: batchReceiptStatus(item.status, item.receipt_status, item.retryable),
+      attempts: Math.max(0, Math.trunc(Number(item.attempts) || 0)),
+    }))
   })
 
   const storageStatsQuery = usePageQuery({
@@ -514,6 +524,7 @@ export function useGalleryOperationsRuntime(options: GalleryOperationsRuntimeOpt
     storageActionError,
     targetFreeMb,
     operationProgress,
+    pushBatchReceiptItems,
     refreshStorageStats,
     openStorageModal,
     closeStorageModal,
@@ -530,5 +541,35 @@ export function useGalleryOperationsRuntime(options: GalleryOperationsRuntimeOpt
     retryFailedPushBatch,
     activate,
     deactivate,
+  }
+}
+
+function batchReceiptFilename(path: string) {
+  const filename = String(path || '').replace(/\\/g, '/').split('/').filter(Boolean).pop()
+  return filename || '未命名图片'
+}
+
+function batchReceiptStatus(
+  status: GenBoxPushBatch['items'][number]['status'],
+  receiptStatus: GenBoxPushBatch['items'][number]['receipt_status'],
+  retryable: boolean,
+) {
+  if (receiptStatus === 'already-imported') return '已确认存在'
+  if (receiptStatus === 'imported') return '已导入'
+  if (receiptStatus === 'duplicate-local') return '本地已记录'
+
+  switch (status) {
+    case 'queued':
+      return '待发送'
+    case 'sending':
+      return '发送中'
+    case 'succeeded':
+      return '已完成'
+    case 'failed':
+      return retryable ? '失败，可重试' : '失败'
+    case 'cancelled':
+      return '已取消'
+    default:
+      return '状态未知'
   }
 }

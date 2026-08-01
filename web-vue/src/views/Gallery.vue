@@ -207,7 +207,20 @@
       @close="operationProgress.open = false"
       @cancel="cancelPushBatch"
       @retry="retryFailedPushBatch"
-    />
+    >
+      <template #details>
+        <section v-if="pushBatchReceiptItems.length" class="gallery-push-receipts" aria-label="图片推送回执">
+          <div class="gallery-push-receipts__header">
+            <span>图片回执</span>
+            <span>状态 / 尝试</span>
+          </div>
+          <div v-for="item in pushBatchReceiptItems" :key="item.id" class="gallery-push-receipts__item">
+            <span class="gallery-push-receipts__filename" :title="item.filename">{{ item.filename }}</span>
+            <span class="gallery-push-receipts__result">{{ item.status }} / {{ item.attempts }} 次</span>
+          </div>
+        </section>
+      </template>
+    </OperationProgressModal>
 
     <ModalShell
       :open="isStorageModalOpen"
@@ -448,6 +461,7 @@ const {
   storageActionError,
   targetFreeMb,
   operationProgress,
+  pushBatchReceiptItems,
   refreshStorageStats,
   openStorageModal,
   closeStorageModal,
@@ -611,6 +625,57 @@ pageRuntime.onShow(() => {
 
 .gallery-storage-modal {
   background: hsl(var(--card));
+}
+
+.gallery-push-receipts {
+  overflow: hidden;
+  border: 1px solid hsl(var(--border));
+  border-radius: 8px;
+}
+
+.gallery-push-receipts__header,
+.gallery-push-receipts__item {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 12px;
+}
+
+.gallery-push-receipts__header {
+  border-bottom: 1px solid hsl(var(--border));
+  background: hsl(var(--muted) / 0.45);
+  padding: 7px 10px;
+  color: hsl(var(--muted-foreground));
+  font-size: 0.6875rem;
+}
+
+.gallery-push-receipts__header span:last-child {
+  text-align: right;
+}
+
+.gallery-push-receipts__item {
+  min-height: 34px;
+  padding: 7px 10px;
+  font-size: 0.75rem;
+}
+
+.gallery-push-receipts__item + .gallery-push-receipts__item {
+  border-top: 1px solid hsl(var(--border));
+}
+
+.gallery-push-receipts__filename {
+  min-width: 0;
+  overflow: hidden;
+  color: hsl(var(--foreground));
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.gallery-push-receipts__result {
+  color: hsl(var(--muted-foreground));
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+  white-space: nowrap;
 }
 
 .gallery-storage-header {
