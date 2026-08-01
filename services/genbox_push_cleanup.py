@@ -3,14 +3,16 @@ from __future__ import annotations
 import json
 import hashlib
 import hmac
+import ipaddress
 import os
 import threading
 import uuid
 from pathlib import Path
 from typing import Any, Callable
+from urllib.parse import urlparse
 
 from services.config import DATA_DIR
-from services.image_storage_service import ImageStorageService, image_storage_service
+from services.image_storage_service import ImageStorageService, _is_filesystem_alias, image_storage_service
 from services.json_file import read_json_object
 from services.process_file_lock import ProcessFileLock, ProcessReentrantLock
 from services.source_claim import source_claim
@@ -68,11 +70,7 @@ class CleanupEnvironmentGate:
         self._storage_root_provider = provider
 
     def environment_class(self) -> str:
-        return _clean(
-            self.environ.get("CHATGPT2API_CLEANUP_ENVIRONMENT")
-            or self.environ.get("GENBOX_CLEANUP_ENVIRONMENT")
-            or self.environ.get("CHATGPT2API_ENVIRONMENT")
-        ).lower()
+        return _clean(self.environ.get("CHATGPT2API_CLEANUP_ENVIRONMENT")).lower()
 
     def _runtime_identity_matches(self) -> bool:
         configured_root = _clean(self.environ.get("CHATGPT2API_CLEANUP_STORAGE_ROOT"))
@@ -81,11 +79,50 @@ class CleanupEnvironmentGate:
         instance_id = _clean(self.environ.get("CHATGPT2API_CLEANUP_INSTANCE_ID"))
         role = _clean(self.environ.get("CHATGPT2API_CLEANUP_INSTANCE_ROLE"))
         try:
-            roots_match = Path(configured_root).resolve() == Path(self._storage_root_provider()).resolve()
-            marker_path = Path(configured_root).resolve().parent / ".genbox-isolated-cleanup"
-            marker = marker_path.read_text(encoding="utf-8").strip()
-            marker_matches = marker == f"{instance_id}\n{role}\n{Path(configured_root).resolve()}"
-        except (OSError, RuntimeError, TypeError):
+            configured_path = Path(configured_root)
+            configured_stat = configured_path.lstat()
+            if not configured_path.is_dir() or _is_filesystem_alias(configured_stat):
+                return False
+            provider_path = Path(self._storage_root_provider())
+            provider_stat = provider_path.lstat()
+            if not provider_path.is_dir() or _is_filesystem_alias(provider_stat):
+                return False
+            configured_resolved = configured_path.resolve()
+            roots_match = configured_resolved == provider_path.resolve()
+            marker_path = configured_resolved.parent / ".genbox-isolated-cleanup"
+            marker_stat = marker_path.lstat()
+            if (
+                not marker_path.is_file()
+                or _is_filesystem_alias(marker_stat)
+                or int(getattr(marker_stat, "st_nlink", 1) or 1) != 1
+            ):
+                return False
+            nofollow = int(getattr(os, "O_NOFOLLOW", 0) or 0)
+            descriptor = os.open(marker_path, os.O_RDONLY | nofollow)
+            try:
+                opened_stat = os.fstat(descriptor)
+                if (
+                    opened_stat.st_dev != marker_stat.st_dev
+                    or opened_stat.st_ino != marker_stat.st_ino
+                    or opened_stat.st_size != marker_stat.st_size
+                ):
+                    return False
+                with os.fdopen(os.dup(descriptor), "rb", closefd=True) as handle:
+                    marker_bytes = handle.read(4096)
+            finally:
+                os.close(descriptor)
+            if len(marker_bytes) != marker_stat.st_size:
+                return False
+            marker = marker_bytes.decode("utf-8").replace("\r\n", "\n").strip()
+            expected_marker_hash = _clean(self.environ.get("CHATGPT2API_CLEANUP_MARKER_SHA256")).lower()
+            if (
+                len(expected_marker_hash) != 64
+                or any(char not in "0123456789abcdef" for char in expected_marker_hash)
+                or hashlib.sha256(marker_bytes).hexdigest() != expected_marker_hash
+            ):
+                return False
+            marker_matches = marker == f"{instance_id}\n{role}\n{configured_resolved}"
+        except (OSError, RuntimeError, TypeError, UnicodeError, ValueError):
             roots_match = False
             marker_matches = False
         return bool(
@@ -96,22 +133,49 @@ class CleanupEnvironmentGate:
             and marker_matches
         )
 
-    def destination_trusted(self, destination_scope: str) -> bool:
+    def destination_trusted(self, destination_scope: str, base_url: str) -> bool:
         trusted = _clean(self.environ.get("CHATGPT2API_CLEANUP_TRUSTED_DESTINATION_SCOPE"))
         trust_kind = _clean(self.environ.get("CHATGPT2API_CLEANUP_TRUSTED_DESTINATION_KIND"))
-        return (
-            trust_kind in {"https", "private-verified"}
-            and bool(trusted)
-            and hmac.compare_digest(trusted, _clean(destination_scope))
-        )
+        trusted_url = _clean(self.environ.get("CHATGPT2API_CLEANUP_TRUSTED_DESTINATION_URL")).rstrip("/")
+        configured_url = _clean(base_url).rstrip("/")
+        if not trusted or not trusted_url or not configured_url:
+            return False
+        try:
+            parsed_trusted = urlparse(trusted_url)
+            parsed_configured = urlparse(configured_url)
+        except ValueError:
+            return False
+        if (
+            parsed_trusted.scheme != "https"
+            or parsed_configured.scheme != "https"
+            or parsed_trusted.username
+            or parsed_trusted.password
+            or parsed_configured.username
+            or parsed_configured.password
+            or parsed_trusted.query
+            or parsed_trusted.fragment
+            or parsed_configured.query
+            or parsed_configured.fragment
+            or parsed_trusted.netloc != parsed_configured.netloc
+            or (parsed_trusted.path or "").rstrip("/") != (parsed_configured.path or "").rstrip("/")
+        ):
+            return False
+        try:
+            host = parsed_configured.hostname or ""
+            address = ipaddress.ip_address(host)
+            if address.is_loopback or address.is_unspecified or address.is_reserved or address.is_multicast:
+                return False
+            if trust_kind == "private-verified" and not (address.is_private or address.is_link_local):
+                return False
+        except ValueError:
+            if not host or trust_kind not in {"https", "private-verified"}:
+                return False
+        return hmac.compare_digest(trusted, _clean(destination_scope))
 
     def can_execute(self) -> bool:
         return (
             self.environment_class() == "isolated-vps"
-            and _bool_env(
-                self.environ.get("CHATGPT2API_CLEANUP_EXECUTE")
-                or self.environ.get("GENBOX_CLEANUP_EXECUTE")
-            )
+            and _bool_env(self.environ.get("CHATGPT2API_CLEANUP_EXECUTE"))
             and self._runtime_identity_matches()
         )
 
@@ -208,14 +272,14 @@ class GenBoxPushCleanupService:
         raw = read_json_object(self.settings_file, name=self.settings_file.name)
         return raw.get("cleanup_enabled") is True
 
-    def _current_destination_scope(self) -> str:
+    def _current_destination(self) -> tuple[str, str]:
         raw = read_json_object(self.settings_file, name=self.settings_file.name)
         base_url = _clean(raw.get("base_url")).rstrip("/")
         source_id = _clean(raw.get("source_id"))
         push_key = _clean(raw.get("push_key"))
         if not base_url or not source_id or not push_key:
-            return ""
-        return hashlib.sha256(f"{base_url}\n{source_id}\n{push_key}".encode("utf-8")).hexdigest()
+            return "", base_url
+        return hashlib.sha256(f"{base_url}\n{source_id}\n{push_key}".encode("utf-8")).hexdigest(), base_url
 
     def settings(self) -> dict[str, object]:
         return {
@@ -296,16 +360,28 @@ class GenBoxPushCleanupService:
         receipt = record.get("receipt") if isinstance(record.get("receipt"), dict) else {}
         if record.get("transfer_status") != "confirmed":
             return "retained", "transfer-unconfirmed", 0
-        if receipt.get("contract_version") != "v1" or receipt.get("source_id") != record.get("source_id"):
+        if (
+            not isinstance(receipt.get("contract_version"), str)
+            or receipt.get("contract_version") != "v1"
+            or not isinstance(receipt.get("source_id"), str)
+            or not isinstance(record.get("source_id"), str)
+            or receipt.get("source_id") != record.get("source_id")
+        ):
             return "retained", "receipt-invalid", 0
-        if receipt.get("sha256") != record.get("source_sha256") or receipt.get("status") not in VALID_RECEIPT_STATUSES:
+        if (
+            not isinstance(receipt.get("sha256"), str)
+            or not isinstance(record.get("source_sha256"), str)
+            or receipt.get("sha256") != record.get("source_sha256")
+            or not isinstance(receipt.get("status"), str)
+            or receipt.get("status") not in VALID_RECEIPT_STATUSES
+        ):
             return "retained", "receipt-invalid", 0
         if receipt.get("safe_to_delete_source") is not True:
             return "retained", "receipt-no-cleanup-permission", 0
-        current_scope = self._current_destination_scope()
+        current_scope, current_url = self._current_destination()
         if not current_scope or current_scope != str(record.get("destination_scope") or ""):
             return "retained", "destination-scope-changed", 0
-        if not self.environment_gate.destination_trusted(current_scope):
+        if not self.environment_gate.destination_trusted(current_scope, current_url):
             return "retained", "destination-unverified", 0
         result = self.image_storage.verify_local_identity(
             str(record.get("remote_path") or ""),
@@ -327,6 +403,7 @@ class GenBoxPushCleanupService:
             "retained": 0,
             "failed": 0,
             "already_deleted": 0,
+            "unknown": 0,
             "potential_bytes": 0,
             "reclaimed_bytes": 0,
             "items": [],
@@ -391,6 +468,17 @@ class GenBoxPushCleanupService:
                     "decision_reason": "already-deleted",
                     "size_bytes": 0,
                     "reclaimed_bytes": 0,
+                })
+                continue
+            elif current_status == "delete_unknown":
+                summary["unknown"] = int(summary.get("unknown", 0)) + 1
+                summary["items"].append({
+                    **self._public_record(record),
+                    "decision": "delete-unknown-terminal",
+                    "decision_reason": "delete-unknown-terminal",
+                    "size_bytes": 0,
+                    "reclaimed_bytes": 0,
+                    "source_retained": False,
                 })
                 continue
             elif not self.policy_enabled():

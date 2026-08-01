@@ -63,6 +63,7 @@ class GenBoxPushCleanupTests(unittest.TestCase):
             f"{self.instance_id}\nisolated-development\n{self.images.resolve()}",
             encoding="utf-8",
         )
+        marker_hash = hashlib.sha256(self.instance_marker.read_bytes()).hexdigest()
         write_json_file(self.settings, {
             "enabled": True,
             "cleanup_enabled": False,
@@ -78,7 +79,9 @@ class GenBoxPushCleanupTests(unittest.TestCase):
             "CHATGPT2API_CLEANUP_INSTANCE_ID": self.instance_id,
             "CHATGPT2API_CLEANUP_STORAGE_ROOT": str(self.images.resolve()),
             "CHATGPT2API_CLEANUP_CAPABILITY": "synthetic-capability-32-bytes-000000000000",
+            "CHATGPT2API_CLEANUP_MARKER_SHA256": marker_hash,
             "CHATGPT2API_CLEANUP_TRUSTED_DESTINATION_KIND": "private-verified",
+            "CHATGPT2API_CLEANUP_TRUSTED_DESTINATION_URL": "https://genbox.test",
             "CHATGPT2API_CLEANUP_TRUSTED_DESTINATION_SCOPE": hashlib.sha256(
                 b"https://genbox.test\nchatgpt2api-dev\nsynthetic-push-key"
             ).hexdigest(),
@@ -266,6 +269,16 @@ class GenBoxPushCleanupTests(unittest.TestCase):
         self.assertTrue(target.exists())
         self.assertEqual(result["items"][0]["decision_reason"], "destination-unverified")
 
+    def test_http_destination_is_untrusted_even_with_matching_scope(self) -> None:
+        target = self._record()
+        self._enable_policy()
+        self.gate.environ["CHATGPT2API_CLEANUP_TRUSTED_DESTINATION_URL"] = "http://genbox.test"
+
+        result = self.service.execute()
+
+        self.assertTrue(target.exists())
+        self.assertEqual(result["items"][0]["decision_reason"], "destination-unverified")
+
     def test_missing_isolated_marker_blocks_execute(self) -> None:
         target = self._record()
         self._enable_policy()
@@ -429,6 +442,51 @@ class GenBoxPushCleanupTests(unittest.TestCase):
         self.assertEqual(result["items"][0]["decision"], "delete_unknown")
         records = json.loads(self.state.read_text(encoding="utf-8"))["records"]
         self.assertEqual(next(iter(records.values()))["cleanup_status"], "delete_unknown")
+
+    def test_delete_unknown_is_terminal_for_same_path_and_hash(self) -> None:
+        target = self._record()
+        self._enable_policy()
+        self.storage._save_index({"2026/08/01/image.png": {"rel": "2026/08/01/image.png", "local": True, "webdav": False}})
+        with patch.object(self.storage, "_save_index", side_effect=OSError("synthetic index failure")):
+            first = self.service.execute()
+        self.assertEqual(first["items"][0]["decision"], "delete_unknown")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(b"synthetic-image")
+
+        second = self.service.preview()
+
+        self.assertEqual(second["unknown"], 1)
+        self.assertEqual(second["items"][0]["decision"], "delete-unknown-terminal")
+        self.assertTrue(target.exists())
+
+    def test_persisted_malformed_receipt_is_retained(self) -> None:
+        target = self._record()
+        self._enable_policy()
+        records = json.loads(self.state.read_text(encoding="utf-8"))["records"]
+        record = next(iter(records.values()))
+        record["receipt"]["status"] = ["imported"]
+        write_json_file(self.state, {"record_version": 1, "records": records})
+
+        result = self.service.execute()
+
+        self.assertTrue(target.exists())
+        self.assertEqual(result["items"][0]["decision_reason"], "receipt-invalid")
+
+    def test_marker_symlink_blocks_execute(self) -> None:
+        target = self._record()
+        self._enable_policy()
+        replacement = self.tmp / "replacement-marker"
+        replacement.write_text(self.instance_marker.read_text(encoding="utf-8"), encoding="utf-8")
+        try:
+            self.instance_marker.unlink()
+            self.instance_marker.symlink_to(replacement)
+        except (OSError, NotImplementedError):
+            self.skipTest("symlinks are unavailable on this filesystem")
+
+        result = self.service.execute()
+
+        self.assertTrue(target.exists())
+        self.assertEqual(result.get("blocked_reason"), "runtime-identity-unverified")
 
 
 if __name__ == "__main__":

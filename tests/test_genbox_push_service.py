@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 from pathlib import Path
 from typing import Any
@@ -15,13 +16,29 @@ from services.genbox_push_service import GenBoxPushError, GenBoxPushService
 
 
 class FakeResponse:
-    def __init__(self, status_code: int, payload: dict[str, object]) -> None:
+    def __init__(
+        self,
+        status_code: int,
+        payload: dict[str, object],
+        *,
+        stream_chunks: list[bytes] | None = None,
+        headers: dict[str, str] | None = None,
+    ) -> None:
         self.status_code = status_code
         self.payload = payload
         self.ok = 200 <= status_code < 300
+        self.headers = headers or {}
+        self.stream_chunks = stream_chunks
 
     def json(self) -> dict[str, object]:
         return self.payload
+
+    def iter_content(self, chunk_size: int = 65536):
+        del chunk_size
+        if self.stream_chunks is not None:
+            yield from self.stream_chunks
+            return
+        yield json.dumps(self.payload).encode("utf-8")
 
 
 class FakeSession:
@@ -105,6 +122,7 @@ class GenBoxPushServiceTests(unittest.TestCase):
         call = self.factory.sessions[0].calls[0]
         self.assertEqual(call["headers"]["X-GenBox-Source"], "chatgpt2api-dev")
         self.assertEqual(call["headers"]["X-GenBox-Key"], "secret-not-for-responses")
+        self.assertTrue(call["verify"])
 
     def test_full_push_endpoint_is_normalized_before_probe(self) -> None:
         settings = self.service.update_settings({
@@ -262,6 +280,25 @@ class GenBoxPushServiceTests(unittest.TestCase):
 
         with self.assertRaises(GenBoxPushError):
             self.service.push_image("2026/07/28/image.png")
+
+    def test_streaming_receipt_is_bounded_before_json_parse(self) -> None:
+        self.configure()
+        oversized = b"{" + (b"x" * (1024 * 1024 + 1))
+        self.factory.responses.append(FakeResponse(200, {}, stream_chunks=[oversized]))
+
+        with self.assertRaisesRegex(GenBoxPushError, "oversized"):
+            self.service.probe()
+
+        call = self.factory.sessions[0].calls[0]
+        self.assertTrue(call["stream"])
+        self.assertTrue(call["verify"])
+
+    def test_streaming_malformed_receipt_is_retained(self) -> None:
+        self.configure()
+        self.factory.responses.append(FakeResponse(200, {}, stream_chunks=[b"not-json"]))
+
+        with self.assertRaisesRegex(GenBoxPushError, "unreadable"):
+            self.service.probe()
 
     def test_expected_source_hash_refuses_changed_content_before_any_request(self) -> None:
         self.configure()

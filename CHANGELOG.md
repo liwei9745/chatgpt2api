@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+### Phase 6 experimental cleanup candidate
+
+- Added receipt-gated, opt-in source cleanup records with SHA-256 binding,
+  isolated-runtime identity checks, path-alias protection, restart recovery,
+  bounded receipt parsing, and conservative `delete_unknown` handling.
+- Verified locally with the full test suite (`85 passed`), compile checks, and
+  a reproducible Docker build. Cleanup remains disabled by default and is not
+  yet an experimental release image; an independent adversarial review and
+  isolated dry-run/explicit synthetic execute gate are still required.
+
 ## 2.7.0 - 2026-07-18
 
 + [发布] `v2.7.0` 正式版，整合并稳定此前 RC 版本的图片失败归因、账号切换、鉴权核验和结果交付流程。
