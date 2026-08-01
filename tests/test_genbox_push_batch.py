@@ -101,6 +101,37 @@ class GenBoxPushBatchServiceTests(unittest.TestCase):
         self.assertEqual(completed["items"][0]["status"], "already-imported")
         self.assertEqual(completed["items"][0]["receipt_status"], "already-imported")
 
+    def test_batch_treats_duplicate_local_receipt_as_already_imported(self) -> None:
+        class DuplicateLocalPushService(FakePushService):
+            def push_image(self, path: str, **kwargs: object) -> dict[str, object]:
+                self.calls.append(path)
+                return {
+                    "status": "duplicate-local",
+                    "sha256": str(kwargs.get("expected_sha256") or ""),
+                    "source_retained": True,
+                }
+
+        duplicate_sender = DuplicateLocalPushService()
+        batches = GenBoxPushBatchService(
+            state_file=self.tmp / "duplicate-local.json",
+            push_service=duplicate_sender,
+            image_reader=self.images.__getitem__,
+            image_exists=lambda path: path in self.images,
+        )
+        batch = batches.create(["2026/07/28/one.png"], start_worker=False)
+        batches._drain()
+
+        completed = batches.get(str(batch["id"]))
+        self.assertEqual(completed["status"], "succeeded")
+        self.assertEqual(completed["succeeded"], 0)
+        self.assertEqual(completed["already_imported"], 1)
+        self.assertEqual(completed["items"][0]["status"], "already-imported")
+        self.assertEqual(completed["items"][0]["receipt_status"], "duplicate-local")
+
+    def test_retry_due_accepts_legacy_naive_timestamp(self) -> None:
+        item = {"next_retry_at": "2026-07-28T12:00:00"}
+        self.assertTrue(GenBoxPushBatchService._retry_due(item))
+
     def test_cancel_only_stops_queued_images(self) -> None:
         batch = self.batches.create(["2026/07/28/one.png", "2026/07/28/two.png"], start_worker=False)
         cancelled = self.batches.cancel(str(batch["id"]))

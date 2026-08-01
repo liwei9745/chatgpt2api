@@ -78,8 +78,11 @@ class GenBoxPushBatchService:
         if not retry_at:
             return True
         try:
-            return datetime.fromisoformat(retry_at) <= beijing_now()
-        except ValueError:
+            parsed = datetime.fromisoformat(retry_at)
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=beijing_now().tzinfo)
+            return parsed <= beijing_now()
+        except (TypeError, ValueError, OverflowError):
             return True
 
     def _retry_at(self, attempts: int) -> str:
@@ -385,7 +388,7 @@ class GenBoxPushBatchService:
             item = batch["items"][item_id]
             attempts = int(item.get("attempts") or 0)
             retry_later = bool(error) and retryable and attempts < MAX_AUTOMATIC_ATTEMPTS
-            status = "queued" if retry_later else "failed" if error else "already-imported" if receipt_status == "already-imported" else "succeeded"
+            status = "queued" if retry_later else "failed" if error else "already-imported" if receipt_status in {"already-imported", "duplicate-local"} else "succeeded"
             item.update({
                 "status": status,
                 "error": error,
