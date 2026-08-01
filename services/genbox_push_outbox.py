@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import threading
+import time
+import hashlib
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -9,11 +11,12 @@ from services.config import DATA_DIR
 from services.genbox_push_service import GenBoxPushService, genbox_push_service
 from services.genbox_push_transfer import GenBoxPushTransferCoordinator, genbox_push_transfer_coordinator
 from services.json_file import read_json_object, write_json_file
+from services.process_file_lock import ProcessFileLock, ProcessReentrantLock
 from utils.timezone import beijing_now_str
 
 
 OUTBOX_FILE = DATA_DIR / "genbox_push_outbox.json"
-OUTBOX_STATUSES = {"queued", "sending", "succeeded", "failed"}
+OUTBOX_STATUSES = {"queued", "sending", "succeeded", "already-imported", "failed"}
 
 
 class GenBoxPushOutbox:
@@ -31,7 +34,9 @@ class GenBoxPushOutbox:
         self.push_service = push_service
         self.transfer_coordinator = transfer_coordinator
         self.worker_factory = worker_factory
-        self._lock = threading.RLock()
+        # The outbox JSON is shared by all application workers.  A thread-only
+        # lock allows two processes to claim the same queued item concurrently.
+        self._lock = ProcessReentrantLock(state_file.with_suffix(state_file.suffix + ".state.lock"))
         self._worker: threading.Thread | None = None
         self._recovered = False
         # Prompt text is intentionally memory-only. It can enrich an immediate
@@ -45,6 +50,10 @@ class GenBoxPushOutbox:
     @classmethod
     def _entry_id(cls, relative_path: str, source_sha256: str) -> str:
         return f"{relative_path}:{source_sha256}"
+
+    def _item_lock(self, entry_id: str) -> ProcessFileLock:
+        lock_id = hashlib.sha256(entry_id.encode("utf-8")).hexdigest()
+        return ProcessFileLock(self.state_file.with_name(f".{self.state_file.name}.{lock_id}.item.lock"))
 
     @staticmethod
     def _safe_error(exc: Exception) -> str:
@@ -62,10 +71,17 @@ class GenBoxPushOutbox:
         if not self._recovered:
             self._recovered = True
             changed = False
-            for item in items.values():
-                if item.get("status") == "sending":
+            for entry_id, item in items.items():
+                if item.get("status") != "sending":
+                    continue
+                item_lock = self._item_lock(entry_id)
+                if not item_lock.acquire(timeout_secs=0):
+                    continue
+                try:
                     item.update({"status": "queued", "updated_at": beijing_now_str()})
                     changed = True
+                finally:
+                    item_lock.release()
             if changed:
                 self._save_locked(items)
         return items
@@ -171,21 +187,35 @@ class GenBoxPushOutbox:
         self._worker = self.worker_factory(target=self._drain, name="genbox-push-outbox", daemon=True)
         self._worker.start()
 
-    def _claim_next(self) -> tuple[str, dict[str, Any]] | None:
+    def _claim_next(self) -> tuple[str, dict[str, Any], ProcessFileLock] | None:
         with self._lock:
             items = self._load_locked()
-            candidates = [
+            candidates = sorted([
                 (entry_id, item)
                 for entry_id, item in items.items()
                 if item.get("status") == "queued"
-            ]
-            if not candidates:
-                return None
-            entry_id, item = min(candidates, key=lambda pair: str(pair[1].get("updated_at") or ""))
-            item.update({"status": "sending", "attempts": int(item.get("attempts") or 0) + 1, "updated_at": beijing_now_str()})
-            items[entry_id] = item
-            self._save_locked(items)
-            return entry_id, dict(item)
+            ], key=lambda pair: str(pair[1].get("updated_at") or ""))
+            for entry_id, item in candidates:
+                item_lock = self._item_lock(entry_id)
+                if not item_lock.acquire(timeout_secs=0):
+                    continue
+                try:
+                    current = items.get(entry_id)
+                    if current is None or current.get("status") != "queued":
+                        item_lock.release()
+                        continue
+                    current.update({
+                        "status": "sending",
+                        "attempts": int(current.get("attempts") or 0) + 1,
+                        "updated_at": beijing_now_str(),
+                    })
+                    items[entry_id] = current
+                    self._save_locked(items)
+                    return entry_id, dict(current), item_lock
+                except Exception:
+                    item_lock.release()
+                    raise
+            return None
 
     def _finish(self, entry_id: str, *, result: dict[str, object] | None = None, error: str = "") -> None:
         with self._lock:
@@ -195,7 +225,11 @@ class GenBoxPushOutbox:
                 self._metadata.pop(entry_id, None)
                 return
             item.update({
-                "status": "succeeded" if result is not None else "failed",
+                "status": (
+                    "already-imported"
+                    if result is not None and str(result.get("status") or "") in {"already-imported", "duplicate-local"}
+                    else "succeeded" if result is not None else "failed"
+                ),
                 "updated_at": beijing_now_str(),
                 "error": error,
             })
@@ -214,7 +248,13 @@ class GenBoxPushOutbox:
 
     def _drain(self) -> None:
         while True:
-            claimed = self._claim_next()
+            try:
+                claimed = self._claim_next()
+            except RuntimeError:
+                # Another application process is updating the durable outbox.
+                # Keep the worker alive and let that short critical section end.
+                time.sleep(0.05)
+                continue
             if claimed is None:
                 # Clear the worker reference while holding the same lock used by
                 # enqueue(). This closes the gap where a newly queued item could
@@ -226,7 +266,7 @@ class GenBoxPushOutbox:
                     if self._worker is threading.current_thread():
                         self._worker = None
                 return
-            entry_id, item = claimed
+            entry_id, item, item_lock = claimed
             metadata = self._metadata.get(entry_id, {})
             try:
                 result = self.transfer_coordinator.push_image(
@@ -241,6 +281,8 @@ class GenBoxPushOutbox:
                 self._finish(entry_id, error=self._safe_error(exc))
             else:
                 self._finish(entry_id, result=result)
+            finally:
+                item_lock.release()
 
 
 genbox_push_outbox = GenBoxPushOutbox()

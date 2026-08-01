@@ -2,15 +2,30 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import multiprocessing
 import os
 from pathlib import Path
 import tempfile
+import time
 import unittest
 
 os.environ.setdefault("CHATGPT2API_AUTH_KEY", "local-test-admin-key")
 
 from services.genbox_push_outbox import GenBoxPushOutbox
 from services.protocol import conversation
+
+
+def _claim_outbox_from_process(state_file: str, start: object, results: object) -> None:
+    service = GenBoxPushOutbox(state_file=Path(state_file), push_service=object())
+    start.wait(timeout=5)
+    try:
+        claimed = service._claim_next()
+        results.put(claimed is not None)
+        # Keep the per-item claim lock held while the competing process tries.
+        if claimed is not None:
+            time.sleep(0.5)
+    except RuntimeError:
+        results.put(False)
 
 
 class FakePushService:
@@ -126,6 +141,48 @@ class GenBoxPushOutboxTests(unittest.TestCase):
         retried = outbox.retry_path(failed_path)
         self.assertEqual(retried["status"], "queued")
         self.assertEqual(outbox.status_for_path(failed_path)["status"], "queued")
+
+    def test_separate_processes_cannot_claim_the_same_item(self) -> None:
+        state_file = self.tmp / "outbox.json"
+        digest = hashlib.sha256(b"synthetic").hexdigest()
+        outbox = GenBoxPushOutbox(state_file=state_file, push_service=FakePushService())
+        outbox.enqueue("2026/07/28/synthetic.png", digest, start_worker=False)
+
+        context = multiprocessing.get_context("spawn")
+        start = context.Event()
+        results = context.Queue()
+        workers = [
+            context.Process(target=_claim_outbox_from_process, args=(str(state_file), start, results))
+            for _ in range(2)
+        ]
+        for worker in workers:
+            worker.start()
+        start.set()
+        for worker in workers:
+            worker.join(timeout=10)
+
+        self.assertTrue(all(not worker.is_alive() for worker in workers))
+        self.assertEqual([worker.exitcode for worker in workers], [0, 0])
+        self.assertEqual(sum(results.get(timeout=2) for _ in workers), 1)
+        self.assertEqual(outbox.status_for_path("2026/07/28/synthetic.png")["status"], "sending")
+
+    def test_already_imported_outcome_is_public(self) -> None:
+        class DuplicatePushService(FakePushService):
+            def push_image(self, path: str, **kwargs: object) -> dict[str, object]:
+                self.calls.append({"path": path})
+                return {
+                    "status": "duplicate-local",
+                    "sha256": kwargs.get("expected_sha256") or "a" * 64,
+                    "safe_to_delete_source": False,
+                    "source_retained": True,
+                }
+
+        outbox = GenBoxPushOutbox(state_file=self.tmp / "duplicate.json", push_service=DuplicatePushService())
+        digest = hashlib.sha256(b"synthetic").hexdigest()
+        outbox.enqueue("2026/07/28/synthetic.png", digest, start_worker=False)
+        outbox._drain()
+
+        self.assertEqual(outbox.status_for_path("2026/07/28/synthetic.png")["status"], "already-imported")
 
 
 class ConversationPushRegistrationTests(unittest.TestCase):
