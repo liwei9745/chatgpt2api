@@ -300,6 +300,14 @@ class GenBoxPushServiceTests(unittest.TestCase):
         with self.assertRaisesRegex(GenBoxPushError, "unreadable"):
             self.service.probe()
 
+    def test_duplicate_receipt_fields_are_rejected(self) -> None:
+        self.configure()
+        duplicate = b'{"ok":true,"contract_version":"v1","source_id":"chatgpt2api-dev","source_id":"other"}'
+        self.factory.responses.append(FakeResponse(200, {}, stream_chunks=[duplicate]))
+
+        with self.assertRaisesRegex(GenBoxPushError, "unreadable"):
+            self.service.probe()
+
     def test_expected_source_hash_refuses_changed_content_before_any_request(self) -> None:
         self.configure()
 

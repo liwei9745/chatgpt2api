@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import tempfile
 import threading
+import time
 import unittest
 from unittest.mock import patch
 
@@ -16,6 +17,7 @@ os.environ.setdefault("CHATGPT2API_AUTH_KEY", "local-test-admin-key")
 
 from services.config import config
 from services.genbox_push_cleanup import CleanupEnvironmentGate, GenBoxPushCleanupService
+from services.genbox_push_service import GenBoxPushService
 from services.image_storage_service import ImageStorageService
 from services.json_file import write_json_file
 from services.source_claim import source_claim
@@ -312,6 +314,60 @@ class GenBoxPushCleanupTests(unittest.TestCase):
 
         self.assertTrue(target.exists())
         self.assertEqual(result["items"][0]["decision_reason"], "cleanup-policy-disabled")
+
+    def test_destination_rotation_after_final_inspection_retains_source(self) -> None:
+        target = self._record()
+        self._enable_policy()
+        original_inspect = self.service._inspect
+        calls = 0
+
+        def rotate_after_final_inspect(record):
+            nonlocal calls
+            calls += 1
+            result = original_inspect(record)
+            if calls == 2:
+                write_json_file(self.settings, {
+                    "enabled": True,
+                    "cleanup_enabled": True,
+                    "base_url": "https://genbox.test",
+                    "source_id": "chatgpt2api-dev",
+                    "push_key": "rotated-after-inspection",
+                })
+            return result
+
+        with patch.object(self.service, "_inspect", side_effect=rotate_after_final_inspect):
+            result = self.service.execute()
+
+        self.assertTrue(target.exists())
+        self.assertEqual(result["items"][0]["decision_reason"], "destination-scope-changed")
+
+    def test_settings_writer_waits_until_cleanup_terminal_state(self) -> None:
+        target = self._record()
+        self._enable_policy()
+        writer = GenBoxPushService(settings_file=self.settings, state_file=self.tmp / "push-state.json")
+        finished = threading.Event()
+        rotation_thread: list[threading.Thread] = []
+        original_delete = self.storage.delete_verified_local
+
+        def rotate_after_delete_starts(*args, **kwargs):
+            def rotate() -> None:
+                writer.update_settings({"push_key": "rotated-after-delete"})
+                finished.set()
+
+            thread = threading.Thread(target=rotate)
+            thread.start()
+            rotation_thread.append(thread)
+            time.sleep(0.05)
+            self.assertFalse(finished.is_set())
+            return original_delete(*args, **kwargs)
+
+        with patch.object(self.storage, "delete_verified_local", side_effect=rotate_after_delete_starts):
+            result = self.service.execute()
+
+        self.assertEqual(result["deleted"], 1)
+        self.assertFalse(target.exists())
+        rotation_thread[0].join(timeout=5)
+        self.assertTrue(finished.is_set())
 
     def test_terminal_audit_failure_leaves_durable_deleting_intent(self) -> None:
         target = self._record()

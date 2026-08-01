@@ -54,6 +54,11 @@ def _bool_env(value: object) -> bool:
     return _clean(value).lower() in {"1", "true", "yes", "on"}
 
 
+def settings_coordination_lock_path(settings_file: Path) -> Path:
+    """Return the process-shared lock used by settings writers and cleanup."""
+    return settings_file.with_name(f".{settings_file.name}.coord.lock")
+
+
 class CleanupEnvironmentGate:
     """Server-side capability gate for destructive cleanup.
 
@@ -253,6 +258,9 @@ class GenBoxPushCleanupService:
         self.environment_gate = environment_gate or CleanupEnvironmentGate()
         self.now = now
         self._lock = ProcessReentrantLock(state_file.with_suffix(state_file.suffix + ".state.lock"))
+        # Hold this lock from the final policy/scope check through unlink and
+        # terminal audit persistence. Settings writers use the same lock.
+        self._settings_lock = ProcessReentrantLock(settings_coordination_lock_path(self.settings_file))
         self.environment_gate.bind_storage_root(lambda: self.image_storage_root())
 
     def image_storage_root(self) -> Path:
@@ -545,74 +553,86 @@ class GenBoxPushCleanupService:
                 summary["items"].append(item_result)
                 continue
             try:
-                with self._lock:
-                    live = self._load_state_locked()
-                    current = live.get(key)
-                    if current is None:
-                        continue
-                    decision, reason, size = self._inspect(current)
-                    if decision != "eligible":
-                        current.update({"cleanup_status": "retained", "decision_reason": reason, "decided_at": self.now()})
-                        self._append_audit_locked(self._audit_event(operation_id=operation_id, mode=mode, record=current, prior_status=current_status, decision="retained", reason=reason, size_bytes=size))
+                # Settings rotation and policy changes are coordinated with
+                # the cleanup operation through the terminal audit write.
+                with self._settings_lock:
+                    with self._lock:
+                        live = self._load_state_locked()
+                        current = live.get(key)
+                        if current is None:
+                            continue
+                        decision, reason, size = self._inspect(current)
+                        if decision == "eligible":
+                            # `_inspect` reads settings, so take one final
+                            # scope snapshot after it returns. This catches a
+                            # direct settings-file replacement as well as a
+                            # managed writer that raced before the lock was
+                            # acquired.
+                            final_scope, _ = self._current_destination()
+                            if final_scope != str(current.get("destination_scope") or ""):
+                                decision, reason, size = "retained", "destination-scope-changed", 0
+                        if decision != "eligible":
+                            current.update({"cleanup_status": "retained", "decision_reason": reason, "decided_at": self.now()})
+                            self._append_audit_locked(self._audit_event(operation_id=operation_id, mode=mode, record=current, prior_status=current_status, decision="retained", reason=reason, size_bytes=size))
+                            self._save_state_locked(live)
+                            summary["retained"] = int(summary["retained"]) + 1
+                            item_result.update({"decision": "retained", "decision_reason": reason, "size_bytes": size})
+                            summary["items"].append(item_result)
+                            continue
+                        if not dry_run and not self.policy_enabled():
+                            current.update({"cleanup_status": "retained", "decision_reason": "cleanup-policy-disabled", "decided_at": self.now()})
+                            self._append_audit_locked(self._audit_event(operation_id=operation_id, mode=mode, record=current, prior_status=current_status, decision="retained", reason="cleanup-policy-disabled", size_bytes=0))
+                            self._save_state_locked(live)
+                            summary["eligible"] = max(0, int(summary["eligible"]) - 1)
+                            summary["potential_bytes"] = max(0, int(summary["potential_bytes"]) - size)
+                            summary["retained"] = int(summary["retained"]) + 1
+                            item_result.update({"decision": "retained", "decision_reason": "cleanup-policy-disabled", "size_bytes": 0})
+                            summary["items"].append(item_result)
+                            continue
+                        intent = dict(current)
+                        intent.update({"cleanup_status": "deleting", "decision_reason": "deletion-intent", "decided_at": self.now(), "operation_id": operation_id})
+                        live[key] = intent
                         self._save_state_locked(live)
-                        summary["retained"] = int(summary["retained"]) + 1
-                        item_result.update({"decision": "retained", "decision_reason": reason, "size_bytes": size})
+                        self._append_audit_locked(self._audit_event(operation_id=operation_id, mode=mode, record=intent, prior_status=current_status, decision="deleting", reason="deletion-intent", size_bytes=size))
+                    deletion = self.image_storage.delete_verified_local(
+                        str(record.get("remote_path") or ""),
+                        str(record.get("source_sha256") or ""),
+                        expected_size=size,
+                        claim_held=True,
+                    )
+                    with self._lock:
+                        live = self._load_state_locked()
+                        current = live.get(key, record)
+                        if deletion.status == "deleted":
+                            current.update({"cleanup_status": "deleted", "decision_reason": "deleted", "decided_at": self.now(), "size_bytes": deletion.size_bytes})
+                            live[key] = current
+                            self._append_audit_locked(self._audit_event(operation_id=operation_id, mode=mode, record=current, prior_status="deleting", decision="deleted", reason="deleted", size_bytes=deletion.size_bytes, reclaimed_bytes=deletion.size_bytes))
+                            self._save_state_locked(live)
+                            summary["deleted"] = int(summary["deleted"]) + 1
+                            summary["reclaimed_bytes"] = int(summary["reclaimed_bytes"]) + deletion.size_bytes
+                            item_result.update({"decision": "deleted", "decision_reason": "deleted", "size_bytes": deletion.size_bytes, "reclaimed_bytes": deletion.size_bytes, "source_retained": False})
+                        elif deletion.status == "delete_failed":
+                            current.update({"cleanup_status": "delete_failed", "decision_reason": deletion.reason, "decided_at": self.now()})
+                            live[key] = current
+                            self._append_audit_locked(self._audit_event(operation_id=operation_id, mode=mode, record=current, prior_status="deleting", decision="delete_failed", reason=deletion.reason, size_bytes=deletion.size_bytes))
+                            self._save_state_locked(live)
+                            summary["failed"] = int(summary["failed"]) + 1
+                            item_result.update({"decision": "delete_failed", "decision_reason": deletion.reason, "size_bytes": deletion.size_bytes})
+                        elif deletion.status == "delete_unknown":
+                            current.update({"cleanup_status": "delete_unknown", "decision_reason": deletion.reason, "decided_at": self.now()})
+                            live[key] = current
+                            self._append_audit_locked(self._audit_event(operation_id=operation_id, mode=mode, record=current, prior_status="deleting", decision="delete_unknown", reason=deletion.reason, size_bytes=deletion.size_bytes))
+                            self._save_state_locked(live)
+                            summary["failed"] = int(summary["failed"]) + 1
+                            item_result.update({"decision": "delete_unknown", "decision_reason": deletion.reason, "size_bytes": deletion.size_bytes, "source_retained": True, "source_state": "unknown"})
+                        else:
+                            current.update({"cleanup_status": "retained", "decision_reason": deletion.reason, "decided_at": self.now()})
+                            live[key] = current
+                            self._append_audit_locked(self._audit_event(operation_id=operation_id, mode=mode, record=current, prior_status="deleting", decision="retained", reason=deletion.reason, size_bytes=deletion.size_bytes))
+                            self._save_state_locked(live)
+                            summary["retained"] = int(summary["retained"]) + 1
+                            item_result.update({"decision": "retained", "decision_reason": deletion.reason, "size_bytes": deletion.size_bytes})
                         summary["items"].append(item_result)
-                        continue
-                    if not dry_run and not self.policy_enabled():
-                        current.update({"cleanup_status": "retained", "decision_reason": "cleanup-policy-disabled", "decided_at": self.now()})
-                        self._append_audit_locked(self._audit_event(operation_id=operation_id, mode=mode, record=current, prior_status=current_status, decision="retained", reason="cleanup-policy-disabled", size_bytes=0))
-                        self._save_state_locked(live)
-                        summary["eligible"] = max(0, int(summary["eligible"]) - 1)
-                        summary["potential_bytes"] = max(0, int(summary["potential_bytes"]) - size)
-                        summary["retained"] = int(summary["retained"]) + 1
-                        item_result.update({"decision": "retained", "decision_reason": "cleanup-policy-disabled", "size_bytes": 0})
-                        summary["items"].append(item_result)
-                        continue
-                    intent = dict(current)
-                    intent.update({"cleanup_status": "deleting", "decision_reason": "deletion-intent", "decided_at": self.now(), "operation_id": operation_id})
-                    live[key] = intent
-                    self._save_state_locked(live)
-                    self._append_audit_locked(self._audit_event(operation_id=operation_id, mode=mode, record=intent, prior_status=current_status, decision="deleting", reason="deletion-intent", size_bytes=size))
-                deletion = self.image_storage.delete_verified_local(
-                    str(record.get("remote_path") or ""),
-                    str(record.get("source_sha256") or ""),
-                    expected_size=size,
-                    claim_held=True,
-                )
-                with self._lock:
-                    live = self._load_state_locked()
-                    current = live.get(key, record)
-                    if deletion.status == "deleted":
-                        current.update({"cleanup_status": "deleted", "decision_reason": "deleted", "decided_at": self.now(), "size_bytes": deletion.size_bytes})
-                        live[key] = current
-                        self._append_audit_locked(self._audit_event(operation_id=operation_id, mode=mode, record=current, prior_status="deleting", decision="deleted", reason="deleted", size_bytes=deletion.size_bytes, reclaimed_bytes=deletion.size_bytes))
-                        self._save_state_locked(live)
-                        summary["deleted"] = int(summary["deleted"]) + 1
-                        summary["reclaimed_bytes"] = int(summary["reclaimed_bytes"]) + deletion.size_bytes
-                        item_result.update({"decision": "deleted", "decision_reason": "deleted", "size_bytes": deletion.size_bytes, "reclaimed_bytes": deletion.size_bytes, "source_retained": False})
-                    elif deletion.status == "delete_failed":
-                        current.update({"cleanup_status": "delete_failed", "decision_reason": deletion.reason, "decided_at": self.now()})
-                        live[key] = current
-                        self._append_audit_locked(self._audit_event(operation_id=operation_id, mode=mode, record=current, prior_status="deleting", decision="delete_failed", reason=deletion.reason, size_bytes=deletion.size_bytes))
-                        self._save_state_locked(live)
-                        summary["failed"] = int(summary["failed"]) + 1
-                        item_result.update({"decision": "delete_failed", "decision_reason": deletion.reason, "size_bytes": deletion.size_bytes})
-                    elif deletion.status == "delete_unknown":
-                        current.update({"cleanup_status": "delete_unknown", "decision_reason": deletion.reason, "decided_at": self.now()})
-                        live[key] = current
-                        self._append_audit_locked(self._audit_event(operation_id=operation_id, mode=mode, record=current, prior_status="deleting", decision="delete_unknown", reason=deletion.reason, size_bytes=deletion.size_bytes))
-                        self._save_state_locked(live)
-                        summary["failed"] = int(summary["failed"]) + 1
-                        item_result.update({"decision": "delete_unknown", "decision_reason": deletion.reason, "size_bytes": deletion.size_bytes, "source_retained": True, "source_state": "unknown"})
-                    else:
-                        current.update({"cleanup_status": "retained", "decision_reason": deletion.reason, "decided_at": self.now()})
-                        live[key] = current
-                        self._append_audit_locked(self._audit_event(operation_id=operation_id, mode=mode, record=current, prior_status="deleting", decision="retained", reason=deletion.reason, size_bytes=deletion.size_bytes))
-                        self._save_state_locked(live)
-                        summary["retained"] = int(summary["retained"]) + 1
-                        item_result.update({"decision": "retained", "decision_reason": deletion.reason, "size_bytes": deletion.size_bytes})
-                    summary["items"].append(item_result)
             except Exception:
                 # A failed write after the intent is durable leaves the record
                 # in ``deleting``. Recovery reports it as unknown; it never

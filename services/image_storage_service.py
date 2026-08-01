@@ -42,6 +42,18 @@ class VerifiedDeleteResult:
     size_bytes: int = 0
 
 
+@dataclass
+class _OpenedCleanupTarget:
+    relative_path: str
+    candidate: Path
+    descriptor: int
+    parent_descriptor: int | None
+    parent_name: str
+    file_stat: os.stat_result
+    digest: str
+    size_bytes: int
+
+
 def _clean(value: object) -> str:
     return str(value or "").strip()
 
@@ -93,6 +105,20 @@ def _is_filesystem_alias(file_stat: os.stat_result) -> bool:
     reparse_flag = int(getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0) or 0)
     attributes = int(getattr(file_stat, "st_file_attributes", 0) or 0)
     return bool(reparse_flag and attributes & reparse_flag)
+
+
+def _same_cleanup_identity(left: os.stat_result, right: os.stat_result) -> bool:
+    return bool(
+        left.st_dev == right.st_dev
+        and left.st_ino == right.st_ino
+        and left.st_size == right.st_size
+        and stat.S_ISREG(left.st_mode)
+        and stat.S_ISREG(right.st_mode)
+        and not _is_filesystem_alias(left)
+        and not _is_filesystem_alias(right)
+        and int(getattr(left, "st_nlink", 1) or 1) == 1
+        and int(getattr(right, "st_nlink", 1) or 1) == 1
+    )
 
 
 def _image_dimensions(payload: bytes) -> tuple[int, int] | None:
@@ -385,18 +411,86 @@ class ImageStorageService:
         items.sort(key=lambda item: str(item.get("created_at") or ""), reverse=True)
         return items
 
-    def verify_local_identity(
+    @staticmethod
+    def _read_open_digest(descriptor: int) -> str:
+        hasher = hashlib.sha256()
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                return hasher.hexdigest()
+            hasher.update(chunk)
+
+    @staticmethod
+    def _open_cleanup_descriptor(candidate: Path) -> int:
+        if os.name != "nt":
+            nofollow = int(getattr(os, "O_NOFOLLOW", 0))
+            return os.open(candidate, os.O_RDONLY | nofollow)
+
+        # Python's O_TEMPORARY enables delete sharing by marking the file for
+        # deletion on close, which would violate retention on a failed check.
+        # Use CreateFileW instead: share DELETE without delete-on-close, and
+        # reject a final reparse point at open time.
+        import ctypes
+        import msvcrt
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        create_file = kernel32.CreateFileW
+        create_file.argtypes = [
+            ctypes.c_wchar_p,
+            ctypes.c_uint32,
+            ctypes.c_uint32,
+            ctypes.c_void_p,
+            ctypes.c_uint32,
+            ctypes.c_uint32,
+            ctypes.c_void_p,
+        ]
+        create_file.restype = ctypes.c_void_p
+        handle = create_file(
+            str(candidate),
+            0x80010000,  # GENERIC_READ | DELETE
+            0x00000007,  # FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE
+            None,
+            3,  # OPEN_EXISTING
+            0x00200080,  # FILE_FLAG_OPEN_REPARSE_POINT | FILE_ATTRIBUTE_NORMAL
+            None,
+        )
+        invalid = ctypes.c_void_p(-1).value
+        if handle in {None, invalid}:
+            error = ctypes.get_last_error()
+            raise OSError(error, "CreateFileW failed")
+        try:
+            return msvcrt.open_osfhandle(handle, os.O_RDONLY | int(getattr(os, "O_BINARY", 0)))
+        except Exception:
+            kernel32.CloseHandle(handle)
+            raise
+
+    @staticmethod
+    def _cleanup_stat(target: _OpenedCleanupTarget) -> os.stat_result:
+        if target.parent_descriptor is not None:
+            return os.stat(target.parent_name, dir_fd=target.parent_descriptor, follow_symlinks=False)
+        return target.candidate.lstat()
+
+    @staticmethod
+    def _close_cleanup_target(target: _OpenedCleanupTarget) -> None:
+        try:
+            os.close(target.descriptor)
+        finally:
+            if target.parent_descriptor is not None:
+                os.close(target.parent_descriptor)
+
+    def _open_verified_cleanup_target(
         self,
         rel: str,
         expected_sha256: str,
         *,
         expected_size: int | None = None,
-    ) -> dict[str, object]:
-        """Inspect one local source without following aliases.
+    ) -> _OpenedCleanupTarget | dict[str, object]:
+        """Open and hash a source while retaining its identity handle.
 
-        This is intentionally separate from ``get_bytes``. The latter is a
-        read convenience for normal image serving; cleanup needs lstat/fstat
-        checks, a regular-file requirement, and a hard-link rejection.
+        The returned handle and its parent directory descriptor stay open until
+        the caller completes the final identity check and unlink. This closes
+        the cooperative Push/cleanup race and gives POSIX callers a stable
+        directory anchor for the unlink operation.
         """
         try:
             safe_rel = _cleanup_relative_path(rel)
@@ -405,7 +499,9 @@ class ImageStorageService:
         digest = str(expected_sha256 or "").strip().lower()
         if len(digest) != 64 or any(char not in "0123456789abcdef" for char in digest):
             return {"ok": False, "reason": "hash-invalid"}
-        root = config.images_dir
+        root = Path(self.local_root())
+        descriptor: int | None = None
+        parent_descriptor: int | None = None
         try:
             root_stat = root.lstat()
             if not stat.S_ISDIR(root_stat.st_mode) or _is_filesystem_alias(root_stat):
@@ -436,51 +532,133 @@ class ImageStorageService:
         if expected_size is not None and int(file_stat.st_size) != int(expected_size):
             return {"ok": False, "reason": "source-changed", "size_bytes": int(file_stat.st_size)}
         try:
-            nofollow = int(getattr(os, "O_NOFOLLOW", 0))
-            flags = os.O_RDONLY | nofollow
-            descriptor = os.open(candidate, flags)
-            try:
-                opened_stat = os.fstat(descriptor)
-                if (
-                    opened_stat.st_dev != file_stat.st_dev
-                    or opened_stat.st_ino != file_stat.st_ino
-                    or opened_stat.st_size != file_stat.st_size
-                    or not stat.S_ISREG(opened_stat.st_mode)
-                    or int(getattr(opened_stat, "st_nlink", 1) or 1) != 1
-                ):
-                    return {"ok": False, "reason": "source-changed"}
-                hasher = hashlib.sha256()
-                with os.fdopen(os.dup(descriptor), "rb", closefd=True) as stream:
-                    for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-                        hasher.update(chunk)
-                actual = hasher.hexdigest()
-            finally:
+            descriptor = self._open_cleanup_descriptor(candidate)
+            opened_stat = os.fstat(descriptor)
+            if not _same_cleanup_identity(opened_stat, file_stat):
                 os.close(descriptor)
+                descriptor = None
+                return {"ok": False, "reason": "source-changed"}
+            actual = self._read_open_digest(descriptor)
+            os.lseek(descriptor, 0, os.SEEK_SET)
         except FileNotFoundError:
+            if descriptor is not None:
+                os.close(descriptor)
             return {"ok": False, "reason": "source-missing"}
         except OSError:
+            if descriptor is not None:
+                os.close(descriptor)
             return {"ok": False, "reason": "source-unreadable"}
         if actual != digest:
+            os.close(descriptor)
             return {"ok": False, "reason": "source-changed", "size_bytes": int(file_stat.st_size)}
+
+        # Keep a parent directory descriptor where the platform supports it;
+        # unlinking through that descriptor avoids a root-path replacement.
+        if os.name != "nt" and hasattr(os, "O_DIRECTORY"):
+            try:
+                parent_descriptor = os.open(
+                    candidate.parent,
+                    os.O_RDONLY | int(getattr(os, "O_DIRECTORY", 0)) | nofollow,
+                )
+            except OSError:
+                os.close(descriptor)
+                return {"ok": False, "reason": "source-unreadable"}
+
+        target = _OpenedCleanupTarget(
+            relative_path=safe_rel,
+            candidate=candidate,
+            descriptor=descriptor,
+            parent_descriptor=parent_descriptor,
+            parent_name=candidate.name,
+            file_stat=file_stat,
+            digest=actual,
+            size_bytes=int(file_stat.st_size),
+        )
         try:
-            after_stat = candidate.lstat()
+            if not _same_cleanup_identity(self._cleanup_stat(target), file_stat):
+                self._close_cleanup_target(target)
+                return {"ok": False, "reason": "source-changed"}
         except OSError:
+            self._close_cleanup_target(target)
             return {"ok": False, "reason": "source-changed"}
-        if (
-            after_stat.st_dev != file_stat.st_dev
-            or after_stat.st_ino != file_stat.st_ino
-            or after_stat.st_size != file_stat.st_size
-            or _is_filesystem_alias(after_stat)
-            or int(getattr(after_stat, "st_nlink", 1) or 1) != 1
-        ):
-            return {"ok": False, "reason": "source-changed"}
-        return {
-            "ok": True,
-            "relative_path": safe_rel,
-            "sha256": actual,
-            "size_bytes": int(file_stat.st_size),
-            "stat": file_stat,
-        }
+        return target
+
+    def verify_local_identity(
+        self,
+        rel: str,
+        expected_sha256: str,
+        *,
+        expected_size: int | None = None,
+    ) -> dict[str, object]:
+        """Inspect one local source without following aliases."""
+        target = self._open_verified_cleanup_target(rel, expected_sha256, expected_size=expected_size)
+        if isinstance(target, dict):
+            return target
+        try:
+            return {
+                "ok": True,
+                "relative_path": target.relative_path,
+                "sha256": target.digest,
+                "size_bytes": target.size_bytes,
+                "stat": target.file_stat,
+            }
+        finally:
+            self._close_cleanup_target(target)
+
+    def _before_verified_unlink(self, _target: _OpenedCleanupTarget) -> None:
+        """Test seam for deterministic replacement-race coverage."""
+
+    def _unlink_open_cleanup_target(self, target: _OpenedCleanupTarget) -> VerifiedDeleteResult:
+        try:
+            os.lseek(target.descriptor, 0, os.SEEK_SET)
+            current_digest = self._read_open_digest(target.descriptor)
+            os.lseek(target.descriptor, 0, os.SEEK_SET)
+        except OSError:
+            return VerifiedDeleteResult("retained", "source-unreadable", target.size_bytes)
+        if current_digest != target.digest:
+            return VerifiedDeleteResult("retained", "source-changed", target.size_bytes)
+        try:
+            latest_stat = self._cleanup_stat(target)
+        except FileNotFoundError:
+            return VerifiedDeleteResult("retained", "source-missing", target.size_bytes)
+        except OSError:
+            return VerifiedDeleteResult("retained", "source-changed", target.size_bytes)
+        if not _same_cleanup_identity(latest_stat, target.file_stat):
+            return VerifiedDeleteResult("retained", "source-changed", target.size_bytes)
+        try:
+            if os.name == "nt":
+                # Delete the exact opened file handle rather than resolving the
+                # path again. This prevents a replacement path from becoming
+                # the object that receives the delete request.
+                import ctypes
+                import msvcrt
+
+                class _FileDispositionInfo(ctypes.Structure):
+                    _fields_ = [("DeleteFile", ctypes.c_ubyte)]
+
+                kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+                set_file_info = kernel32.SetFileInformationByHandle
+                set_file_info.argtypes = [
+                    ctypes.c_void_p,
+                    ctypes.c_int,
+                    ctypes.c_void_p,
+                    ctypes.c_uint32,
+                ]
+                set_file_info.restype = ctypes.c_int
+                info = _FileDispositionInfo(1)
+                handle = ctypes.c_void_p(msvcrt.get_osfhandle(target.descriptor))
+                if not set_file_info(handle, 4, ctypes.byref(info), ctypes.sizeof(info)):
+                    error = ctypes.get_last_error()
+                    raise OSError(error, "SetFileInformationByHandle failed")
+            elif target.parent_descriptor is not None:
+                os.unlink(target.parent_name, dir_fd=target.parent_descriptor)
+            else:
+                target.candidate.unlink()
+        except FileNotFoundError:
+            return VerifiedDeleteResult("retained", "source-missing", target.size_bytes)
+        except OSError:
+            return VerifiedDeleteResult("delete_failed", "unlink-failed", target.size_bytes)
+        return VerifiedDeleteResult("deleted", "deleted", target.size_bytes)
 
     def delete_verified_local(
         self,
@@ -506,18 +684,27 @@ class ImageStorageService:
             lock = source_claim(safe_rel, str(expected_sha256 or "").strip().lower())
             if not lock.acquire(timeout_secs=0):
                 return VerifiedDeleteResult("retained", "source-busy")
+        target: _OpenedCleanupTarget | None = None
         try:
-            identity = self.verify_local_identity(safe_rel, expected_sha256, expected_size=expected_size)
-            if not bool(identity.get("ok")):
-                return VerifiedDeleteResult("retained", str(identity.get("reason") or "source-unverified"), int(identity.get("size_bytes") or 0))
-            root = config.images_dir
-            candidate = root / str(identity["relative_path"])
-            try:
-                candidate.unlink()
-            except FileNotFoundError:
-                return VerifiedDeleteResult("retained", "source-missing")
-            except OSError:
-                return VerifiedDeleteResult("delete_failed", "unlink-failed", int(identity.get("size_bytes") or 0))
+            opened = self._open_verified_cleanup_target(
+                safe_rel,
+                expected_sha256,
+                expected_size=expected_size,
+            )
+            if isinstance(opened, dict):
+                return VerifiedDeleteResult(
+                    "retained",
+                    str(opened.get("reason") or "source-unverified"),
+                    int(opened.get("size_bytes") or 0),
+                )
+            target = opened
+            # The handle remains open through the final identity check and
+            # unlink. The hook exists only to make replacement races
+            # deterministic in focused storage tests.
+            self._before_verified_unlink(target)
+            deletion = self._unlink_open_cleanup_target(target)
+            if deletion.status != "deleted":
+                return deletion
             try:
                 with self._index_lock:
                     items = self._load_clean_index()
@@ -535,9 +722,11 @@ class ImageStorageService:
             except Exception:
                 # The source is already gone, but the durable cleanup record
                 # remains in ``deleting`` so recovery can report ambiguity.
-                return VerifiedDeleteResult("delete_unknown", "index-write-failed", int(identity.get("size_bytes") or 0))
-            return VerifiedDeleteResult("deleted", "deleted", int(identity.get("size_bytes") or 0))
+                return VerifiedDeleteResult("delete_unknown", "index-write-failed", target.size_bytes)
+            return deletion
         finally:
+            if target is not None:
+                self._close_cleanup_target(target)
             if lock is not None:
                 lock.release()
 

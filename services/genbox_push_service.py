@@ -13,9 +13,14 @@ from urllib.parse import urlparse
 from curl_cffi import CurlMime, requests
 
 from services.config import DATA_DIR
-from services.genbox_push_cleanup import GenBoxPushCleanupService, genbox_push_cleanup_service
+from services.genbox_push_cleanup import (
+    GenBoxPushCleanupService,
+    genbox_push_cleanup_service,
+    settings_coordination_lock_path,
+)
 from services.image_storage_service import image_storage_service
 from services.json_file import read_json_object, write_json_file
+from services.process_file_lock import ProcessReentrantLock
 from services.source_claim import source_claim
 
 
@@ -23,6 +28,15 @@ PUSH_CONTRACT_VERSION = "v1"
 SOURCE_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 SUCCESS_STATUSES = {"imported", "already-imported", "duplicate-local"}
 MAX_RECEIPT_BYTES = 1024 * 1024
+
+
+def _reject_duplicate_json_pairs(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate receipt field")
+        result[key] = value
+    return result
 
 
 class GenBoxPushError(RuntimeError):
@@ -114,6 +128,7 @@ class GenBoxPushService:
             )
         )
         self._lock = threading.RLock()
+        self._settings_coordination_lock = ProcessReentrantLock(settings_coordination_lock_path(self.settings_file))
 
     def _load_settings(self) -> GenBoxPushSettings:
         raw = read_json_object(self.settings_file, name=self.settings_file.name)
@@ -142,7 +157,7 @@ class GenBoxPushService:
             return self._public_settings(self._load_settings())
 
     def update_settings(self, payload: dict[str, object]) -> dict[str, object]:
-        with self._lock:
+        with self._settings_coordination_lock, self._lock:
             current = self._load_settings()
             push_key = current.push_key
             if bool(payload.get("clear_push_key", False)):
@@ -219,7 +234,10 @@ class GenBoxPushService:
                     if total > MAX_RECEIPT_BYTES:
                         raise GenBoxPushError("GenBox returned an oversized receipt; the source image was retained.")
                     chunks.append(payload_chunk)
-                payload = json.loads(b"".join(chunks).decode("utf-8"))
+                payload = json.loads(
+                    b"".join(chunks).decode("utf-8"),
+                    object_pairs_hook=_reject_duplicate_json_pairs,
+                )
             except GenBoxPushError:
                 raise
             except Exception as exc:
@@ -230,11 +248,23 @@ class GenBoxPushService:
         content = getattr(response, "content", None)
         if isinstance(content, (bytes, bytearray)) and len(content) > MAX_RECEIPT_BYTES:
             raise GenBoxPushError("GenBox returned an oversized receipt; the source image was retained.")
+        if isinstance(content, (bytes, bytearray)):
+            try:
+                payload = json.loads(bytes(content).decode("utf-8"), object_pairs_hook=_reject_duplicate_json_pairs)
+            except Exception as exc:
+                raise GenBoxPushError("GenBox returned an unreadable response; the source image was retained.") from exc
+            if not isinstance(payload, dict):
+                raise GenBoxPushError("GenBox returned an unreadable response; the source image was retained.")
+            return payload
         text = getattr(response, "text", None)
         if isinstance(text, str) and len(text.encode("utf-8")) > MAX_RECEIPT_BYTES:
             raise GenBoxPushError("GenBox returned an oversized receipt; the source image was retained.")
         try:
-            payload = response.json()
+            raw_text = getattr(response, "text", None)
+            if isinstance(raw_text, str):
+                payload = json.loads(raw_text, object_pairs_hook=_reject_duplicate_json_pairs)
+            else:
+                payload = response.json()
         except Exception as exc:
             raise GenBoxPushError("GenBox 返回了无法识别的响应") from exc
         if not isinstance(payload, dict):
