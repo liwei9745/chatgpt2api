@@ -319,19 +319,24 @@ export function useGalleryOperationsRuntime(options: GalleryOperationsRuntimeOpt
 
   function applyPushBatch(batch: GenBoxPushBatch) {
     activePushBatch.value = batch
+    const progressMismatch = !batch.is_terminal && !['queued', 'sending'].includes(batch.status)
     operationProgress.open = true
     operationProgress.title = '推送到 GenBox'
     operationProgress.subtitle = `已选择 ${batch.total} 张图片；源图会保留`
     operationProgress.total = batch.total
-    operationProgress.current = batch.succeeded + batch.already_imported + batch.failed + batch.cancelled
-    operationProgress.statusLabel = batch.failed
+    operationProgress.current = batch.processed
+    operationProgress.statusLabel = progressMismatch
+      ? '状态异常'
+      : batch.failed
       ? `失败 ${batch.failed}`
       : batch.retrying
         ? `重试中 ${batch.retrying}`
       : batch.already_imported
         ? `已存在 ${batch.already_imported}`
         : '已处理'
-    operationProgress.message = batch.status === 'queued'
+    operationProgress.message = progressMismatch
+      ? '批次状态与处理计数不一致，未将此任务视为完成。请刷新后重新查看。'
+      : batch.status === 'queued'
       ? batch.retrying
         ? '部分图片会在短暂等待后自动重试；源图仍保留。'
         : '已加入推送队列。你可以继续浏览图片。'
@@ -344,10 +349,12 @@ export function useGalleryOperationsRuntime(options: GalleryOperationsRuntimeOpt
             : batch.already_imported
               ? '图片已在 GenBox 中确认存在；不会重复导入，源图仍保留。'
               : '图片已推送完成；源图仍保留。'
-    operationProgress.error = batch.failed
-      ? '部分图片暂时未能推送。不会影响本地源图。'
-      : ''
-    operationProgress.busy = batch.status === 'queued' || batch.status === 'sending'
+    operationProgress.error = progressMismatch
+      ? '未完成的图片不会被视为已推送，源图仍保留。'
+      : batch.failed
+        ? '部分图片暂时未能推送。不会影响本地源图。'
+        : ''
+    operationProgress.busy = !progressMismatch && (batch.status === 'queued' || batch.status === 'sending')
     if (!operationProgress.busy) {
       batchBusy.value = false
       options.runtime.clearInterval('gallery:genbox-push-batch')

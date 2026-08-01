@@ -42,6 +42,8 @@ export interface GenBoxPushBatch {
   created_at: string
   updated_at: string
   total: number
+  processed: number
+  is_terminal: boolean
   queued: number
   sending: number
   succeeded: number
