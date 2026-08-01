@@ -73,6 +73,7 @@ export interface GenBoxPushSchedule {
   last_error: string
   queued: number
   succeeded: number
+  already_imported: number
   failed: number
   source_retained: true
 }

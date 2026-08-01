@@ -50,6 +50,8 @@ export function useGalleryOperationsRuntime(options: GalleryOperationsRuntimeOpt
   const targetFreeMb = ref('500')
   const batchBusy = ref(false)
   const activePushBatch = ref<GenBoxPushBatch | null>(null)
+  let pushBatchRequestGeneration = 0
+  let pushBatchRefreshInFlight = false
   const operationProgress = reactive({
     open: false,
     title: '',
@@ -354,15 +356,21 @@ export function useGalleryOperationsRuntime(options: GalleryOperationsRuntimeOpt
 
   async function refreshPushBatch() {
     const batchId = activePushBatch.value?.id
-    if (!batchId || !options.runtime.canRun.value) return
+    if (!batchId || !options.runtime.canRun.value || pushBatchRefreshInFlight) return
+    const generation = ++pushBatchRequestGeneration
+    pushBatchRefreshInFlight = true
     try {
       const response = await genboxPushApi.getBatch(batchId)
+      if (generation !== pushBatchRequestGeneration || activePushBatch.value?.id !== batchId) return
       applyPushBatch(response.batch)
     } catch (error: any) {
+      if (generation !== pushBatchRequestGeneration || activePushBatch.value?.id !== batchId) return
       operationProgress.error = error?.message || '无法刷新 GenBox 推送进度'
       operationProgress.busy = false
       batchBusy.value = false
       options.runtime.clearInterval('gallery:genbox-push-batch')
+    } finally {
+      pushBatchRefreshInFlight = false
     }
   }
 
@@ -376,8 +384,10 @@ export function useGalleryOperationsRuntime(options: GalleryOperationsRuntimeOpt
 
   async function restorePushBatch() {
     if (!options.runtime.canRun.value) return
+    const generation = ++pushBatchRequestGeneration
     try {
       const response = await genboxPushApi.getLatestRecoverableBatch()
+      if (generation !== pushBatchRequestGeneration) return
       if (!response.batch) return
       applyPushBatch(response.batch)
       if (response.batch.status === 'queued' || response.batch.status === 'sending') {
@@ -404,9 +414,11 @@ export function useGalleryOperationsRuntime(options: GalleryOperationsRuntimeOpt
     if (!confirmed) return
 
     batchBusy.value = true
+    const generation = ++pushBatchRequestGeneration
     resetProgress({ title: '推送到 GenBox', subtitle: `已选择 ${paths.length} 张图片`, total: paths.length, message: '正在创建可恢复的推送批次...' })
     try {
       const response = await genboxPushApi.createBatch(paths)
+      if (generation !== pushBatchRequestGeneration) return
       options.clearSelection()
       applyPushBatch(response.batch)
       startPushBatchPolling(response.batch.id)
@@ -426,6 +438,7 @@ export function useGalleryOperationsRuntime(options: GalleryOperationsRuntimeOpt
       return
     }
     batchBusy.value = true
+    const generation = ++pushBatchRequestGeneration
     try {
       const previewResponse = await genboxPushApi.previewBatchDateRange(startDate, endDate)
       const preview = previewResponse.preview
@@ -441,6 +454,7 @@ export function useGalleryOperationsRuntime(options: GalleryOperationsRuntimeOpt
       })
       if (!confirmed) return
       const response = await genboxPushApi.createBatch(preview.paths)
+      if (generation !== pushBatchRequestGeneration) return
       applyPushBatch(response.batch)
       startPushBatchPolling(response.batch.id)
     } catch (error: any) {
@@ -453,6 +467,7 @@ export function useGalleryOperationsRuntime(options: GalleryOperationsRuntimeOpt
   async function cancelPushBatch() {
     const batchId = activePushBatch.value?.id
     if (!batchId) return
+    ++pushBatchRequestGeneration
     try {
       const response = await genboxPushApi.cancelBatch(batchId)
       applyPushBatch(response.batch)
@@ -465,8 +480,10 @@ export function useGalleryOperationsRuntime(options: GalleryOperationsRuntimeOpt
     const batchId = activePushBatch.value?.id
     if (!batchId) return
     batchBusy.value = true
+    const generation = ++pushBatchRequestGeneration
     try {
       const response = await genboxPushApi.retryFailedBatch(batchId)
+      if (generation !== pushBatchRequestGeneration) return
       applyPushBatch(response.batch)
       startPushBatchPolling(batchId)
     } catch (error: any) {
@@ -476,6 +493,7 @@ export function useGalleryOperationsRuntime(options: GalleryOperationsRuntimeOpt
   }
 
   function deactivate() {
+    ++pushBatchRequestGeneration
     storageStatsQuery.invalidate()
     options.runtime.clearInterval('gallery:genbox-push-batch')
     isStorageBusy.value = false

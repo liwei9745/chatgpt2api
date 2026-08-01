@@ -176,6 +176,7 @@ class GenBoxPushScheduleService:
             "last_error": str(schedule.get("last_error") or ""),
             "queued": sum(item.get("status") in {"queued", "sending"} for item in items),
             "succeeded": sum(item.get("status") == "succeeded" for item in items),
+            "already_imported": sum(item.get("status") == "already-imported" for item in items),
             "failed": sum(item.get("status") == "failed" for item in items),
             "source_retained": True,
         }
@@ -247,7 +248,13 @@ class GenBoxPushScheduleService:
             if status in {"queued", "sending"}:
                 item["status"] = status
             elif status == "succeeded":
-                item.update({"status": "succeeded", "error": "", "updated_at": now.isoformat()})
+                already_imported = int(batch.get("already_imported") or 0)
+                succeeded = int(batch.get("succeeded") or 0)
+                item.update({
+                    "status": "already-imported" if already_imported and not succeeded else "succeeded",
+                    "error": "",
+                    "updated_at": now.isoformat(),
+                })
             else:
                 item.update({"status": "failed", "error": self._safe_error(), "updated_at": now.isoformat()})
 
@@ -272,7 +279,7 @@ class GenBoxPushScheduleService:
             attempts = int(item.get("attempts") or 0) + 1
             status = str(retried.get("status") or "queued")
             item.update({
-                "status": "succeeded" if status == "succeeded" else "queued",
+                "status": "already-imported" if status == "succeeded" and int(retried.get("already_imported") or 0) and not int(retried.get("succeeded") or 0) else "succeeded" if status == "succeeded" else "queued",
                 "attempts": attempts,
                 "retry_at": "" if status == "succeeded" else (now + timedelta(minutes=min(2 ** attempts, 30))).isoformat(),
                 "error": "" if status == "succeeded" else self._safe_error(),
@@ -319,7 +326,7 @@ class GenBoxPushScheduleService:
                             "path": path,
                             "source_sha256": digest,
                             "batch_id": str(batch.get("id") or ""),
-                            "status": status if status in {"queued", "sending", "succeeded"} else "failed",
+                            "status": status if status in {"queued", "sending", "succeeded", "already-imported"} else "failed",
                             "attempts": 1,
                             "updated_at": now.isoformat(),
                             "error": "" if status != "failed" else self._safe_error(),

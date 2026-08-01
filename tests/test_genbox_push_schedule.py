@@ -169,6 +169,21 @@ class GenBoxPushScheduleTests(unittest.TestCase):
         self.assertEqual(refreshed["queued"], 0)
         self.assertEqual(refreshed["succeeded"], 1)
 
+    def test_duplicate_batch_is_reported_as_already_imported(self) -> None:
+        self.batch.status = "queued"
+        queued = self.service.run_now()
+        self.assertEqual(queued["queued"], 1)
+
+        self.batch.batches["batch-1"].update({
+            "status": "succeeded",
+            "succeeded": 0,
+            "already_imported": 1,
+        })
+        refreshed = self.service.get_settings()
+
+        self.assertEqual(refreshed["succeeded"], 0)
+        self.assertEqual(refreshed["already_imported"], 1)
+
 
 class StubScheduleService:
     def __init__(self) -> None:
@@ -179,7 +194,7 @@ class StubScheduleService:
         return {
             "enabled": False, "weekday": 0, "time": "09:00", "start_date": "", "end_date": "",
             "cursor": "", "last_run_at": "", "last_error": "", "queued": 0,
-            "succeeded": 0, "failed": 0, "source_retained": True,
+            "succeeded": 0, "already_imported": 0, "failed": 0, "source_retained": True,
         }
 
     def get_settings(self) -> dict[str, object]:

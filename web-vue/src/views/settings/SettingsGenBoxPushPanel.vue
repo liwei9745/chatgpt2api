@@ -138,9 +138,9 @@ async function load() {
   }
 }
 
-function setScheduleMessage(schedule: { queued: number; succeeded: number; failed: number; last_error: string }, success: string) {
+function setScheduleMessage(schedule: { queued: number; succeeded: number; already_imported: number; failed: number; last_error: string }, success: string) {
   scheduleTone.value = schedule.last_error ? 'error' : 'success'
-  scheduleMessage.value = schedule.last_error || `${success} 已完成 ${schedule.succeeded} 张，等待中 ${schedule.queued} 张，失败 ${schedule.failed} 张；源图仍保留。`
+  scheduleMessage.value = schedule.last_error || `${success} 已完成 ${schedule.succeeded} 张，已存在 ${schedule.already_imported} 张，等待中 ${schedule.queued} 张，失败 ${schedule.failed} 张；源图仍保留。`
 }
 
 function stopSchedulePolling() {
