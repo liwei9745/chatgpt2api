@@ -256,6 +256,26 @@ class GenBoxPushCleanupTests(unittest.TestCase):
         self.assertEqual(result.get("blocked_reason"), "development-disabled")
         self.assertTrue(target.exists())
 
+    def test_destination_scope_without_server_trust_is_retained(self) -> None:
+        target = self._record()
+        self._enable_policy()
+        self.gate.environ["CHATGPT2API_CLEANUP_TRUSTED_DESTINATION_SCOPE"] = "wrong-scope"
+
+        result = self.service.execute()
+
+        self.assertTrue(target.exists())
+        self.assertEqual(result["items"][0]["decision_reason"], "destination-unverified")
+
+    def test_missing_isolated_marker_blocks_execute(self) -> None:
+        target = self._record()
+        self._enable_policy()
+        self.instance_marker.unlink()
+
+        result = self.service.execute()
+
+        self.assertTrue(target.exists())
+        self.assertEqual(result.get("blocked_reason"), "runtime-identity-unverified")
+
     def test_cleanup_admin_rejects_cross_origin_browser_request(self) -> None:
         from api.support import require_cleanup_admin
 
@@ -396,6 +416,19 @@ class GenBoxPushCleanupTests(unittest.TestCase):
         self.assertEqual(second["items"][0]["decision"], "already-deleted")
         records = json.loads(self.state.read_text(encoding="utf-8"))["records"]
         self.assertEqual(next(iter(records.values()))["cleanup_status"], "deleted")
+
+    def test_index_write_failure_is_delete_unknown_not_delete_failed(self) -> None:
+        target = self._record()
+        self._enable_policy()
+        self.storage._save_index({"2026/08/01/image.png": {"rel": "2026/08/01/image.png", "local": True, "webdav": False}})
+        with patch.object(self.storage, "_save_index", side_effect=OSError("synthetic index failure")):
+            result = self.service.execute()
+
+        self.assertFalse(target.exists())
+        self.assertEqual(result["failed"], 1)
+        self.assertEqual(result["items"][0]["decision"], "delete_unknown")
+        records = json.loads(self.state.read_text(encoding="utf-8"))["records"]
+        self.assertEqual(next(iter(records.values()))["cleanup_status"], "delete_unknown")
 
 
 if __name__ == "__main__":
