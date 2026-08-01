@@ -74,6 +74,48 @@ class GenBoxPushBatchServiceTests(unittest.TestCase):
         self.assertTrue(completed["source_retained"])
         self.assertEqual(self.sender.calls, ["2026/07/28/one.png", "2026/07/28/two.png"])
 
+    def test_public_projection_only_becomes_terminal_after_every_item_is_processed(self) -> None:
+        batch = self.batches.create(["2026/07/28/one.png", "2026/07/28/two.png"], start_worker=False)
+        claimed = self.batches._claim_next()
+        self.assertIsNotNone(claimed)
+        assert claimed is not None
+        batch_id, item_id, _item, item_lock = claimed
+        try:
+            in_progress = self.batches.get(batch_id)
+            self.assertEqual(in_progress["total"], 2)
+            self.assertEqual(in_progress["processed"], 0)
+            self.assertFalse(in_progress["is_terminal"])
+
+            self.batches._finish(batch_id, item_id, receipt_status="imported")
+            partial = self.batches.get(batch_id)
+            self.assertEqual(partial["processed"], 1)
+            self.assertFalse(partial["is_terminal"])
+        finally:
+            item_lock.release()
+
+        self.batches._drain()
+        completed = self.batches.get(str(batch["id"]))
+        self.assertEqual(completed["processed"], 2)
+        self.assertTrue(completed["is_terminal"])
+
+    def test_claim_skips_an_item_owned_by_another_worker(self) -> None:
+        batch = self.batches.create(["2026/07/28/one.png", "2026/07/28/two.png"], start_worker=False)
+        state = self.batches.get(str(batch["id"]))
+        first_item = state["items"][0]
+        held_lock = self.batches._item_lock(str(batch["id"]), str(first_item["id"]))
+        self.assertTrue(held_lock.acquire(timeout_secs=0))
+        try:
+            claimed = self.batches._claim_next()
+            self.assertIsNotNone(claimed)
+            assert claimed is not None
+            _batch_id, _item_id, item, item_lock = claimed
+            try:
+                self.assertEqual(item["path"], "2026/07/28/two.png")
+            finally:
+                item_lock.release()
+        finally:
+            held_lock.release()
+
     def test_batch_preserves_already_imported_receipt_outcome(self) -> None:
         class DuplicatePushService(FakePushService):
             def push_image(self, path: str, **kwargs: object) -> dict[str, object]:

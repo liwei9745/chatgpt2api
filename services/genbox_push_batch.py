@@ -174,12 +174,22 @@ class GenBoxPushBatchService:
             }
             for item_id, item in batch["items"].items()
         ]
+        processed = sum(
+            item["status"] in {"succeeded", "already-imported", "failed", "cancelled"}
+            for item in public_items
+        )
+        total = len(public_items)
         return {
             "id": batch_id,
             "status": cls._status(items),
             "created_at": str(batch.get("created_at") or ""),
             "updated_at": str(batch.get("updated_at") or ""),
-            "total": len(public_items),
+            "total": total,
+            # A batch can be terminal only after every selected source has a
+            # terminal outcome. Consumers must not infer completion from the
+            # aggregate status text alone.
+            "processed": processed,
+            "is_terminal": processed == total,
             "queued": sum(item["status"] == "queued" for item in public_items),
             "sending": sum(item["status"] == "sending" for item in public_items),
             "succeeded": sum(item["status"] == "succeeded" for item in public_items),
@@ -350,26 +360,30 @@ class GenBoxPushBatchService:
     def _claim_next(self) -> tuple[str, str, dict[str, Any], ProcessFileLock] | None:
         with self._lock:
             batches = self._load_locked()
-            candidates = [
-                (batch_id, item_id, item)
-                for batch_id, batch in batches.items()
-                for item_id, item in batch["items"].items()
-                if item.get("status") == "queued" and self._retry_due(item)
-            ]
-            if not candidates:
-                return None
-            batch_id, item_id, item = min(candidates, key=lambda entry: str(entry[2].get("updated_at") or ""))
-            item_lock = self._item_lock(batch_id, item_id)
-            if not item_lock.acquire(timeout_secs=0):
-                return None
-            try:
-                item.update({"status": "sending", "attempts": int(item.get("attempts") or 0) + 1, "updated_at": beijing_now_str()})
-                batches[batch_id]["updated_at"] = beijing_now_str()
-                self._save_locked(batches)
-                return batch_id, item_id, dict(item), item_lock
-            except Exception:
-                item_lock.release()
-                raise
+            candidates = sorted(
+                [
+                    (batch_id, item_id, item)
+                    for batch_id, batch in batches.items()
+                    for item_id, item in batch["items"].items()
+                    if item.get("status") == "queued" and self._retry_due(item)
+                ],
+                key=lambda entry: str(entry[2].get("updated_at") or ""),
+            )
+            for batch_id, item_id, item in candidates:
+                item_lock = self._item_lock(batch_id, item_id)
+                if not item_lock.acquire(timeout_secs=0):
+                    # Another worker owns this exact item. Other queued images
+                    # may still be safely processed by this worker.
+                    continue
+                try:
+                    item.update({"status": "sending", "attempts": int(item.get("attempts") or 0) + 1, "updated_at": beijing_now_str()})
+                    batches[batch_id]["updated_at"] = beijing_now_str()
+                    self._save_locked(batches)
+                    return batch_id, item_id, dict(item), item_lock
+                except Exception:
+                    item_lock.release()
+                    raise
+            return None
 
     def _finish(
         self,
