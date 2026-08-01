@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 from typing import Any
 import unittest
+from unittest.mock import patch
 
 from curl_cffi import CurlMime
 
@@ -292,6 +293,14 @@ class GenBoxPushServiceTests(unittest.TestCase):
         call = self.factory.sessions[0].calls[0]
         self.assertTrue(call["stream"])
         self.assertTrue(call["verify"])
+
+    def test_slow_drip_receipt_hits_total_deadline(self) -> None:
+        self.configure()
+        self.factory.responses.append(FakeResponse(200, {}, stream_chunks=[b"{}", b"{}", b"{}"]))
+        ticks = iter([0.0, 31.0])
+        with patch("services.genbox_push_service.time.monotonic", side_effect=lambda: next(ticks)):
+            with self.assertRaisesRegex(GenBoxPushError, "timed out"):
+                self.service.probe()
 
     def test_streaming_malformed_receipt_is_retained(self) -> None:
         self.configure()
