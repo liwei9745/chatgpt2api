@@ -5,6 +5,7 @@ import json
 import os
 import re
 import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
@@ -28,6 +29,7 @@ PUSH_CONTRACT_VERSION = "v1"
 SOURCE_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 SUCCESS_STATUSES = {"imported", "already-imported", "duplicate-local"}
 MAX_RECEIPT_BYTES = 1024 * 1024
+MAX_RECEIPT_SECONDS = 30.0
 
 
 def _reject_duplicate_json_pairs(pairs: list[tuple[str, object]]) -> dict[str, object]:
@@ -225,8 +227,11 @@ class GenBoxPushService:
         if callable(iterator):
             chunks: list[bytes] = []
             total = 0
+            started = time.monotonic()
             try:
                 for chunk in iterator(chunk_size=64 * 1024):
+                    if time.monotonic() - started > MAX_RECEIPT_SECONDS:
+                        raise GenBoxPushError("GenBox receipt timed out; the source image was retained.")
                     if not chunk:
                         continue
                     payload_chunk = bytes(chunk)

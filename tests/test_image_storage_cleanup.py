@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import os
 from pathlib import Path
+import subprocess
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -112,6 +113,35 @@ class ImageStorageCleanupTests(unittest.TestCase):
         self.assertEqual(result.status, "retained")
         self.assertEqual(result.reason, "path-alias")
         self.assertTrue((outside / "source.png").exists())
+
+    def test_directory_junction_alias_is_retained(self) -> None:
+        rel = "2026/08/01/source.png"
+        outside = self.tmp / "junction-outside"
+        outside.mkdir()
+        (outside / "source.png").write_bytes(b"outside-bytes")
+        alias_dir = self.images / "2026/08/01"
+        alias_dir.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            created = subprocess.run(
+                ["cmd", "/c", "mklink", "/J", str(alias_dir), str(outside)],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        except OSError as exc:
+            self.skipTest(f"junction tool unavailable: {exc}")
+        if created.returncode != 0 or not alias_dir.exists():
+            self.skipTest(f"junction unavailable: {created.stderr.strip() or created.stdout.strip()}")
+        try:
+            result = self.storage.delete_verified_local(
+                rel,
+                hashlib.sha256(b"outside-bytes").hexdigest(),
+            )
+            self.assertEqual(result.status, "retained")
+            self.assertEqual(result.reason, "path-alias")
+            self.assertTrue((outside / "source.png").exists())
+        finally:
+            os.rmdir(alias_dir)
 
     def test_index_write_failure_is_delete_unknown(self) -> None:
         rel, target, digest = self._source()

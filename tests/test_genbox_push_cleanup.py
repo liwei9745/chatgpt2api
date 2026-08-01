@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import multiprocessing
 import os
 from pathlib import Path
 import tempfile
@@ -50,6 +51,52 @@ class _ImageConfig:
     @property
     def base_url(self) -> str:
         return ""
+
+
+def _cleanup_process_worker(
+    images: str,
+    settings: str,
+    state: str,
+    audit: str,
+    index: str,
+    environment: dict[str, str],
+    result_queue,
+) -> None:
+    import services.image_storage_service as storage_module
+
+    storage_module.config = _ImageConfig(Path(images))
+    storage = ImageStorageService(index_file=Path(index))
+    service = GenBoxPushCleanupService(
+        state_file=Path(state),
+        audit_file=Path(audit),
+        settings_file=Path(settings),
+        image_storage=storage,
+        environment_gate=CleanupEnvironmentGate(dict(environment)),
+    )
+    result_queue.put(service.execute())
+
+
+def _cleanup_crash_worker(
+    images: str,
+    settings: str,
+    state: str,
+    audit: str,
+    index: str,
+    environment: dict[str, str],
+) -> None:
+    import services.image_storage_service as storage_module
+
+    storage_module.config = _ImageConfig(Path(images))
+    storage = ImageStorageService(index_file=Path(index))
+    storage._before_verified_unlink = lambda _target: os._exit(17)
+    service = GenBoxPushCleanupService(
+        state_file=Path(state),
+        audit_file=Path(audit),
+        settings_file=Path(settings),
+        image_storage=storage,
+        environment_gate=CleanupEnvironmentGate(dict(environment)),
+    )
+    service.execute()
 
 
 class GenBoxPushCleanupTests(unittest.TestCase):
@@ -506,6 +553,83 @@ class GenBoxPushCleanupTests(unittest.TestCase):
         self.assertFalse(target.exists())
         self.assertEqual(sum(int(result["deleted"]) for result in results), 1)
         self.assertEqual(sum(int(result["reclaimed_bytes"]) for result in results), len(b"synthetic-image"))
+
+    def test_cleanup_claim_is_shared_across_processes(self) -> None:
+        target = self._record()
+        self._enable_policy()
+        context = multiprocessing.get_context("spawn")
+        result_queue = context.Queue()
+        args = (
+            str(self.images),
+            str(self.settings),
+            str(self.state),
+            str(self.audit),
+            str(self.tmp / "index.json"),
+            dict(self.gate.environ),
+            result_queue,
+        )
+        workers = [context.Process(target=_cleanup_process_worker, args=args) for _ in range(2)]
+        for worker in workers:
+            worker.start()
+        for worker in workers:
+            worker.join(timeout=15)
+            self.assertEqual(worker.exitcode, 0)
+        results = [result_queue.get(timeout=5), result_queue.get(timeout=5)]
+
+        self.assertFalse(target.exists())
+        self.assertEqual(sum(int(result["deleted"]) for result in results), 1)
+
+    def test_application_lifespan_recovery_after_crash_before_unlink(self) -> None:
+        target = self._record()
+        self._enable_policy()
+        context = multiprocessing.get_context("spawn")
+        worker = context.Process(
+            target=_cleanup_crash_worker,
+            args=(
+                str(self.images),
+                str(self.settings),
+                str(self.state),
+                str(self.audit),
+                str(self.tmp / "index.json"),
+                dict(self.gate.environ),
+            ),
+        )
+        worker.start()
+        worker.join(timeout=15)
+
+        self.assertEqual(worker.exitcode, 17)
+        self.assertTrue(target.exists())
+        recovered = self.service.recover_inflight()
+        self.assertEqual(recovered, {"retained": 1, "unknown": 0})
+        self.assertTrue(target.exists())
+
+    def test_mixed_execute_results_reconcile_totals(self) -> None:
+        valid = self._record("2026/08/01/valid.png", b"valid")
+        changed = self._record("2026/08/01/changed.png", b"original")
+        changed.write_bytes(b"changed")
+        false_path = self.images / "2026/08/01/permission.png"
+        false_path.parent.mkdir(parents=True, exist_ok=True)
+        false_path.write_bytes(b"permission")
+        self.service.record_receipt(
+            destination_scope=self._scope(),
+            source_id="chatgpt2api-dev",
+            remote_path="2026/08/01/permission.png",
+            source_sha256=hashlib.sha256(b"permission").hexdigest(),
+            receipt_status="imported",
+            safe_to_delete_source=False,
+            size_bytes=len(b"permission"),
+        )
+        self._enable_policy()
+
+        result = self.service.execute()
+
+        self.assertEqual(result["deleted"], 1)
+        self.assertEqual(result["reclaimed_bytes"], len(b"valid"))
+        self.assertFalse(valid.exists())
+        self.assertTrue(changed.exists())
+        self.assertTrue(false_path.exists())
+        self.assertEqual(result["candidates"], 3)
+        self.assertEqual(result["deleted"] + result["retained"] + result["failed"], 3)
 
     def test_source_busy_does_not_leave_eligible_bytes_in_summary(self) -> None:
         target = self._record()
