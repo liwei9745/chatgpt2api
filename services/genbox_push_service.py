@@ -12,13 +12,16 @@ from urllib.parse import urlparse
 from curl_cffi import CurlMime, requests
 
 from services.config import DATA_DIR
+from services.genbox_push_cleanup import GenBoxPushCleanupService, genbox_push_cleanup_service
 from services.image_storage_service import image_storage_service
 from services.json_file import read_json_object, write_json_file
+from services.source_claim import source_claim
 
 
 PUSH_CONTRACT_VERSION = "v1"
 SOURCE_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 SUCCESS_STATUSES = {"imported", "already-imported", "duplicate-local"}
+MAX_RECEIPT_BYTES = 1024 * 1024
 
 
 class GenBoxPushError(RuntimeError):
@@ -30,6 +33,7 @@ class GenBoxPushError(RuntimeError):
 @dataclass(frozen=True)
 class GenBoxPushSettings:
     enabled: bool
+    cleanup_enabled: bool
     base_url: str
     source_id: str
     push_key: str
@@ -93,17 +97,28 @@ class GenBoxPushService:
         state_file: Path | None = None,
         image_reader: Callable[[str], bytes] | None = None,
         session_factory: Callable[[], Any] | None = None,
+        cleanup_service: GenBoxPushCleanupService | None = None,
     ) -> None:
         self.settings_file = settings_file or DATA_DIR / "genbox_push_settings.json"
         self.state_file = state_file or DATA_DIR / "genbox_push_state.json"
         self.image_reader = image_reader or image_storage_service.get_bytes
         self.session_factory = session_factory or requests.Session
+        self.cleanup_service = cleanup_service or (
+            genbox_push_cleanup_service
+            if settings_file is None and state_file is None
+            else GenBoxPushCleanupService(
+                state_file=self.state_file.with_name("genbox_push_cleanup.json"),
+                audit_file=self.state_file.with_name("genbox_push_cleanup_audit.json"),
+                settings_file=self.settings_file,
+            )
+        )
         self._lock = threading.RLock()
 
     def _load_settings(self) -> GenBoxPushSettings:
         raw = read_json_object(self.settings_file, name=self.settings_file.name)
         return GenBoxPushSettings(
             enabled=bool(raw.get("enabled", False)),
+            cleanup_enabled=raw.get("cleanup_enabled") is True,
             base_url=_normalize_base_url(raw.get("base_url")),
             source_id=_normalize_source_id(raw.get("source_id")),
             push_key=_clean(raw.get("push_key")),
@@ -114,6 +129,7 @@ class GenBoxPushService:
     def _public_settings(settings: GenBoxPushSettings) -> dict[str, object]:
         return {
             "enabled": settings.enabled,
+            "cleanup_enabled": settings.cleanup_enabled,
             "base_url": settings.base_url,
             "source_id": settings.source_id,
             "has_push_key": bool(settings.push_key),
@@ -134,6 +150,11 @@ class GenBoxPushService:
                 push_key = _clean(payload.get("push_key"))
             settings = GenBoxPushSettings(
                 enabled=bool(payload.get("enabled", current.enabled)),
+                cleanup_enabled=(
+                    current.cleanup_enabled
+                    if payload.get("cleanup_enabled") is None
+                    else bool(payload.get("cleanup_enabled"))
+                ),
                 base_url=_normalize_base_url(payload.get("base_url", current.base_url)),
                 source_id=_normalize_source_id(payload.get("source_id", current.source_id)),
                 push_key=push_key,
@@ -143,6 +164,7 @@ class GenBoxPushService:
                 raise ValueError("启用 GenBox 推送前必须填写地址、来源标识和推送密钥")
             write_json_file(self.settings_file, {
                 "enabled": settings.enabled,
+                "cleanup_enabled": settings.cleanup_enabled,
                 "base_url": settings.base_url,
                 "source_id": settings.source_id,
                 "push_key": settings.push_key,
@@ -176,6 +198,12 @@ class GenBoxPushService:
 
     @staticmethod
     def _response_json(response: Any) -> dict[str, object]:
+        content = getattr(response, "content", None)
+        if isinstance(content, (bytes, bytearray)) and len(content) > MAX_RECEIPT_BYTES:
+            raise GenBoxPushError("GenBox returned an oversized receipt; the source image was retained.")
+        text = getattr(response, "text", None)
+        if isinstance(text, str) and len(text.encode("utf-8")) > MAX_RECEIPT_BYTES:
+            raise GenBoxPushError("GenBox returned an oversized receipt; the source image was retained.")
         try:
             payload = response.json()
         except Exception as exc:
@@ -284,6 +312,38 @@ class GenBoxPushService:
         expected_sha256: str | None = None,
         _transfer_context: GenBoxPushTransferContext | None = None,
     ) -> dict[str, object]:
+        payload = self.image_reader(relative_path)
+        digest = hashlib.sha256(payload).hexdigest()
+        if expected_sha256 is not None and digest != expected_sha256:
+            raise GenBoxPushError("The source image changed before it could be sent; it was retained.")
+        claim = source_claim(relative_path, digest)
+        if not claim.acquire(timeout_secs=0):
+            raise GenBoxPushError(
+                "The source image is busy; it was retained. Retry after the active transfer finishes.",
+                retryable=True,
+            )
+        try:
+            return self._push_image_unclaimed(
+                relative_path,
+                created_at=created_at,
+                prompt=prompt,
+                model=model,
+                expected_sha256=digest,
+                _transfer_context=_transfer_context,
+            )
+        finally:
+            claim.release()
+
+    def _push_image_unclaimed(
+        self,
+        relative_path: str,
+        *,
+        created_at: str = "",
+        prompt: str = "",
+        model: str = "",
+        expected_sha256: str | None = None,
+        _transfer_context: GenBoxPushTransferContext | None = None,
+    ) -> dict[str, object]:
         with self._lock:
             settings = self._configured_settings()
             if _transfer_context is not None:
@@ -353,6 +413,20 @@ class GenBoxPushService:
                 "source_retained": True,
             }
             self._save_result(relative_path, result)
+            try:
+                self.cleanup_service.record_receipt(
+                    destination_scope=self._transfer_scope_for(settings),
+                    source_id=settings.source_id,
+                    remote_path=relative_path,
+                    source_sha256=digest,
+                    receipt_status=str(receipt["status"]),
+                    safe_to_delete_source=receipt.get("safe_to_delete_source") is True,
+                    size_bytes=len(payload),
+                )
+            except Exception as exc:
+                raise GenBoxPushError(
+                    "The receipt was accepted but could not be durably recorded; the source was retained."
+                ) from exc
             return result
 
 

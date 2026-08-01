@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import hashlib
 import io
+import os
+import stat
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -33,6 +35,13 @@ class StoredImage:
     size: int
 
 
+@dataclass(frozen=True)
+class VerifiedDeleteResult:
+    status: str
+    reason: str
+    size_bytes: int = 0
+
+
 def _clean(value: object) -> str:
     return str(value or "").strip()
 
@@ -57,6 +66,25 @@ def _safe_relative_path(path: str) -> str:
     if any(part in {"", ".", ".."} for part in parts):
         raise HTTPException(status_code=404, detail="image not found")
     return Path(*parts).as_posix()
+
+
+def _cleanup_relative_path(path: object) -> str:
+    """Validate the already-normalized path used by destructive cleanup.
+
+    The normal image API accepts a few browser-friendly aliases. Cleanup must
+    be stricter: an absolute path, alternate separator, traversal component, or
+    empty component is never an acceptable deletion target.
+    """
+    value = str(path or "")
+    if not value or "\\" in value or "\x00" in value or value.startswith("/"):
+        raise ImageStorageError("cleanup path is not a normalized relative path")
+    parts = value.split("/")
+    if any(not part or part in {".", ".."} for part in parts):
+        raise ImageStorageError("cleanup path is not a normalized relative path")
+    candidate = Path(value)
+    if candidate.is_absolute() or candidate.as_posix() != value:
+        raise ImageStorageError("cleanup path is not a normalized relative path")
+    return value
 
 
 def _image_dimensions(payload: bytes) -> tuple[int, int] | None:
@@ -345,6 +373,168 @@ class ImageStorageService:
                 self._save_index(indexed)
         items.sort(key=lambda item: str(item.get("created_at") or ""), reverse=True)
         return items
+
+    def verify_local_identity(
+        self,
+        rel: str,
+        expected_sha256: str,
+        *,
+        expected_size: int | None = None,
+    ) -> dict[str, object]:
+        """Inspect one local source without following aliases.
+
+        This is intentionally separate from ``get_bytes``. The latter is a
+        read convenience for normal image serving; cleanup needs lstat/fstat
+        checks, a regular-file requirement, and a hard-link rejection.
+        """
+        try:
+            safe_rel = _cleanup_relative_path(rel)
+        except ImageStorageError as exc:
+            return {"ok": False, "reason": "path-invalid", "detail": str(exc)}
+        digest = str(expected_sha256 or "").strip().lower()
+        if len(digest) != 64 or any(char not in "0123456789abcdef" for char in digest):
+            return {"ok": False, "reason": "hash-invalid"}
+        root = config.images_dir
+        try:
+            root_stat = root.lstat()
+            if not stat.S_ISDIR(root_stat.st_mode) or root.is_symlink():
+                return {"ok": False, "reason": "storage-root-invalid"}
+            candidate = root / safe_rel
+            relative_check = candidate.relative_to(root)
+            if relative_check.as_posix() != safe_rel:
+                return {"ok": False, "reason": "path-outside-root"}
+            file_stat = candidate.lstat()
+        except (OSError, ValueError):
+            return {"ok": False, "reason": "source-missing"}
+        if stat.S_ISLNK(file_stat.st_mode):
+            return {"ok": False, "reason": "path-alias"}
+        if not stat.S_ISREG(file_stat.st_mode):
+            return {"ok": False, "reason": "source-not-regular"}
+        if int(getattr(file_stat, "st_nlink", 1) or 1) != 1:
+            return {"ok": False, "reason": "path-alias"}
+        if expected_size is not None and int(file_stat.st_size) != int(expected_size):
+            return {"ok": False, "reason": "source-changed", "size_bytes": int(file_stat.st_size)}
+        try:
+            nofollow = int(getattr(os, "O_NOFOLLOW", 0))
+            flags = os.O_RDONLY | nofollow
+            descriptor = os.open(candidate, flags)
+            try:
+                opened_stat = os.fstat(descriptor)
+                if (
+                    opened_stat.st_dev != file_stat.st_dev
+                    or opened_stat.st_ino != file_stat.st_ino
+                    or opened_stat.st_size != file_stat.st_size
+                    or not stat.S_ISREG(opened_stat.st_mode)
+                    or int(getattr(opened_stat, "st_nlink", 1) or 1) != 1
+                ):
+                    return {"ok": False, "reason": "source-changed"}
+                hasher = hashlib.sha256()
+                with os.fdopen(os.dup(descriptor), "rb", closefd=True) as stream:
+                    for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                        hasher.update(chunk)
+                actual = hasher.hexdigest()
+            finally:
+                os.close(descriptor)
+        except FileNotFoundError:
+            return {"ok": False, "reason": "source-missing"}
+        except OSError:
+            return {"ok": False, "reason": "source-unreadable"}
+        if actual != digest:
+            return {"ok": False, "reason": "source-changed", "size_bytes": int(file_stat.st_size)}
+        try:
+            after_stat = candidate.lstat()
+        except OSError:
+            return {"ok": False, "reason": "source-changed"}
+        if (
+            after_stat.st_dev != file_stat.st_dev
+            or after_stat.st_ino != file_stat.st_ino
+            or after_stat.st_size != file_stat.st_size
+            or stat.S_ISLNK(after_stat.st_mode)
+            or int(getattr(after_stat, "st_nlink", 1) or 1) != 1
+        ):
+            return {"ok": False, "reason": "source-changed"}
+        return {
+            "ok": True,
+            "relative_path": safe_rel,
+            "sha256": actual,
+            "size_bytes": int(file_stat.st_size),
+            "stat": file_stat,
+        }
+
+    def delete_verified_local(
+        self,
+        rel: str,
+        expected_sha256: str,
+        *,
+        expected_size: int | None = None,
+        claim_held: bool = False,
+    ) -> VerifiedDeleteResult:
+        """Delete one unchanged local source after storage-owned checks.
+
+        The cleanup service holds the shared source claim through its durable
+        terminal record. Direct callers get the same claim automatically.
+        WebDAV-only entries are retained: this primitive is deliberately local
+        to the sender's image root and never turns a cleanup request into an
+        unrelated remote delete.
+        """
+        from services.source_claim import source_claim
+
+        safe_rel = str(rel or "")
+        lock = None
+        if not claim_held:
+            lock = source_claim(safe_rel, str(expected_sha256 or "").strip().lower())
+            if not lock.acquire(timeout_secs=0):
+                return VerifiedDeleteResult("retained", "source-busy")
+        try:
+            identity = self.verify_local_identity(safe_rel, expected_sha256, expected_size=expected_size)
+            if not bool(identity.get("ok")):
+                return VerifiedDeleteResult("retained", str(identity.get("reason") or "source-unverified"), int(identity.get("size_bytes") or 0))
+            root = config.images_dir
+            candidate = root / str(identity["relative_path"])
+            try:
+                candidate.unlink()
+            except FileNotFoundError:
+                return VerifiedDeleteResult("retained", "source-missing")
+            except OSError:
+                return VerifiedDeleteResult("delete_failed", "unlink-failed", int(identity.get("size_bytes") or 0))
+            try:
+                with self._index_lock:
+                    items = self._load_clean_index()
+                    item = items.get(safe_rel)
+                    if item is not None:
+                        if item.get("webdav"):
+                            items[safe_rel] = {
+                                **item,
+                                "local": False,
+                                "storage": "webdav",
+                            }
+                        else:
+                            items.pop(safe_rel, None)
+                        self._save_index(items)
+            except Exception:
+                # The source is already gone, but the durable cleanup record
+                # remains in ``deleting`` so recovery can report ambiguity.
+                return VerifiedDeleteResult("delete_failed", "index-write-failed", int(identity.get("size_bytes") or 0))
+            return VerifiedDeleteResult("deleted", "deleted", int(identity.get("size_bytes") or 0))
+        finally:
+            if lock is not None:
+                lock.release()
+
+    def delete_verified(
+        self,
+        rel: str,
+        expected_sha256: str,
+        *,
+        expected_size: int | None = None,
+        claim_held: bool = False,
+    ) -> VerifiedDeleteResult:
+        """Compatibility name for the storage-owned cleanup primitive."""
+        return self.delete_verified_local(
+            rel,
+            expected_sha256,
+            expected_size=expected_size,
+            claim_held=claim_held,
+        )
 
     def delete(self, rel: str) -> bool:
         safe_rel = _safe_relative_path(rel)

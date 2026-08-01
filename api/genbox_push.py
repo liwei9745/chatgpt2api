@@ -1,11 +1,12 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, HTTPException, Header
+from fastapi import APIRouter, HTTPException, Header, Request
 from fastapi.concurrency import run_in_threadpool
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
-from api.support import require_admin
+from api.support import require_admin, require_cleanup_admin
 from services.genbox_push_batch import genbox_push_batch_service
+from services.genbox_push_cleanup import genbox_push_cleanup_service
 from services.genbox_push_schedule import genbox_push_schedule_service
 from services.genbox_push_service import GenBoxPushError, genbox_push_service
 from services.genbox_push_transfer import GenBoxPushTransferCoordinator, genbox_push_transfer_coordinator
@@ -44,6 +45,12 @@ class GenBoxPushScheduleRequest(BaseModel):
     end_date: str = Field(default="", max_length=10)
 
 
+class GenBoxPushCleanupSettingsRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = False
+
+
 def _raise_push_error(exc: Exception) -> None:
     message = str(exc) or "GenBox 推送失败"
     raise HTTPException(status_code=400, detail={"error": message}) from exc
@@ -74,6 +81,37 @@ def create_router() -> APIRouter:
         except GenBoxPushError as exc:
             _raise_push_error(exc)
         return {"result": result}
+
+    @router.get("/api/genbox-push/cleanup/settings")
+    async def get_cleanup_settings(authorization: str | None = Header(default=None)):
+        require_admin(authorization)
+        return {"settings": await run_in_threadpool(genbox_push_cleanup_service.settings)}
+
+    @router.post("/api/genbox-push/cleanup/settings")
+    async def update_cleanup_settings(
+        body: GenBoxPushCleanupSettingsRequest,
+        request: Request,
+        authorization: str | None = Header(default=None),
+    ):
+        require_cleanup_admin(request, authorization)
+        try:
+            await run_in_threadpool(
+                genbox_push_service.update_settings,
+                {"cleanup_enabled": body.enabled},
+            )
+        except (GenBoxPushError, ValueError) as exc:
+            _raise_push_error(exc)
+        return {"settings": await run_in_threadpool(genbox_push_cleanup_service.settings)}
+
+    @router.post("/api/genbox-push/cleanup/preview")
+    async def preview_cleanup(request: Request, authorization: str | None = Header(default=None)):
+        require_cleanup_admin(request, authorization)
+        return {"result": await run_in_threadpool(genbox_push_cleanup_service.preview)}
+
+    @router.post("/api/genbox-push/cleanup/run")
+    async def run_cleanup(request: Request, authorization: str | None = Header(default=None)):
+        require_cleanup_admin(request, authorization)
+        return {"result": await run_in_threadpool(genbox_push_cleanup_service.execute)}
 
     @router.post("/api/genbox-push/images")
     async def push_image(body: GenBoxPushImageRequest, authorization: str | None = Header(default=None)):

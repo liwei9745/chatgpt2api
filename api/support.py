@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from threading import Event, Thread
+from urllib.parse import urlparse
 
 from fastapi import HTTPException, Request
 
@@ -43,6 +44,31 @@ def require_admin(authorization: str | None) -> dict[str, object]:
     identity = require_identity(authorization)
     if identity.get("role") != "admin":
         raise HTTPException(status_code=403, detail={"error": "需要管理员权限才能执行这个操作"})
+    return identity
+
+
+def require_cleanup_admin(request: Request, authorization: str | None) -> dict[str, object]:
+    """Require admin auth plus a same-origin browser mutation boundary.
+
+    Cleanup endpoints are destructive administrative actions. The bearer key
+    remains the authentication mechanism, while the Origin/Fetch-Metadata
+    check prevents a cross-site browser from replaying a valid browser-held
+    credential into a cleanup request. Non-browser callers may omit these
+    headers; cross-site browser markers are always rejected.
+    """
+    identity = require_admin(authorization)
+    origin = str(request.headers.get("origin") or "").strip()
+    if origin:
+        if origin == "null":
+            raise HTTPException(status_code=403, detail={"error": "cleanup request origin is not trusted"})
+        parsed = urlparse(origin)
+        expected_scheme = str(request.url.scheme or "").lower()
+        expected_netloc = str(request.url.netloc or "").lower()
+        if parsed.scheme.lower() != expected_scheme or parsed.netloc.lower() != expected_netloc:
+            raise HTTPException(status_code=403, detail={"error": "cleanup request origin is not trusted"})
+    fetch_site = str(request.headers.get("sec-fetch-site") or "").strip().lower()
+    if fetch_site in {"cross-site", "cross-origin"}:
+        raise HTTPException(status_code=403, detail={"error": "cleanup request origin is not trusted"})
     return identity
 
 
