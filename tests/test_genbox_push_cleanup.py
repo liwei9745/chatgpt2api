@@ -57,6 +57,12 @@ class GenBoxPushCleanupTests(unittest.TestCase):
         self.settings = self.tmp / "settings.json"
         self.state = self.tmp / "cleanup.json"
         self.audit = self.tmp / "audit.json"
+        self.instance_id = "synthetic-isolated-sender"
+        self.instance_marker = self.tmp / ".genbox-isolated-cleanup"
+        self.instance_marker.write_text(
+            f"{self.instance_id}\nisolated-development\n{self.images.resolve()}",
+            encoding="utf-8",
+        )
         write_json_file(self.settings, {
             "enabled": True,
             "cleanup_enabled": False,
@@ -69,7 +75,7 @@ class GenBoxPushCleanupTests(unittest.TestCase):
             "CHATGPT2API_CLEANUP_ENVIRONMENT": "isolated-vps",
             "CHATGPT2API_CLEANUP_EXECUTE": "1",
             "CHATGPT2API_CLEANUP_INSTANCE_ROLE": "isolated-development",
-            "CHATGPT2API_CLEANUP_INSTANCE_ID": "synthetic-isolated-sender",
+            "CHATGPT2API_CLEANUP_INSTANCE_ID": self.instance_id,
             "CHATGPT2API_CLEANUP_STORAGE_ROOT": str(self.images.resolve()),
             "CHATGPT2API_CLEANUP_CAPABILITY": "synthetic-capability-32-bytes-000000000000",
             "CHATGPT2API_CLEANUP_TRUSTED_DESTINATION_KIND": "private-verified",

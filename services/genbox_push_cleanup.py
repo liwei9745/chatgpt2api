@@ -78,15 +78,22 @@ class CleanupEnvironmentGate:
         configured_root = _clean(self.environ.get("CHATGPT2API_CLEANUP_STORAGE_ROOT"))
         if not configured_root or self._storage_root_provider is None:
             return False
+        instance_id = _clean(self.environ.get("CHATGPT2API_CLEANUP_INSTANCE_ID"))
+        role = _clean(self.environ.get("CHATGPT2API_CLEANUP_INSTANCE_ROLE"))
         try:
             roots_match = Path(configured_root).resolve() == Path(self._storage_root_provider()).resolve()
+            marker_path = Path(configured_root).resolve().parent / ".genbox-isolated-cleanup"
+            marker = marker_path.read_text(encoding="utf-8").strip()
+            marker_matches = marker == f"{instance_id}\n{role}\n{Path(configured_root).resolve()}"
         except (OSError, RuntimeError, TypeError):
             roots_match = False
+            marker_matches = False
         return bool(
-            _clean(self.environ.get("CHATGPT2API_CLEANUP_INSTANCE_ROLE")) == "isolated-development"
-            and _clean(self.environ.get("CHATGPT2API_CLEANUP_INSTANCE_ID"))
+            role == "isolated-development"
+            and instance_id
             and _clean(self.environ.get("CHATGPT2API_CLEANUP_CAPABILITY"))
             and roots_match
+            and marker_matches
         )
 
     def destination_trusted(self, destination_scope: str) -> bool:
