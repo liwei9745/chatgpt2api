@@ -11,7 +11,7 @@ from fastapi import HTTPException
 from fastapi.responses import FileResponse, Response
 from PIL import Image, ImageOps
 
-from services.config import config
+from services.config import CLEANUP_STATE_FILE, config
 from services.image_storage_service import image_storage_service
 from services.image_tags_service import load_tags, remove_tags
 from utils.log import logger
@@ -254,6 +254,11 @@ def _retention_days(value: int | float | str | None, fallback: int) -> int:
 
 def _retention_cleanup_targets(retention_days: int) -> list[tuple[str, int]]:
     days = _retention_days(retention_days, config.image_retention_days)
+    # Retention cleanup is automatic and must fail closed like the other
+    # automatic cleaners: without readable Phase 6 state it cannot prove an
+    # old source is untracked, so no target is eligible at all.
+    if not CLEANUP_STATE_FILE.exists() or "*" in config.receipt_protected_image_paths():
+        return []
     cutoff = time.time() - days * 86400
     root = config.images_dir.resolve()
     targets: list[tuple[str, int]] = []
@@ -291,12 +296,16 @@ def cleanup_image_retention(retention_days: int | None = None) -> dict[str, int 
     removed = 0
     removed_size_bytes = 0
     for rel, size in targets:
+        # Delete the source first. Thumbnails and tags are removed only
+        # when the storage layer actually deleted the image; stripping
+        # metadata for a retained source would hide it from the library.
         try:
-            if image_storage_service.delete(rel):
-                removed += 1
-                removed_size_bytes += size
+            if not image_storage_service.delete(rel):
+                continue
         except Exception:
             continue
+        removed += 1
+        removed_size_bytes += size
         for thumbnail in (_thumbnail_path(rel), config.image_thumbnails_dir / _safe_relative_path(rel)):
             if thumbnail.is_file():
                 thumbnail.unlink()
@@ -415,10 +424,12 @@ def delete_images(paths: list[str] | None = None, start_date: str = "", end_date
             continue
         if image_storage_service.delete(item):
             removed += 1
-        for thumbnail in (_thumbnail_path(item), config.image_thumbnails_dir / _safe_relative_path(item)):
-            if thumbnail.is_file():
-                thumbnail.unlink()
-        remove_tags(item)
+            # Metadata is stripped only after a confirmed source delete; a
+            # retained source keeps its thumbnails and tags.
+            for thumbnail in (_thumbnail_path(item), config.image_thumbnails_dir / _safe_relative_path(item)):
+                if thumbnail.is_file():
+                    thumbnail.unlink()
+            remove_tags(item)
     _cleanup_empty_dirs(root)
     _cleanup_empty_dirs(config.image_thumbnails_dir)
     return {"removed": removed}
@@ -527,15 +538,21 @@ def delete_to_target(target_free_mb: int, dry_run: bool = False) -> dict:
             break
         rel = p.relative_to(config.images_dir).as_posix()
         protected = config.receipt_protected_image_paths()
-        if "*" in protected or rel in protected:
+        # Low-space cleanup is automatic and must fail closed when the Phase 6
+        # state is absent or malformed; it may never unlink a tracked source.
+        if not CLEANUP_STATE_FILE.exists() or "*" in protected or rel in protected:
             continue
         size = p.stat().st_size
         if not dry_run:
+            # Delete the source first. If the receipt projection or shared
+            # claim changes between discovery and deletion, do not remove
+            # thumbnails/tags for an image that was retained.
+            if not image_storage_service.delete(rel):
+                continue
             for tp in (_thumbnail_path(rel), config.image_thumbnails_dir / _safe_relative_path(rel)):
                 if tp.is_file():
                     tp.unlink()
             remove_tags(rel)
-            p.unlink()
         freed += size
         removed += 1
 

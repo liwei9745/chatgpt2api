@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import queue
 import re
 import threading
 import time
@@ -205,6 +206,10 @@ class GenBoxPushService:
             raise GenBoxPushError("GenBox 推送尚未启用")
         if not settings.base_url or not settings.source_id or not settings.push_key:
             raise GenBoxPushError("GenBox 推送配置不完整")
+        if settings.cleanup_enabled and urlparse(settings.base_url).scheme != "https":
+            raise GenBoxPushError(
+                "Source cleanup requires an HTTPS GenBox destination; the source image was retained."
+            )
         return settings
 
     @staticmethod
@@ -217,6 +222,11 @@ class GenBoxPushService:
     @staticmethod
     def _response_json(response: Any) -> dict[str, object]:
         headers = getattr(response, "headers", {}) or {}
+        content_type = _clean(headers.get("content-type") or headers.get("Content-Type"))
+        if content_type:
+            media_type = content_type.split(";", 1)[0].strip().lower()
+            if media_type not in {"application/json", "application/problem+json"}:
+                raise GenBoxPushError("GenBox returned a non-JSON receipt; the source image was retained.")
         try:
             content_length = int(headers.get("content-length") or headers.get("Content-Length") or 0)
         except (TypeError, ValueError):
@@ -228,13 +238,33 @@ class GenBoxPushService:
             chunks: list[bytes] = []
             total = 0
             started = time.monotonic()
+            events: queue.Queue[tuple[str, object]] = queue.Queue(maxsize=1)
+
+            def consume() -> None:
+                try:
+                    for chunk in iterator(chunk_size=64 * 1024):
+                        events.put(("chunk", bytes(chunk)))
+                    events.put(("done", None))
+                except BaseException as exc:
+                    events.put(("error", exc))
+
+            threading.Thread(target=consume, name="genbox-receipt-reader", daemon=True).start()
             try:
-                for chunk in iterator(chunk_size=64 * 1024):
-                    if time.monotonic() - started > MAX_RECEIPT_SECONDS:
+                while True:
+                    remaining = MAX_RECEIPT_SECONDS - (time.monotonic() - started)
+                    if remaining <= 0:
                         raise GenBoxPushError("GenBox receipt timed out; the source image was retained.")
-                    if not chunk:
+                    try:
+                        kind, value = events.get(timeout=remaining)
+                    except queue.Empty as exc:
+                        raise GenBoxPushError("GenBox receipt timed out; the source image was retained.") from exc
+                    if kind == "done":
+                        break
+                    if kind == "error":
+                        raise value if isinstance(value, BaseException) else RuntimeError("receipt stream failed")
+                    payload_chunk = value if isinstance(value, bytes) else bytes(value)
+                    if not payload_chunk:
                         continue
-                    payload_chunk = bytes(chunk)
                     total += len(payload_chunk)
                     if total > MAX_RECEIPT_BYTES:
                         raise GenBoxPushError("GenBox returned an oversized receipt; the source image was retained.")
@@ -266,10 +296,9 @@ class GenBoxPushService:
             raise GenBoxPushError("GenBox returned an oversized receipt; the source image was retained.")
         try:
             raw_text = getattr(response, "text", None)
-            if isinstance(raw_text, str):
-                payload = json.loads(raw_text, object_pairs_hook=_reject_duplicate_json_pairs)
-            else:
-                payload = response.json()
+            if not isinstance(raw_text, str):
+                raise ValueError("response body is unavailable")
+            payload = json.loads(raw_text, object_pairs_hook=_reject_duplicate_json_pairs)
         except Exception as exc:
             raise GenBoxPushError("GenBox 返回了无法识别的响应") from exc
         if not isinstance(payload, dict):
@@ -295,30 +324,41 @@ class GenBoxPushService:
 
     def _probe(self, settings: GenBoxPushSettings) -> dict[str, object]:
         session = self.session_factory()
+        response = None
         try:
-            response = session.get(
-                f"{settings.base_url}/api/sync/push/status",
-                headers=self._headers(settings),
-                timeout=settings.timeout_secs,
-                allow_redirects=False,
-                stream=True,
-                verify=True,
-            )
-        except Exception as exc:
-            raise GenBoxPushError("无法连接到 GenBox，请检查私网或地址", retryable=True) from exc
+            try:
+                response = session.get(
+                    f"{settings.base_url}/api/sync/push/status",
+                    headers=self._headers(settings),
+                    timeout=settings.timeout_secs,
+                    allow_redirects=False,
+                    stream=True,
+                    verify=True,
+                )
+            except Exception as exc:
+                raise GenBoxPushError("无法连接到 GenBox，请检查私网或地址", retryable=True) from exc
+            self._reject_redirect(response)
+            if not bool(getattr(response, "ok", False)):
+                raise self._request_error(response)
+            payload = self._response_json(response)
+            if payload.get("ok") is not True or not isinstance(payload.get("contract_version"), str) or payload.get("contract_version") != PUSH_CONTRACT_VERSION:
+                raise GenBoxPushError("GenBox 不支持当前推送协议")
+            if not isinstance(payload.get("source_id"), str) or payload.get("source_id") != settings.source_id:
+                raise GenBoxPushError("GenBox 返回的来源标识不匹配")
+            return payload
         finally:
+            # The streaming response must be released even when the bounded
+            # read fails; otherwise the receipt deadline leaks the reader.
+            if response is not None:
+                close_response = getattr(response, "close", None)
+                if callable(close_response):
+                    try:
+                        close_response()
+                    except Exception:
+                        pass
             close = getattr(session, "close", None)
             if callable(close):
                 close()
-        self._reject_redirect(response)
-        if not bool(getattr(response, "ok", False)):
-            raise self._request_error(response)
-        payload = self._response_json(response)
-        if payload.get("ok") is not True or not isinstance(payload.get("contract_version"), str) or payload.get("contract_version") != PUSH_CONTRACT_VERSION:
-            raise GenBoxPushError("GenBox 不支持当前推送协议")
-        if not isinstance(payload.get("source_id"), str) or payload.get("source_id") != settings.source_id:
-            raise GenBoxPushError("GenBox 返回的来源标识不匹配")
-        return payload
 
     def probe(self) -> dict[str, object]:
         with self._lock:
@@ -438,69 +478,80 @@ class GenBoxPushService:
                 content_type=self._content_type(relative_path),
                 data=payload,
             )
+            response = None
             try:
-                response = session.post(
-                    f"{settings.base_url}/api/sync/push",
-                    headers=self._headers(settings),
-                    multipart=multipart,
-                    data={
-                        "remote_path": relative_path,
-                        "source_sha256": digest,
-                        "created_at": _clean(created_at),
-                        "prompt": _clean(prompt),
-                        "model": _clean(model),
-                    },
-                    timeout=settings.timeout_secs,
-                    allow_redirects=False,
-                    stream=True,
-                    verify=True,
-                )
-            except Exception as exc:
-                raise GenBoxPushError("图片尚未发送成功，源图已保留", retryable=True) from exc
+                try:
+                    response = session.post(
+                        f"{settings.base_url}/api/sync/push",
+                        headers=self._headers(settings),
+                        multipart=multipart,
+                        data={
+                            "remote_path": relative_path,
+                            "source_sha256": digest,
+                            "created_at": _clean(created_at),
+                            "prompt": _clean(prompt),
+                            "model": _clean(model),
+                        },
+                        timeout=settings.timeout_secs,
+                        allow_redirects=False,
+                        stream=True,
+                        verify=True,
+                    )
+                except Exception as exc:
+                    raise GenBoxPushError("图片尚未发送成功，源图已保留", retryable=True) from exc
+                self._reject_redirect(response)
+                if not bool(getattr(response, "ok", False)):
+                    raise self._request_error(response)
+                receipt = self._response_json(response)
+                status = receipt.get("status")
+                if (
+                    receipt.get("ok") is not True
+                    or not isinstance(receipt.get("contract_version"), str)
+                    or receipt.get("contract_version") != PUSH_CONTRACT_VERSION
+                    or not isinstance(receipt.get("source_id"), str)
+                    or receipt.get("source_id") != settings.source_id
+                    or not isinstance(receipt.get("sha256"), str)
+                    or receipt.get("sha256") != digest
+                    or not isinstance(status, str)
+                    or status not in SUCCESS_STATUSES
+                ):
+                    raise GenBoxPushError("GenBox 回执校验失败，源图已保留")
+                result = {
+                    "status": str(receipt["status"]),
+                    "sha256": digest,
+                    "safe_to_delete_source": receipt.get("safe_to_delete_source") is True,
+                    "source_retained": True,
+                }
+                self._save_result(relative_path, result)
+                try:
+                    self.cleanup_service.record_receipt(
+                        destination_scope=self._transfer_scope_for(settings),
+                        source_id=settings.source_id,
+                        remote_path=relative_path,
+                        source_sha256=digest,
+                        receipt_status=str(receipt["status"]),
+                        safe_to_delete_source=receipt.get("safe_to_delete_source") is True,
+                        size_bytes=len(payload),
+                    )
+                except Exception as exc:
+                    raise GenBoxPushError(
+                        "The receipt was accepted but could not be durably recorded; the source was retained."
+                    ) from exc
+                return result
             finally:
                 multipart.close()
+                # Close the streaming response on every outcome so a failed
+                # or timed-out receipt read cannot leak the reader thread.
+                if response is not None:
+                    close_response = getattr(response, "close", None)
+                    if callable(close_response):
+                        try:
+                            close_response()
+                        except Exception:
+                            pass
                 close = getattr(session, "close", None)
                 if callable(close):
                     close()
-            self._reject_redirect(response)
-            if not bool(getattr(response, "ok", False)):
-                raise self._request_error(response)
-            receipt = self._response_json(response)
-            status = receipt.get("status")
-            if (
-                receipt.get("ok") is not True
-                or not isinstance(receipt.get("contract_version"), str)
-                or receipt.get("contract_version") != PUSH_CONTRACT_VERSION
-                or not isinstance(receipt.get("source_id"), str)
-                or receipt.get("source_id") != settings.source_id
-                or not isinstance(receipt.get("sha256"), str)
-                or receipt.get("sha256") != digest
-                or not isinstance(status, str)
-                or status not in SUCCESS_STATUSES
-            ):
-                raise GenBoxPushError("GenBox 回执校验失败，源图已保留")
-            result = {
-                "status": str(receipt["status"]),
-                "sha256": digest,
-                "safe_to_delete_source": receipt.get("safe_to_delete_source") is True,
-                "source_retained": True,
-            }
-            self._save_result(relative_path, result)
-            try:
-                self.cleanup_service.record_receipt(
-                    destination_scope=self._transfer_scope_for(settings),
-                    source_id=settings.source_id,
-                    remote_path=relative_path,
-                    source_sha256=digest,
-                    receipt_status=str(receipt["status"]),
-                    safe_to_delete_source=receipt.get("safe_to_delete_source") is True,
-                    size_bytes=len(payload),
-                )
-            except Exception as exc:
-                raise GenBoxPushError(
-                    "The receipt was accepted but could not be durably recorded; the source was retained."
-                ) from exc
-            return result
 
 
 genbox_push_service = GenBoxPushService()

@@ -34,6 +34,7 @@ class FakeResponse:
         self.ok = 200 <= status_code < 300
         self.headers = headers or {}
         self.stream_chunks = stream_chunks
+        self.closed = False
 
     def json(self) -> dict[str, object]:
         return self.payload
@@ -44,6 +45,9 @@ class FakeResponse:
             yield from self.stream_chunks
             return
         yield json.dumps(self.payload).encode("utf-8")
+
+    def close(self) -> None:
+        self.closed = True
 
 
 class FakeSession:
@@ -134,6 +138,20 @@ class GenBoxPushServiceTests(unittest.TestCase):
         self.assertEqual(call["headers"]["X-GenBox-Source"], "chatgpt2api-dev")
         self.assertEqual(call["headers"]["X-GenBox-Key"], "secret-not-for-responses")
         self.assertTrue(call["verify"])
+
+    def test_cleanup_enabled_rejects_http_destination_before_request(self) -> None:
+        self.service.update_settings({
+            "enabled": True,
+            "cleanup_enabled": True,
+            "base_url": "http://genbox.test",
+            "source_id": "chatgpt2api-dev",
+            "push_key": "secret-not-for-responses",
+        })
+
+        with self.assertRaisesRegex(GenBoxPushError, "HTTPS"):
+            self.service.probe()
+
+        self.assertEqual(self.factory.sessions, [])
 
     def test_full_push_endpoint_is_normalized_before_probe(self) -> None:
         settings = self.service.update_settings({
@@ -312,6 +330,35 @@ class GenBoxPushServiceTests(unittest.TestCase):
             with self.assertRaisesRegex(GenBoxPushError, "timed out"):
                 self.service.probe()
 
+    def test_receipt_that_stalls_before_first_chunk_hits_total_deadline(self) -> None:
+        self.configure()
+        release = threading.Event()
+
+        class BlockingResponse(FakeResponse):
+            def iter_content(self, chunk_size: int = 65536):
+                del chunk_size
+                release.wait(timeout=5)
+                yield b"{}"
+
+        self.factory.responses.append(BlockingResponse(200, {}))
+        try:
+            with patch("services.genbox_push_service.MAX_RECEIPT_SECONDS", 0.05):
+                with self.assertRaisesRegex(GenBoxPushError, "timed out"):
+                    self.service.probe()
+        finally:
+            release.set()
+
+    def test_non_json_receipt_content_type_is_rejected(self) -> None:
+        self.configure()
+        self.factory.responses.append(FakeResponse(
+            200,
+            {},
+            headers={"Content-Type": "text/html"},
+        ))
+
+        with self.assertRaisesRegex(GenBoxPushError, "non-JSON"):
+            self.service.probe()
+
     def test_real_slow_drip_push_retains_source_and_state(self) -> None:
         source_rel = "2026/07/28/image.png"
         source = self.tmp / source_rel
@@ -412,6 +459,48 @@ class GenBoxPushServiceTests(unittest.TestCase):
 
         with self.assertRaisesRegex(GenBoxPushError, "unreadable"):
             self.service.probe()
+
+    def test_streaming_responses_are_closed_after_successful_push(self) -> None:
+        self.configure()
+        digest = hashlib.sha256(self.image).hexdigest()
+        probe_response = FakeResponse(200, {
+            "ok": True,
+            "contract_version": "v1",
+            "source_id": "chatgpt2api-dev",
+            "max_image_bytes": 4096,
+        })
+        push_response = FakeResponse(200, {
+            "ok": True,
+            "contract_version": "v1",
+            "source_id": "chatgpt2api-dev",
+            "sha256": digest,
+            "status": "imported",
+            "safe_to_delete_source": False,
+        })
+        self.factory.responses.extend([probe_response, push_response])
+
+        result = self.service.push_image("2026/07/28/image.png")
+
+        self.assertEqual(result["status"], "imported")
+        self.assertTrue(probe_response.closed)
+        self.assertTrue(push_response.closed)
+
+    def test_streaming_responses_are_closed_when_receipt_is_malformed(self) -> None:
+        self.configure()
+        probe_response = FakeResponse(200, {
+            "ok": True,
+            "contract_version": "v1",
+            "source_id": "chatgpt2api-dev",
+            "max_image_bytes": 4096,
+        })
+        push_response = FakeResponse(200, {}, stream_chunks=[b"not-json"])
+        self.factory.responses.extend([probe_response, push_response])
+
+        with self.assertRaisesRegex(GenBoxPushError, "unreadable"):
+            self.service.push_image("2026/07/28/image.png")
+
+        self.assertTrue(probe_response.closed)
+        self.assertTrue(push_response.closed)
 
     def test_duplicate_receipt_fields_are_rejected(self) -> None:
         self.configure()

@@ -446,6 +446,7 @@ class GenBoxPushCleanupService:
         reason: str,
         size_bytes: int,
         reclaimed_bytes: int = 0,
+        detail: str = "",
     ) -> dict[str, object]:
         return {
             "audit_id": uuid.uuid4().hex,
@@ -458,6 +459,7 @@ class GenBoxPushCleanupService:
             "prior_cleanup_status": prior_status,
             "decision": decision,
             "decision_reason": reason,
+            "decision_detail": str(detail or ""),
             "size_bytes": max(0, int(size_bytes or 0)),
             "reclaimed_bytes": max(0, int(reclaimed_bytes or 0)),
             "receipt_status": str((record.get("receipt") or {}).get("status") or ""),
@@ -518,6 +520,8 @@ class GenBoxPushCleanupService:
                 summary["potential_bytes"] = int(summary["potential_bytes"]) + size
             else:
                 summary["retained"] = int(summary["retained"]) + 1
+            initially_eligible = decision == "eligible"
+            initially_eligible_bytes = size if initially_eligible else 0
             item_result = {
                 **self._public_record(record),
                 "decision": decision,
@@ -560,6 +564,16 @@ class GenBoxPushCleanupService:
                         live = self._load_state_locked()
                         current = live.get(key)
                         if current is None:
+                            if initially_eligible:
+                                summary["eligible"] = max(0, int(summary["eligible"]) - 1)
+                                summary["potential_bytes"] = max(0, int(summary["potential_bytes"]) - initially_eligible_bytes)
+                            summary["retained"] = int(summary["retained"]) + 1
+                            item_result.update({
+                                "decision": "retained",
+                                "decision_reason": "state-changed",
+                                "size_bytes": 0,
+                            })
+                            summary["items"].append(item_result)
                             continue
                         decision, reason, size = self._inspect(current)
                         if decision == "eligible":
@@ -572,6 +586,9 @@ class GenBoxPushCleanupService:
                             if final_scope != str(current.get("destination_scope") or ""):
                                 decision, reason, size = "retained", "destination-scope-changed", 0
                         if decision != "eligible":
+                            if initially_eligible:
+                                summary["eligible"] = max(0, int(summary["eligible"]) - 1)
+                                summary["potential_bytes"] = max(0, int(summary["potential_bytes"]) - initially_eligible_bytes)
                             current.update({"cleanup_status": "retained", "decision_reason": reason, "decided_at": self.now()})
                             self._append_audit_locked(self._audit_event(operation_id=operation_id, mode=mode, record=current, prior_status=current_status, decision="retained", reason=reason, size_bytes=size))
                             self._save_state_locked(live)
@@ -606,7 +623,7 @@ class GenBoxPushCleanupService:
                         if deletion.status == "deleted":
                             current.update({"cleanup_status": "deleted", "decision_reason": "deleted", "decided_at": self.now(), "size_bytes": deletion.size_bytes})
                             live[key] = current
-                            self._append_audit_locked(self._audit_event(operation_id=operation_id, mode=mode, record=current, prior_status="deleting", decision="deleted", reason="deleted", size_bytes=deletion.size_bytes, reclaimed_bytes=deletion.size_bytes))
+                            self._append_audit_locked(self._audit_event(operation_id=operation_id, mode=mode, record=current, prior_status="deleting", decision="deleted", reason="deleted", size_bytes=deletion.size_bytes, reclaimed_bytes=deletion.size_bytes, detail=deletion.detail))
                             self._save_state_locked(live)
                             summary["deleted"] = int(summary["deleted"]) + 1
                             summary["reclaimed_bytes"] = int(summary["reclaimed_bytes"]) + deletion.size_bytes
@@ -614,21 +631,21 @@ class GenBoxPushCleanupService:
                         elif deletion.status == "delete_failed":
                             current.update({"cleanup_status": "delete_failed", "decision_reason": deletion.reason, "decided_at": self.now()})
                             live[key] = current
-                            self._append_audit_locked(self._audit_event(operation_id=operation_id, mode=mode, record=current, prior_status="deleting", decision="delete_failed", reason=deletion.reason, size_bytes=deletion.size_bytes))
+                            self._append_audit_locked(self._audit_event(operation_id=operation_id, mode=mode, record=current, prior_status="deleting", decision="delete_failed", reason=deletion.reason, size_bytes=deletion.size_bytes, detail=deletion.detail))
                             self._save_state_locked(live)
                             summary["failed"] = int(summary["failed"]) + 1
                             item_result.update({"decision": "delete_failed", "decision_reason": deletion.reason, "size_bytes": deletion.size_bytes})
                         elif deletion.status == "delete_unknown":
                             current.update({"cleanup_status": "delete_unknown", "decision_reason": deletion.reason, "decided_at": self.now()})
                             live[key] = current
-                            self._append_audit_locked(self._audit_event(operation_id=operation_id, mode=mode, record=current, prior_status="deleting", decision="delete_unknown", reason=deletion.reason, size_bytes=deletion.size_bytes))
+                            self._append_audit_locked(self._audit_event(operation_id=operation_id, mode=mode, record=current, prior_status="deleting", decision="delete_unknown", reason=deletion.reason, size_bytes=deletion.size_bytes, detail=deletion.detail))
                             self._save_state_locked(live)
                             summary["failed"] = int(summary["failed"]) + 1
                             item_result.update({"decision": "delete_unknown", "decision_reason": deletion.reason, "size_bytes": deletion.size_bytes, "source_retained": True, "source_state": "unknown"})
                         else:
                             current.update({"cleanup_status": "retained", "decision_reason": deletion.reason, "decided_at": self.now()})
                             live[key] = current
-                            self._append_audit_locked(self._audit_event(operation_id=operation_id, mode=mode, record=current, prior_status="deleting", decision="retained", reason=deletion.reason, size_bytes=deletion.size_bytes))
+                            self._append_audit_locked(self._audit_event(operation_id=operation_id, mode=mode, record=current, prior_status="deleting", decision="retained", reason=deletion.reason, size_bytes=deletion.size_bytes, detail=deletion.detail))
                             self._save_state_locked(live)
                             summary["retained"] = int(summary["retained"]) + 1
                             item_result.update({"decision": "retained", "decision_reason": deletion.reason, "size_bytes": deletion.size_bytes})
@@ -638,6 +655,9 @@ class GenBoxPushCleanupService:
                 # in ``deleting``. Recovery reports it as unknown; it never
                 # guesses success or selects another path.
                 summary["failed"] = int(summary["failed"]) + 1
+                if initially_eligible:
+                    summary["eligible"] = max(0, int(summary["eligible"]) - 1)
+                    summary["potential_bytes"] = max(0, int(summary["potential_bytes"]) - initially_eligible_bytes)
                 item_result.update({"decision": "delete_unknown", "decision_reason": "state-write-failed"})
                 summary["items"].append(item_result)
             finally:

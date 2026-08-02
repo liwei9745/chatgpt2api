@@ -21,7 +21,7 @@ os.environ.setdefault("CHATGPT2API_AUTH_KEY", "local-test-admin-key")
 from services.config import config
 from services.genbox_push_cleanup import CleanupEnvironmentGate, GenBoxPushCleanupService
 from services.genbox_push_service import GenBoxPushService
-from services.image_storage_service import ImageStorageService
+from services.image_storage_service import ImageStorageService, VerifiedDeleteResult
 from services.json_file import write_json_file
 from services.source_claim import source_claim
 
@@ -100,6 +100,37 @@ def _cleanup_crash_worker(
     claim_module.DATA_DIR = Path(state).parent / "claims"
     storage = ImageStorageService(index_file=Path(index))
     storage._before_verified_unlink = lambda _target: os._exit(17)
+    service = GenBoxPushCleanupService(
+        state_file=Path(state),
+        audit_file=Path(audit),
+        settings_file=Path(settings),
+        image_storage=storage,
+        environment_gate=CleanupEnvironmentGate(dict(environment)),
+    )
+    service.execute()
+
+
+def _cleanup_crash_after_unlink_worker(
+    images: str,
+    settings: str,
+    state: str,
+    audit: str,
+    index: str,
+    environment: dict[str, str],
+    relative_path: str,
+) -> None:
+    import services.image_storage_service as storage_module
+    import services.source_claim as claim_module
+
+    storage_module.config = _ImageConfig(Path(images))
+    claim_module.DATA_DIR = Path(state).parent / "claims"
+    storage = ImageStorageService(index_file=Path(index))
+
+    def unlink_then_exit(rel: str, *_args, **_kwargs):
+        (Path(images) / rel).unlink()
+        os._exit(19)
+
+    storage.delete_verified_local = unlink_then_exit
     service = GenBoxPushCleanupService(
         state_file=Path(state),
         audit_file=Path(audit),
@@ -227,6 +258,31 @@ class GenBoxPushCleanupTests(unittest.TestCase):
         audit = json.loads(self.audit.read_text(encoding="utf-8"))
         self.assertTrue(any(event.get("decision") == "deleted" for event in audit["events"]))
 
+    def test_quarantine_names_are_disclosed_in_audit_detail(self) -> None:
+        target = self._record()
+        self._enable_policy()
+
+        def quarantined_retain(*_args: object, **_kwargs: object) -> VerifiedDeleteResult:
+            return VerifiedDeleteResult(
+                "retained",
+                "source-changed",
+                int(target.stat().st_size),
+                detail="quarantined:.genbox-retained-synthetic",
+            )
+
+        with patch.object(self.storage, "delete_verified_local", side_effect=quarantined_retain):
+            result = self.service.execute()
+
+        self.assertEqual(result["retained"], 1)
+        self.assertTrue(target.exists())
+        audit = json.loads(self.audit.read_text(encoding="utf-8"))
+        retained = [event for event in audit["events"] if event.get("decision") == "retained"]
+        self.assertTrue(retained)
+        self.assertEqual(
+            retained[-1].get("decision_detail"),
+            "quarantined:.genbox-retained-synthetic",
+        )
+
     def test_changed_source_is_retained(self) -> None:
         target = self._record()
         self._enable_policy()
@@ -253,6 +309,10 @@ class GenBoxPushCleanupTests(unittest.TestCase):
 
         self.assertTrue(target.exists())
         self.assertEqual(result["items"][0]["decision_reason"], "destination-scope-changed")
+        self.assertEqual(result["eligible"], 0)
+        self.assertEqual(result["potential_bytes"], 0)
+        self.assertEqual(result["retained"], 1)
+        self.assertEqual(result["candidates"], 1)
 
     def test_symlink_and_hardlink_aliases_are_retained(self) -> None:
         self._enable_policy()
@@ -652,6 +712,39 @@ class GenBoxPushCleanupTests(unittest.TestCase):
         self.assertEqual(recovered["cleanup_status"], "retained")
         self.assertEqual(recovered["decision_reason"], "interrupted-before-delete")
         self.assertTrue(target.exists())
+
+    def test_restart_after_unlink_before_terminal_audit_is_unknown(self) -> None:
+        relative_path = "2026/08/01/crash-after-unlink.png"
+        target = self._record(relative_path)
+        self._enable_policy()
+        context = multiprocessing.get_context("spawn")
+        worker = context.Process(
+            target=_cleanup_crash_after_unlink_worker,
+            args=(
+                str(self.images),
+                str(self.settings),
+                str(self.state),
+                str(self.audit),
+                str(self.tmp / "index.json"),
+                dict(self.gate.environ),
+                relative_path,
+            ),
+        )
+        worker.start()
+        worker.join(timeout=15)
+
+        self.assertEqual(worker.exitcode, 19)
+        self.assertFalse(target.exists())
+        substitute = self.images / "2026/08/01/crash-after-unlink-substitute.png"
+        substitute.write_bytes(b"substitute")
+
+        recovered = self.service.recover_inflight()
+
+        self.assertEqual(recovered, {"retained": 0, "unknown": 1})
+        self.assertTrue(substitute.exists())
+        records = json.loads(self.state.read_text(encoding="utf-8"))["records"]
+        record = next(record for record in records.values() if record["remote_path"] == relative_path)
+        self.assertEqual(record["cleanup_status"], "delete_unknown")
 
     def test_mixed_execute_results_reconcile_totals(self) -> None:
         valid = self._record("2026/08/01/valid.png", b"valid")

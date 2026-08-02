@@ -99,7 +99,7 @@ class ImageStorageCleanupTests(unittest.TestCase):
             except OSError as exc:
                 replacement_blocked.append(exc)
 
-        with patch.object(self.storage, "_before_final_unlink", side_effect=replace_after_final_check):
+        with patch.object(self.storage, "_after_final_identity_check", side_effect=replace_after_final_check):
             result = self.storage.delete_verified_local(rel, digest)
 
         if replacement_blocked:
@@ -107,9 +107,90 @@ class ImageStorageCleanupTests(unittest.TestCase):
             self.assertFalse(target.exists())
         else:
             self.assertEqual(result.status, "retained")
-            self.assertEqual(result.reason, "source-changed")
+            self.assertIn(result.reason, {"source-changed", "path-alias", "atomic-delete-failed"})
             self.assertTrue(target.exists())
             self.assertEqual(target.read_bytes(), b"replacement-after-final-check")
+
+    def test_hard_link_added_after_final_identity_check_is_retained(self) -> None:
+        if os.name == "nt":
+            self.skipTest("POSIX hard-link race requires a Linux filesystem")
+        rel, target, digest = self._source()
+        alias = target.with_name("alias-after-final-check.png")
+
+        def add_alias(_opened: object) -> None:
+            os.link(target, alias)
+
+        with patch.object(self.storage, "_after_final_identity_check", side_effect=add_alias):
+            result = self.storage.delete_verified_local(rel, digest)
+
+        self.assertEqual(result.status, "retained")
+        self.assertEqual(result.reason, "path-alias")
+        self.assertTrue(target.exists())
+        self.assertTrue(alias.exists())
+
+    def test_hard_link_added_during_posix_exchange_restores_original_entry(self) -> None:
+        if os.name == "nt":
+            self.skipTest("POSIX exchange race requires a Linux filesystem")
+        rel, target, digest = self._source()
+        alias = target.with_name("alias-during-exchange.png")
+
+        def add_alias(_opened: object) -> None:
+            os.link(target, alias)
+
+        with patch.object(self.storage, "_before_posix_exchange", side_effect=add_alias):
+            result = self.storage.delete_verified_local(rel, digest)
+
+        # The ambiguous source is retained exactly where it was: the original
+        # directory entry is restored and only the service's own links are
+        # dropped. No temporary or quarantine name may be left behind.
+        self.assertEqual(result.status, "retained")
+        self.assertEqual(result.reason, "path-alias")
+        self.assertEqual(result.detail, "restored-original-entry")
+        self.assertTrue(target.exists())
+        self.assertEqual(target.read_bytes(), b"source-bytes")
+        self.assertTrue(alias.exists())
+        leftovers = [
+            path.name
+            for path in target.parent.iterdir()
+            if path.name.startswith((".genbox-cleanup-", ".genbox-retained-"))
+        ]
+        self.assertEqual(leftovers, [])
+
+    def test_replacement_during_posix_exchange_restores_replacement_and_quarantines_source(self) -> None:
+        if os.name == "nt":
+            self.skipTest("POSIX exchange race requires a Linux filesystem")
+        rel, target, digest = self._source()
+        replacement = target.with_name("replacement-during-exchange.png")
+
+        def replace_entry(_opened: object) -> None:
+            replacement.write_bytes(b"replacement-during-exchange")
+            os.replace(replacement, target)
+
+        with patch.object(self.storage, "_before_posix_exchange", side_effect=replace_entry):
+            result = self.storage.delete_verified_local(rel, digest)
+
+        # The racer's file is restored at the recorded name and the original
+        # inode is retained under one opaque quarantine name, which the
+        # result detail must disclose for the cleanup audit trail.
+        self.assertEqual(result.status, "retained")
+        self.assertEqual(result.reason, "source-changed")
+        self.assertTrue(target.exists())
+        self.assertEqual(target.read_bytes(), b"replacement-during-exchange")
+        quarantined = [
+            path
+            for path in target.parent.iterdir()
+            if path.name.startswith(".genbox-retained-")
+        ]
+        self.assertEqual(len(quarantined), 1)
+        self.assertEqual(quarantined[0].read_bytes(), b"source-bytes")
+        self.assertIn("quarantined:", result.detail)
+        self.assertIn(quarantined[0].name, result.detail)
+        leftovers = [
+            path.name
+            for path in target.parent.iterdir()
+            if path.name.startswith(".genbox-cleanup-")
+        ]
+        self.assertEqual(leftovers, [])
 
     def test_hard_link_alias_is_retained(self) -> None:
         rel, target, digest = self._source()

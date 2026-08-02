@@ -5,6 +5,7 @@ import io
 import os
 import stat
 import time
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from threading import Lock
@@ -40,6 +41,8 @@ class VerifiedDeleteResult:
     status: str
     reason: str
     size_bytes: int = 0
+    # Opaque operator-facing detail (for example quarantined entry names).
+    detail: str = ""
 
 
 @dataclass
@@ -119,6 +122,24 @@ def _same_cleanup_identity(left: os.stat_result, right: os.stat_result) -> bool:
         and int(getattr(left, "st_nlink", 1) or 1) == 1
         and int(getattr(right, "st_nlink", 1) or 1) == 1
     )
+
+
+def _same_cleanup_inode(left: os.stat_result, right: os.stat_result) -> bool:
+    """Compare an inode without requiring a single hard-link count."""
+    return bool(
+        left.st_dev == right.st_dev
+        and left.st_ino == right.st_ino
+        and left.st_size == right.st_size
+        and stat.S_ISREG(left.st_mode)
+        and stat.S_ISREG(right.st_mode)
+        and not _is_filesystem_alias(left)
+        and not _is_filesystem_alias(right)
+    )
+
+
+def _quarantine_detail(names: list[str]) -> str:
+    """Summarize quarantined directory entries for the cleanup audit trail."""
+    return f"quarantined:{';'.join(names)}" if names else ""
 
 
 def _image_dimensions(payload: bytes) -> tuple[int, int] | None:
@@ -478,6 +499,99 @@ class ImageStorageService:
             if target.parent_descriptor is not None:
                 os.close(target.parent_descriptor)
 
+    def _open_verified_posix_cleanup_target(
+        self,
+        root: Path,
+        safe_rel: str,
+        digest: str,
+        *,
+        expected_size: int | None,
+    ) -> _OpenedCleanupTarget | dict[str, object]:
+        """Open a cleanup target through anchored directory descriptors.
+
+        This avoids a second pathname walk after validating a directory. Each
+        component is opened relative to the descriptor for its already-opened
+        parent and compared with the no-follow stat observed immediately before
+        it. Any replacement or alias therefore becomes a retention decision.
+        """
+        nofollow = int(getattr(os, "O_NOFOLLOW", 0))
+        directory_flags = os.O_RDONLY | int(getattr(os, "O_DIRECTORY", 0)) | nofollow
+        parent_descriptor: int | None = None
+        descriptor: int | None = None
+        try:
+            root_stat = root.lstat()
+            if not stat.S_ISDIR(root_stat.st_mode) or _is_filesystem_alias(root_stat):
+                return {"ok": False, "reason": "storage-root-invalid"}
+            parent_descriptor = os.open(root, directory_flags)
+            opened_root = os.fstat(parent_descriptor)
+            if (
+                opened_root.st_dev != root_stat.st_dev
+                or opened_root.st_ino != root_stat.st_ino
+                or not stat.S_ISDIR(opened_root.st_mode)
+            ):
+                return {"ok": False, "reason": "storage-root-invalid"}
+
+            parts = Path(safe_rel).parts
+            for component in parts[:-1]:
+                component_stat = os.stat(component, dir_fd=parent_descriptor, follow_symlinks=False)
+                if _is_filesystem_alias(component_stat) or not stat.S_ISDIR(component_stat.st_mode):
+                    return {"ok": False, "reason": "path-alias"}
+                next_descriptor = os.open(component, directory_flags, dir_fd=parent_descriptor)
+                opened_component = os.fstat(next_descriptor)
+                if (
+                    opened_component.st_dev != component_stat.st_dev
+                    or opened_component.st_ino != component_stat.st_ino
+                    or not stat.S_ISDIR(opened_component.st_mode)
+                ):
+                    os.close(next_descriptor)
+                    return {"ok": False, "reason": "source-changed"}
+                os.close(parent_descriptor)
+                parent_descriptor = next_descriptor
+
+            parent_name = parts[-1]
+            file_stat = os.stat(parent_name, dir_fd=parent_descriptor, follow_symlinks=False)
+            if _is_filesystem_alias(file_stat):
+                return {"ok": False, "reason": "path-alias"}
+            if not stat.S_ISREG(file_stat.st_mode):
+                return {"ok": False, "reason": "source-not-regular"}
+            if int(getattr(file_stat, "st_nlink", 1) or 1) != 1:
+                return {"ok": False, "reason": "path-alias"}
+            if expected_size is not None and int(file_stat.st_size) != int(expected_size):
+                return {"ok": False, "reason": "source-changed", "size_bytes": int(file_stat.st_size)}
+            descriptor = os.open(parent_name, os.O_RDONLY | nofollow, dir_fd=parent_descriptor)
+            opened_stat = os.fstat(descriptor)
+            if not _same_cleanup_identity(opened_stat, file_stat):
+                return {"ok": False, "reason": "source-changed"}
+            actual = self._read_open_digest(descriptor)
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            if actual != digest:
+                return {"ok": False, "reason": "source-changed", "size_bytes": int(file_stat.st_size)}
+            latest_stat = os.stat(parent_name, dir_fd=parent_descriptor, follow_symlinks=False)
+            if not _same_cleanup_identity(latest_stat, file_stat):
+                return {"ok": False, "reason": "source-changed"}
+            target = _OpenedCleanupTarget(
+                relative_path=safe_rel,
+                candidate=root / safe_rel,
+                descriptor=descriptor,
+                parent_descriptor=parent_descriptor,
+                parent_name=parent_name,
+                file_stat=file_stat,
+                digest=actual,
+                size_bytes=int(file_stat.st_size),
+            )
+            descriptor = None
+            parent_descriptor = None
+            return target
+        except FileNotFoundError:
+            return {"ok": False, "reason": "source-missing"}
+        except OSError:
+            return {"ok": False, "reason": "source-unreadable"}
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
+            if parent_descriptor is not None:
+                os.close(parent_descriptor)
+
     def _open_verified_cleanup_target(
         self,
         rel: str,
@@ -500,6 +614,13 @@ class ImageStorageService:
         if len(digest) != 64 or any(char not in "0123456789abcdef" for char in digest):
             return {"ok": False, "reason": "hash-invalid"}
         root = Path(self.local_root())
+        if os.name != "nt" and hasattr(os, "O_DIRECTORY") and getattr(os, "O_NOFOLLOW", 0):
+            return self._open_verified_posix_cleanup_target(
+                root,
+                safe_rel,
+                digest,
+                expected_size=expected_size,
+            )
         descriptor: int | None = None
         parent_descriptor: int | None = None
         try:
@@ -555,6 +676,7 @@ class ImageStorageService:
         # Keep a parent directory descriptor where the platform supports it;
         # unlinking through that descriptor avoids a root-path replacement.
         if os.name != "nt" and hasattr(os, "O_DIRECTORY"):
+            nofollow = int(getattr(os, "O_NOFOLLOW", 0))
             try:
                 parent_descriptor = os.open(
                     candidate.parent,
@@ -611,6 +733,175 @@ class ImageStorageService:
     def _before_final_unlink(self, _target: _OpenedCleanupTarget) -> None:
         """Test seam for the final directory-entry identity check."""
 
+    def _after_final_identity_check(self, _target: _OpenedCleanupTarget) -> None:
+        """Test seam immediately before the platform deletion primitive."""
+
+    def _before_posix_exchange(self, _target: _OpenedCleanupTarget) -> None:
+        """Test seam between the pre-exchange link check and the exchange."""
+
+    def _unlink_posix_exact(self, target: _OpenedCleanupTarget) -> VerifiedDeleteResult:
+        """Remove only the opened inode using Linux atomic directory moves.
+
+        POSIX has no unlink-if-inode primitive. On Linux, two hard links plus
+        ``renameat2`` let us exchange and tombstone the current directory entry
+        atomically. If the entry changed, the current object is restored and
+        every unexpected object is quarantined instead of being deleted. When
+        the required syscalls are unavailable, cleanup fails closed.
+        """
+        parent_fd = target.parent_descriptor
+        if parent_fd is None:
+            return VerifiedDeleteResult("retained", "atomic-delete-unavailable", target.size_bytes)
+        import ctypes
+
+        libc = ctypes.CDLL(None, use_errno=True)
+        linkat = getattr(libc, "linkat", None)
+        renameat2 = getattr(libc, "renameat2", None)
+        if linkat is None or renameat2 is None:
+            return VerifiedDeleteResult("retained", "atomic-delete-unavailable", target.size_bytes)
+        linkat.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_int]
+        linkat.restype = ctypes.c_int
+        renameat2.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+        renameat2.restype = ctypes.c_int
+
+        at_empty_path = 0x1000
+        rename_noreplace = 0x1
+        rename_exchange = 0x2
+        suffix = f"{os.getpid()}-{uuid.uuid4().hex}"
+        temp_name = f".genbox-cleanup-{suffix}.tmp"
+        hold_name = f".genbox-cleanup-{suffix}.hold"
+        tomb_name = f".genbox-cleanup-{suffix}.tomb"
+        names = [temp_name, hold_name, tomb_name]
+        exchanged = False
+        tombstoned = False
+        quarantined: list[str] = []
+
+        def syscall_error(message: str) -> OSError:
+            return OSError(ctypes.get_errno(), message)
+
+        def link_from_fd(name: str) -> None:
+            if linkat(target.descriptor, b"", parent_fd, os.fsencode(name), at_empty_path) != 0:
+                raise syscall_error("linkat(AT_EMPTY_PATH) failed")
+
+        def rename_name(source: str, destination: str, flags: int) -> None:
+            if renameat2(parent_fd, os.fsencode(source), parent_fd, os.fsencode(destination), flags) != 0:
+                raise syscall_error("renameat2 failed")
+
+        def stat_name(name: str) -> os.stat_result:
+            return os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+
+        def unlink_name(name: str) -> None:
+            os.unlink(name, dir_fd=parent_fd)
+
+        def quarantine_name(name: str) -> None:
+            quarantine = f".genbox-retained-{suffix}-{uuid.uuid4().hex}"
+            try:
+                rename_name(name, quarantine, rename_noreplace)
+            except OSError:
+                return
+            quarantined.append(quarantine)
+
+        try:
+            link_from_fd(temp_name)
+            link_from_fd(hold_name)
+            # The two temporary links must be the only additional references
+            # to the opened inode. An external hard-link alias is ambiguous,
+            # so retain the source and quarantine only our own links.
+            linked_stat = os.fstat(target.descriptor)
+            if int(getattr(linked_stat, "st_nlink", 0) or 0) != 3:
+                for name in (temp_name, hold_name):
+                    try:
+                        unlink_name(name)
+                    except OSError:
+                        pass
+                return VerifiedDeleteResult("retained", "path-alias", target.size_bytes)
+            self._before_posix_exchange(target)
+            rename_name(temp_name, target.parent_name, rename_exchange)
+            exchanged = True
+            rename_name(target.parent_name, tomb_name, rename_noreplace)
+            tombstoned = True
+            tomb_stat = stat_name(tomb_name)
+            temp_stat = stat_name(temp_name)
+            tomb_is_target = _same_cleanup_inode(tomb_stat, target.file_stat)
+            temp_is_target = _same_cleanup_inode(temp_stat, target.file_stat)
+            if int(getattr(tomb_stat, "st_nlink", 0) or 0) != 3:
+                if tomb_is_target and temp_is_target:
+                    # An external hard-link alias appeared between the
+                    # pre-exchange check and the exchange. Put the opened
+                    # inode back at its recorded name and drop only our own
+                    # links; the ambiguous source is retained exactly where
+                    # it was, and no racer's entry stays hidden.
+                    rename_name(temp_name, target.parent_name, rename_noreplace)
+                    names.remove(temp_name)
+                    unlink_name(tomb_name)
+                    names.remove(tomb_name)
+                    unlink_name(hold_name)
+                    names.remove(hold_name)
+                    return VerifiedDeleteResult(
+                        "retained",
+                        "path-alias",
+                        target.size_bytes,
+                        detail="restored-original-entry",
+                    )
+            elif tomb_is_target and temp_is_target:
+                unlink_name(tomb_name)
+                unlink_name(temp_name)
+                unlink_name(hold_name)
+                return VerifiedDeleteResult("deleted", "deleted", target.size_bytes)
+
+            # A replacement was observed. Restore the newest non-target entry
+            # at the original name, then retain every other object under an
+            # opaque quarantine name. No unexpected inode is unlinked.
+            if not tomb_is_target:
+                rename_name(tomb_name, target.parent_name, rename_noreplace)
+                tombstoned = False
+            elif not temp_is_target:
+                rename_name(temp_name, target.parent_name, rename_noreplace)
+                names.remove(temp_name)
+            if tomb_is_target and tomb_name in names:
+                unlink_name(tomb_name)
+                names.remove(tomb_name)
+            for name in list(names):
+                if name == target.parent_name:
+                    continue
+                try:
+                    stat_name(name)
+                except OSError:
+                    continue
+                quarantine_name(name)
+            return VerifiedDeleteResult(
+                "retained",
+                "source-changed",
+                target.size_bytes,
+                detail=_quarantine_detail(quarantined),
+            )
+        except (FileNotFoundError, OSError):
+            # Best-effort recovery never deletes a leftover object. If the
+            # original name is absent after a partial exchange, restore a
+            # remaining entry before quarantining temporary links.
+            if exchanged and tombstoned:
+                try:
+                    stat_name(target.parent_name)
+                except OSError:
+                    for candidate in (tomb_name, temp_name):
+                        try:
+                            stat_name(candidate)
+                            rename_name(candidate, target.parent_name, rename_noreplace)
+                            break
+                        except OSError:
+                            continue
+            for name in names:
+                try:
+                    stat_name(name)
+                except OSError:
+                    continue
+                quarantine_name(name)
+            return VerifiedDeleteResult(
+                "retained",
+                "atomic-delete-failed",
+                target.size_bytes,
+                detail=_quarantine_detail(quarantined),
+            )
+
     def _unlink_open_cleanup_target(self, target: _OpenedCleanupTarget) -> VerifiedDeleteResult:
         try:
             os.lseek(target.descriptor, 0, os.SEEK_SET)
@@ -645,6 +936,7 @@ class ImageStorageService:
             return VerifiedDeleteResult("retained", "source-changed", target.size_bytes)
         if final_digest != target.digest or not _same_cleanup_identity(final_stat, target.file_stat):
             return VerifiedDeleteResult("retained", "source-changed", target.size_bytes)
+        self._after_final_identity_check(target)
         try:
             if os.name == "nt":
                 # Delete the exact opened file handle rather than resolving the
@@ -671,7 +963,7 @@ class ImageStorageService:
                     error = ctypes.get_last_error()
                     raise OSError(error, "SetFileInformationByHandle failed")
             elif target.parent_descriptor is not None:
-                os.unlink(target.parent_name, dir_fd=target.parent_descriptor)
+                return self._unlink_posix_exact(target)
             else:
                 target.candidate.unlink()
         except FileNotFoundError:
@@ -767,25 +1059,50 @@ class ImageStorageService:
         )
 
     def delete(self, rel: str) -> bool:
+        # Generic/manual deletion must not bypass a receipt-tracked source.
+        # Phase 6 cleanup uses delete_verified_local(), which owns the receipt,
+        # policy, intent, audit, and identity checks.
+        from services.config import config as runtime_config
+        protected = runtime_config.receipt_protected_image_paths()
         safe_rel = _safe_relative_path(rel)
+        if safe_rel in protected or "*" in protected:
+            return False
         removed = False
         path = _local_image_path(safe_rel)
+        claim = None
         if path.is_file():
-            path.unlink()
-            removed = True
-        with self._index_lock:
-            items = self._load_clean_index()
-            item = items.get(safe_rel, {})
-            if item.get("webdav"):
-                try:
-                    removed = WebDAVClient(self.settings()).delete(safe_rel) or removed
-                except ImageStorageError:
-                    if not removed:
-                        raise
-            if safe_rel in items:
-                items.pop(safe_rel, None)
-                self._save_index(items)
-        return removed
+            digest = hashlib.sha256(path.read_bytes()).hexdigest()
+            from services.source_claim import source_claim
+
+            claim = source_claim(safe_rel, digest)
+            if not claim.acquire(timeout_secs=0):
+                return False
+        try:
+            # Re-read the protected projection after claiming the source. A
+            # concurrent Push that registered a receipt before this point wins
+            # over a generic deletion request.
+            protected = runtime_config.receipt_protected_image_paths()
+            if safe_rel in protected or "*" in protected:
+                return False
+            if path.is_file():
+                path.unlink()
+                removed = True
+            with self._index_lock:
+                items = self._load_clean_index()
+                item = items.get(safe_rel, {})
+                if item.get("webdav"):
+                    try:
+                        removed = WebDAVClient(self.settings()).delete(safe_rel) or removed
+                    except ImageStorageError:
+                        if not removed:
+                            raise
+                if safe_rel in items:
+                    items.pop(safe_rel, None)
+                    self._save_index(items)
+            return removed
+        finally:
+            if claim is not None:
+                claim.release()
 
     def sync_all(self) -> dict[str, int]:
         settings = self.settings()

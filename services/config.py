@@ -583,6 +583,11 @@ class ConfigStore:
     def cleanup_old_images(self) -> int:
         cutoff = time.time() - self.image_retention_days * 86400
         protected = self.receipt_protected_image_paths()
+        # A missing cleanup state cannot prove that an old source is not
+        # tracked by the Push workflow. Automatic retention therefore fails
+        # closed until the state file exists and is readable.
+        if not CLEANUP_STATE_FILE.exists() or "*" in protected:
+            return 0
         removed = 0
         for path in self.images_dir.rglob("*"):
             rel = ""
@@ -591,8 +596,13 @@ class ConfigStore:
             except ValueError:
                 pass
             if path.is_file() and rel not in protected and path.stat().st_mtime < cutoff:
-                path.unlink()
-                removed += 1
+                try:
+                    from services.image_storage_service import image_storage_service
+
+                    if image_storage_service.delete(rel):
+                        removed += 1
+                except Exception:
+                    continue
         for path in sorted((p for p in self.images_dir.rglob("*") if p.is_dir()), key=lambda p: len(p.parts), reverse=True):
             try:
                 path.rmdir()
