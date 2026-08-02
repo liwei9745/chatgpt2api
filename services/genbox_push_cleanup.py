@@ -606,8 +606,15 @@ class GenBoxPushCleanupService:
                             item_result.update({"decision": "retained", "decision_reason": "cleanup-policy-disabled", "size_bytes": 0})
                             summary["items"].append(item_result)
                             continue
+                        cleanup_token = hashlib.sha256(f"{operation_id}\n{key}".encode("utf-8")).hexdigest()
                         intent = dict(current)
-                        intent.update({"cleanup_status": "deleting", "decision_reason": "deletion-intent", "decided_at": self.now(), "operation_id": operation_id})
+                        intent.update({
+                            "cleanup_status": "deleting",
+                            "decision_reason": "deletion-intent",
+                            "decided_at": self.now(),
+                            "operation_id": operation_id,
+                            "cleanup_token": cleanup_token,
+                        })
                         live[key] = intent
                         self._save_state_locked(live)
                         self._append_audit_locked(self._audit_event(operation_id=operation_id, mode=mode, record=intent, prior_status=current_status, decision="deleting", reason="deletion-intent", size_bytes=size))
@@ -616,6 +623,7 @@ class GenBoxPushCleanupService:
                         str(record.get("source_sha256") or ""),
                         expected_size=size,
                         claim_held=True,
+                        cleanup_token=cleanup_token,
                     )
                     with self._lock:
                         live = self._load_state_locked()
@@ -681,17 +689,38 @@ class GenBoxPushCleanupService:
                     continue
                 path = str(record.get("remote_path") or "")
                 digest = str(record.get("source_sha256") or "")
+                cleanup_token = str(record.get("cleanup_token") or "")
+                artifact_evidence = self.image_storage.inspect_verified_delete_artifacts(
+                    path,
+                    digest,
+                    cleanup_token,
+                    expected_size=int(record.get("size_bytes") or 0) or None,
+                ) if cleanup_token else {"artifacts": [], "matching_artifacts": []}
+                artifact_names = [str(name) for name in artifact_evidence.get("artifacts") or []]
+                matching_artifacts = [str(name) for name in artifact_evidence.get("matching_artifacts") or []]
+                target_matches = artifact_evidence.get("target_matches") is True
+                detail = f"artifacts:{';'.join(artifact_names)}" if artifact_names else ""
                 identity = self.image_storage.verify_local_identity(path, digest, expected_size=int(record.get("size_bytes") or 0) or None)
-                if identity.get("ok"):
-                    record.update({"cleanup_status": "retained", "decision_reason": "interrupted-before-delete", "decided_at": self.now()})
+                if identity.get("ok") or target_matches:
+                    record.update({
+                        "cleanup_status": "retained",
+                        "decision_reason": "interrupted-before-delete",
+                        "decided_at": self.now(),
+                        "recovery_detail": detail,
+                    })
                     recovered["retained"] += 1
                     decision = "retained"
                     reason = "interrupted-before-delete"
                 else:
-                    record.update({"cleanup_status": "delete_unknown", "decision_reason": "interrupted-ambiguous", "decided_at": self.now()})
+                    reason = "interrupted-artifact-retained" if matching_artifacts else "interrupted-ambiguous"
+                    record.update({
+                        "cleanup_status": "delete_unknown",
+                        "decision_reason": reason,
+                        "decided_at": self.now(),
+                        "recovery_detail": detail,
+                    })
                     recovered["unknown"] += 1
                     decision = "delete_unknown"
-                    reason = "interrupted-ambiguous"
                 records[key] = record
                 self._append_audit_locked(self._audit_event(
                     operation_id=f"recovery-{uuid.uuid4().hex}",
@@ -701,6 +730,7 @@ class GenBoxPushCleanupService:
                     decision=decision,
                     reason=reason,
                     size_bytes=int(record.get("size_bytes") or 0),
+                    detail=detail,
                 ))
                 changed = True
             if changed:

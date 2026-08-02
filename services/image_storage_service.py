@@ -55,6 +55,7 @@ class _OpenedCleanupTarget:
     file_stat: os.stat_result
     digest: str
     size_bytes: int
+    write_guard_held: bool = False
 
 
 def _clean(value: object) -> str:
@@ -140,6 +141,13 @@ def _same_cleanup_inode(left: os.stat_result, right: os.stat_result) -> bool:
 def _quarantine_detail(names: list[str]) -> str:
     """Summarize quarantined directory entries for the cleanup audit trail."""
     return f"quarantined:{';'.join(names)}" if names else ""
+
+
+def _cleanup_transaction_token(value: object) -> str:
+    token = str(value or "").strip().lower()
+    if len(token) in {32, 64} and all(char in "0123456789abcdef" for char in token):
+        return token
+    return ""
 
 
 def _image_dimensions(payload: bytes) -> tuple[int, int] | None:
@@ -469,7 +477,7 @@ class ImageStorageService:
         handle = create_file(
             str(candidate),
             0x80010000,  # GENERIC_READ | DELETE
-            0x00000007,  # FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE
+            0x00000005,  # FILE_SHARE_READ | FILE_SHARE_DELETE; deny new writers
             None,
             3,  # OPEN_EXISTING
             0x00200080,  # FILE_FLAG_OPEN_REPARSE_POINT | FILE_ATTRIBUTE_NORMAL
@@ -492,8 +500,49 @@ class ImageStorageService:
         return target.candidate.lstat()
 
     @staticmethod
+    def _acquire_posix_write_guard(descriptor: int) -> bool:
+        """Acquire a kernel-enforced write lease or fail closed.
+
+        The application claim coordinates GenBox workers. The lease closes the
+        remaining cross-process window by rejecting an already-open writer and
+        blocking new opens for write until the exact-delete operation ends.
+        """
+        if os.name == "nt":
+            return False
+        try:
+            import fcntl
+            import signal
+
+            required = ("F_SETLEASE", "F_GETLEASE", "F_WRLCK", "F_UNLCK", "F_SETSIG")
+            if any(not hasattr(fcntl, name) for name in required):
+                return False
+            fcntl.fcntl(descriptor, fcntl.F_SETSIG, signal.SIGURG)
+            fcntl.fcntl(descriptor, fcntl.F_SETLEASE, fcntl.F_WRLCK)
+            return fcntl.fcntl(descriptor, fcntl.F_GETLEASE) == fcntl.F_WRLCK
+        except (ImportError, OSError, ValueError):
+            return False
+
+    @staticmethod
+    def _posix_write_guard_active(descriptor: int) -> bool:
+        if os.name == "nt":
+            return False
+        try:
+            import fcntl
+
+            return fcntl.fcntl(descriptor, fcntl.F_GETLEASE) == fcntl.F_WRLCK
+        except (ImportError, OSError, ValueError, AttributeError):
+            return False
+
+    @staticmethod
     def _close_cleanup_target(target: _OpenedCleanupTarget) -> None:
         try:
+            if target.write_guard_held and os.name != "nt":
+                try:
+                    import fcntl
+
+                    fcntl.fcntl(target.descriptor, fcntl.F_SETLEASE, fcntl.F_UNLCK)
+                except (ImportError, OSError, ValueError, AttributeError):
+                    pass
             os.close(target.descriptor)
         finally:
             if target.parent_descriptor is not None:
@@ -558,7 +607,9 @@ class ImageStorageService:
                 return {"ok": False, "reason": "path-alias"}
             if expected_size is not None and int(file_stat.st_size) != int(expected_size):
                 return {"ok": False, "reason": "source-changed", "size_bytes": int(file_stat.st_size)}
-            descriptor = os.open(parent_name, os.O_RDONLY | nofollow, dir_fd=parent_descriptor)
+            descriptor = os.open(parent_name, os.O_RDWR | nofollow, dir_fd=parent_descriptor)
+            if not self._acquire_posix_write_guard(descriptor):
+                return {"ok": False, "reason": "source-busy"}
             opened_stat = os.fstat(descriptor)
             if not _same_cleanup_identity(opened_stat, file_stat):
                 return {"ok": False, "reason": "source-changed"}
@@ -578,6 +629,7 @@ class ImageStorageService:
                 file_stat=file_stat,
                 digest=actual,
                 size_bytes=int(file_stat.st_size),
+                write_guard_held=True,
             )
             descriptor = None
             parent_descriptor = None
@@ -739,7 +791,18 @@ class ImageStorageService:
     def _before_posix_exchange(self, _target: _OpenedCleanupTarget) -> None:
         """Test seam between the pre-exchange link check and the exchange."""
 
-    def _unlink_posix_exact(self, target: _OpenedCleanupTarget) -> VerifiedDeleteResult:
+    def _after_posix_tombstone(self, _target: _OpenedCleanupTarget) -> None:
+        """Test seam after the source name is atomically tombstoned."""
+
+    def _after_posix_exchange(self, _target: _OpenedCleanupTarget) -> None:
+        """Test seam immediately after the atomic directory-entry exchange."""
+
+    def _unlink_posix_exact(
+        self,
+        target: _OpenedCleanupTarget,
+        *,
+        cleanup_token: str | None = None,
+    ) -> VerifiedDeleteResult:
         """Remove only the opened inode using Linux atomic directory moves.
 
         POSIX has no unlink-if-inode primitive. On Linux, two hard links plus
@@ -766,7 +829,7 @@ class ImageStorageService:
         at_empty_path = 0x1000
         rename_noreplace = 0x1
         rename_exchange = 0x2
-        suffix = f"{os.getpid()}-{uuid.uuid4().hex}"
+        suffix = _cleanup_transaction_token(cleanup_token) or f"{os.getpid()}-{uuid.uuid4().hex}"
         temp_name = f".genbox-cleanup-{suffix}.tmp"
         hold_name = f".genbox-cleanup-{suffix}.hold"
         tomb_name = f".genbox-cleanup-{suffix}.tomb"
@@ -800,6 +863,19 @@ class ImageStorageService:
                 return
             quarantined.append(quarantine)
 
+        def open_digest() -> str:
+            os.lseek(target.descriptor, 0, os.SEEK_SET)
+            digest = self._read_open_digest(target.descriptor)
+            os.lseek(target.descriptor, 0, os.SEEK_SET)
+            return digest
+
+        def drop_service_links(*service_names: str) -> None:
+            for service_name in service_names:
+                try:
+                    unlink_name(service_name)
+                except OSError:
+                    pass
+
         try:
             link_from_fd(temp_name)
             link_from_fd(hold_name)
@@ -808,21 +884,38 @@ class ImageStorageService:
             # so retain the source and quarantine only our own links.
             linked_stat = os.fstat(target.descriptor)
             if int(getattr(linked_stat, "st_nlink", 0) or 0) != 3:
-                for name in (temp_name, hold_name):
-                    try:
-                        unlink_name(name)
-                    except OSError:
-                        pass
+                drop_service_links(temp_name, hold_name)
                 return VerifiedDeleteResult("retained", "path-alias", target.size_bytes)
             self._before_posix_exchange(target)
+            if open_digest() != target.digest:
+                drop_service_links(temp_name, hold_name)
+                return VerifiedDeleteResult("retained", "source-changed", target.size_bytes)
+            if not self._posix_write_guard_active(target.descriptor):
+                drop_service_links(temp_name, hold_name)
+                return VerifiedDeleteResult("retained", "write-guard-lost", target.size_bytes)
             rename_name(temp_name, target.parent_name, rename_exchange)
             exchanged = True
+            self._after_posix_exchange(target)
             rename_name(target.parent_name, tomb_name, rename_noreplace)
             tombstoned = True
+            self._after_posix_tombstone(target)
             tomb_stat = stat_name(tomb_name)
             temp_stat = stat_name(temp_name)
             tomb_is_target = _same_cleanup_inode(tomb_stat, target.file_stat)
             temp_is_target = _same_cleanup_inode(temp_stat, target.file_stat)
+            if tomb_is_target and temp_is_target and open_digest() != target.digest:
+                rename_name(tomb_name, target.parent_name, rename_noreplace)
+                tombstoned = False
+                names.remove(tomb_name)
+                drop_service_links(temp_name, hold_name)
+                names.remove(temp_name)
+                names.remove(hold_name)
+                return VerifiedDeleteResult(
+                    "retained",
+                    "source-changed",
+                    target.size_bytes,
+                    detail="restored-original-entry",
+                )
             if int(getattr(tomb_stat, "st_nlink", 0) or 0) != 3:
                 if tomb_is_target and temp_is_target:
                     # An external hard-link alias appeared between the
@@ -902,7 +995,12 @@ class ImageStorageService:
                 detail=_quarantine_detail(quarantined),
             )
 
-    def _unlink_open_cleanup_target(self, target: _OpenedCleanupTarget) -> VerifiedDeleteResult:
+    def _unlink_open_cleanup_target(
+        self,
+        target: _OpenedCleanupTarget,
+        *,
+        cleanup_token: str | None = None,
+    ) -> VerifiedDeleteResult:
         try:
             os.lseek(target.descriptor, 0, os.SEEK_SET)
             current_digest = self._read_open_digest(target.descriptor)
@@ -963,7 +1061,7 @@ class ImageStorageService:
                     error = ctypes.get_last_error()
                     raise OSError(error, "SetFileInformationByHandle failed")
             elif target.parent_descriptor is not None:
-                return self._unlink_posix_exact(target)
+                return self._unlink_posix_exact(target, cleanup_token=cleanup_token)
             else:
                 target.candidate.unlink()
         except FileNotFoundError:
@@ -979,6 +1077,7 @@ class ImageStorageService:
         *,
         expected_size: int | None = None,
         claim_held: bool = False,
+        cleanup_token: str | None = None,
     ) -> VerifiedDeleteResult:
         """Delete one unchanged local source after storage-owned checks.
 
@@ -1014,7 +1113,7 @@ class ImageStorageService:
             # unlink. The hook exists only to make replacement races
             # deterministic in focused storage tests.
             self._before_verified_unlink(target)
-            deletion = self._unlink_open_cleanup_target(target)
+            deletion = self._unlink_open_cleanup_target(target, cleanup_token=cleanup_token)
             if deletion.status != "deleted":
                 return deletion
             try:
@@ -1049,6 +1148,7 @@ class ImageStorageService:
         *,
         expected_size: int | None = None,
         claim_held: bool = False,
+        cleanup_token: str | None = None,
     ) -> VerifiedDeleteResult:
         """Compatibility name for the storage-owned cleanup primitive."""
         return self.delete_verified_local(
@@ -1056,7 +1156,110 @@ class ImageStorageService:
             expected_sha256,
             expected_size=expected_size,
             claim_held=claim_held,
+            cleanup_token=cleanup_token,
         )
+
+    def inspect_verified_delete_artifacts(
+        self,
+        rel: str,
+        expected_sha256: str,
+        cleanup_token: str,
+        *,
+        expected_size: int | None = None,
+    ) -> dict[str, object]:
+        """Locate only the deterministic artifacts for one interrupted delete.
+
+        Recovery is read-only: it never removes, relinks, or renames an entry.
+        The opaque names make an interrupted atomic transaction explainable to
+        an operator without exposing an arbitrary filesystem path.
+        """
+        token = _cleanup_transaction_token(cleanup_token)
+        digest = str(expected_sha256 or "").strip().lower()
+        try:
+            safe_rel = _cleanup_relative_path(rel)
+        except ImageStorageError:
+            return {"artifacts": [], "matching_artifacts": [], "target_matches": False, "reason": "path-invalid"}
+        if not token or len(digest) != 64 or any(char not in "0123456789abcdef" for char in digest):
+            return {"artifacts": [], "matching_artifacts": [], "target_matches": False, "reason": "transaction-invalid"}
+        names = [
+            f".genbox-cleanup-{token}.tmp",
+            f".genbox-cleanup-{token}.hold",
+            f".genbox-cleanup-{token}.tomb",
+        ]
+        root = Path(self.local_root())
+        artifacts: list[str] = []
+        matching: list[str] = []
+        target_matches = False
+        parent_descriptor: int | None = None
+        descriptor: int | None = None
+        try:
+            if os.name == "nt" or not hasattr(os, "O_DIRECTORY"):
+                return {"artifacts": [], "matching_artifacts": [], "target_matches": False, "reason": "not-posix"}
+            nofollow = int(getattr(os, "O_NOFOLLOW", 0))
+            directory_flags = os.O_RDONLY | int(getattr(os, "O_DIRECTORY", 0)) | nofollow
+            parent_descriptor = os.open(root, directory_flags)
+            for component in Path(safe_rel).parts[:-1]:
+                next_descriptor = os.open(component, directory_flags, dir_fd=parent_descriptor)
+                os.close(parent_descriptor)
+                parent_descriptor = next_descriptor
+            target_name = Path(safe_rel).parts[-1]
+            try:
+                target_stat = os.stat(target_name, dir_fd=parent_descriptor, follow_symlinks=False)
+                if stat.S_ISREG(target_stat.st_mode) and not _is_filesystem_alias(target_stat):
+                    descriptor = os.open(target_name, os.O_RDONLY | nofollow, dir_fd=parent_descriptor)
+                    opened_target = os.fstat(descriptor)
+                    if (
+                        opened_target.st_dev == target_stat.st_dev
+                        and opened_target.st_ino == target_stat.st_ino
+                        and opened_target.st_size == target_stat.st_size
+                        and (expected_size is None or int(opened_target.st_size) == int(expected_size))
+                        and self._read_open_digest(descriptor) == digest
+                    ):
+                        target_matches = True
+                    os.close(descriptor)
+                    descriptor = None
+            except FileNotFoundError:
+                pass
+            for name in names:
+                try:
+                    file_stat = os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
+                except FileNotFoundError:
+                    continue
+                if not stat.S_ISREG(file_stat.st_mode) or _is_filesystem_alias(file_stat):
+                    artifacts.append(name)
+                    continue
+                artifacts.append(name)
+                descriptor = os.open(name, os.O_RDONLY | nofollow, dir_fd=parent_descriptor)
+                opened_stat = os.fstat(descriptor)
+                if (
+                    opened_stat.st_dev == file_stat.st_dev
+                    and opened_stat.st_ino == file_stat.st_ino
+                    and opened_stat.st_size == file_stat.st_size
+                    and (expected_size is None or int(opened_stat.st_size) == int(expected_size))
+                ):
+                    actual = self._read_open_digest(descriptor)
+                    if actual == digest:
+                        matching.append(name)
+                os.close(descriptor)
+                descriptor = None
+        except OSError:
+            return {
+                "artifacts": artifacts,
+                "matching_artifacts": matching,
+                "target_matches": target_matches,
+                "reason": "artifact-inspection-failed",
+            }
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
+            if parent_descriptor is not None:
+                os.close(parent_descriptor)
+        return {
+            "artifacts": artifacts,
+            "matching_artifacts": matching,
+            "target_matches": target_matches,
+            "reason": "inspected",
+        }
 
     def delete(self, rel: str) -> bool:
         # Generic/manual deletion must not bypass a receipt-tracked source.

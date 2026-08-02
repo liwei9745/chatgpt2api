@@ -141,6 +141,71 @@ def _cleanup_crash_after_unlink_worker(
     service.execute()
 
 
+def _cleanup_atomic_crash_worker(
+    images: str,
+    settings: str,
+    state: str,
+    audit: str,
+    index: str,
+    environment: dict[str, str],
+    stage: str,
+    exit_code: int,
+) -> None:
+    import services.image_storage_service as storage_module
+    import services.source_claim as claim_module
+
+    storage_module.config = _ImageConfig(Path(images))
+    claim_module.DATA_DIR = Path(state).parent / "claims"
+    storage = ImageStorageService(index_file=Path(index))
+    crash = lambda _target: os._exit(exit_code)
+    if stage == "after-exchange":
+        storage._after_posix_exchange = crash
+    elif stage == "after-tombstone":
+        storage._after_posix_tombstone = crash
+    else:
+        raise RuntimeError("unsupported crash stage")
+    service = GenBoxPushCleanupService(
+        state_file=Path(state),
+        audit_file=Path(audit),
+        settings_file=Path(settings),
+        image_storage=storage,
+        environment_gate=CleanupEnvironmentGate(dict(environment)),
+    )
+    service.execute()
+
+
+def _cleanup_crash_after_terminal_audit_worker(
+    images: str,
+    settings: str,
+    state: str,
+    audit: str,
+    index: str,
+    environment: dict[str, str],
+) -> None:
+    import services.image_storage_service as storage_module
+    import services.source_claim as claim_module
+
+    storage_module.config = _ImageConfig(Path(images))
+    claim_module.DATA_DIR = Path(state).parent / "claims"
+    storage = ImageStorageService(index_file=Path(index))
+    service = GenBoxPushCleanupService(
+        state_file=Path(state),
+        audit_file=Path(audit),
+        settings_file=Path(settings),
+        image_storage=storage,
+        environment_gate=CleanupEnvironmentGate(dict(environment)),
+    )
+    original_save = service._save_state_locked
+
+    def crash_on_terminal_state(records: dict[str, dict[str, object]]) -> None:
+        if any(record.get("cleanup_status") == "deleted" for record in records.values()):
+            os._exit(23)
+        original_save(records)
+
+    service._save_state_locked = crash_on_terminal_state
+    service.execute()
+
+
 class GenBoxPushCleanupTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = Path(tempfile.mkdtemp(prefix="genbox-cleanup-"))
@@ -745,6 +810,124 @@ class GenBoxPushCleanupTests(unittest.TestCase):
         records = json.loads(self.state.read_text(encoding="utf-8"))["records"]
         record = next(record for record in records.values() if record["remote_path"] == relative_path)
         self.assertEqual(record["cleanup_status"], "delete_unknown")
+
+    def test_restart_after_atomic_exchange_retains_source_and_lists_artifacts(self) -> None:
+        if os.name == "nt":
+            self.skipTest("POSIX atomic exchange crash requires Linux")
+        target = self._record("2026/08/01/crash-after-exchange.png")
+        self._enable_policy()
+        context = multiprocessing.get_context("spawn")
+        worker = context.Process(
+            target=_cleanup_atomic_crash_worker,
+            args=(
+                str(self.images),
+                str(self.settings),
+                str(self.state),
+                str(self.audit),
+                str(self.tmp / "index.json"),
+                dict(self.gate.environ),
+                "after-exchange",
+                21,
+            ),
+        )
+        worker.start()
+        worker.join(timeout=15)
+
+        self.assertEqual(worker.exitcode, 21)
+        self.assertTrue(target.exists())
+        records = json.loads(self.state.read_text(encoding="utf-8"))["records"]
+        intent = next(iter(records.values()))
+        token = intent.get("cleanup_token")
+        self.assertIsInstance(token, str)
+        self.assertEqual(len(token), 64)
+
+        recovered = self.service.recover_inflight()
+
+        self.assertEqual(recovered, {"retained": 1, "unknown": 0})
+        record = next(iter(json.loads(self.state.read_text(encoding="utf-8"))["records"].values()))
+        self.assertEqual(record["cleanup_status"], "retained")
+        self.assertIn(f".genbox-cleanup-{token}.", record.get("recovery_detail") or "")
+        self.assertTrue(target.exists())
+
+    def test_restart_after_atomic_tombstone_preserves_locatable_artifacts(self) -> None:
+        if os.name == "nt":
+            self.skipTest("POSIX atomic tombstone crash requires Linux")
+        relative_path = "2026/08/01/crash-after-tombstone.png"
+        target = self._record(relative_path)
+        self._enable_policy()
+        context = multiprocessing.get_context("spawn")
+        worker = context.Process(
+            target=_cleanup_atomic_crash_worker,
+            args=(
+                str(self.images),
+                str(self.settings),
+                str(self.state),
+                str(self.audit),
+                str(self.tmp / "index.json"),
+                dict(self.gate.environ),
+                "after-tombstone",
+                22,
+            ),
+        )
+        worker.start()
+        worker.join(timeout=15)
+
+        self.assertEqual(worker.exitcode, 22)
+        self.assertFalse(target.exists())
+        intent = next(iter(json.loads(self.state.read_text(encoding="utf-8"))["records"].values()))
+        token = str(intent.get("cleanup_token") or "")
+        evidence = self.storage.inspect_verified_delete_artifacts(
+            relative_path,
+            hashlib.sha256(b"synthetic-image").hexdigest(),
+            token,
+            expected_size=len(b"synthetic-image"),
+        )
+        self.assertGreaterEqual(len(evidence["matching_artifacts"]), 1)
+        for name in evidence["matching_artifacts"]:
+            self.assertEqual((target.parent / name).read_bytes(), b"synthetic-image")
+
+        recovered = self.service.recover_inflight()
+
+        self.assertEqual(recovered, {"retained": 0, "unknown": 1})
+        record = next(iter(json.loads(self.state.read_text(encoding="utf-8"))["records"].values()))
+        self.assertEqual(record["cleanup_status"], "delete_unknown")
+        self.assertEqual(record["decision_reason"], "interrupted-artifact-retained")
+        self.assertIn(f".genbox-cleanup-{token}.", record.get("recovery_detail") or "")
+
+    def test_restart_after_terminal_audit_before_state_commit_is_unknown(self) -> None:
+        if os.name == "nt":
+            self.skipTest("POSIX exact-delete terminal audit crash requires Linux")
+        target = self._record("2026/08/01/crash-after-terminal-audit.png")
+        self._enable_policy()
+        context = multiprocessing.get_context("spawn")
+        worker = context.Process(
+            target=_cleanup_crash_after_terminal_audit_worker,
+            args=(
+                str(self.images),
+                str(self.settings),
+                str(self.state),
+                str(self.audit),
+                str(self.tmp / "index.json"),
+                dict(self.gate.environ),
+            ),
+        )
+        worker.start()
+        worker.join(timeout=15)
+
+        self.assertEqual(worker.exitcode, 23)
+        self.assertFalse(target.exists())
+        intent = next(iter(json.loads(self.state.read_text(encoding="utf-8"))["records"].values()))
+        self.assertEqual(intent["cleanup_status"], "deleting")
+        decisions = [event.get("decision") for event in json.loads(self.audit.read_text(encoding="utf-8"))["events"]]
+        self.assertIn("deleted", decisions)
+
+        recovered = self.service.recover_inflight()
+
+        self.assertEqual(recovered, {"retained": 0, "unknown": 1})
+        record = next(iter(json.loads(self.state.read_text(encoding="utf-8"))["records"].values()))
+        self.assertEqual(record["cleanup_status"], "delete_unknown")
+        decisions = [event.get("decision") for event in json.loads(self.audit.read_text(encoding="utf-8"))["events"]]
+        self.assertEqual(decisions[-1], "delete_unknown")
 
     def test_mixed_execute_results_reconcile_totals(self) -> None:
         valid = self._record("2026/08/01/valid.png", b"valid")

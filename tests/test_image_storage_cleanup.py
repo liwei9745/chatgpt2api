@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import multiprocessing
 import os
 from pathlib import Path
 import subprocess
@@ -11,6 +12,16 @@ from unittest.mock import patch
 os.environ.setdefault("CHATGPT2API_AUTH_KEY", "local-test-admin-key")
 
 from services.image_storage_service import ImageStorageService
+
+
+def _posix_write_attempt_worker(path: str, started_queue, result_queue) -> None:
+    started_queue.put("started")
+    try:
+        Path(path).write_bytes(b"mutated-data")
+    except OSError as exc:
+        result_queue.put(f"failed:{type(exc).__name__}")
+    else:
+        result_queue.put("wrote")
 
 
 class _ImageConfig:
@@ -127,6 +138,89 @@ class ImageStorageCleanupTests(unittest.TestCase):
         self.assertEqual(result.reason, "path-alias")
         self.assertTrue(target.exists())
         self.assertTrue(alias.exists())
+
+    def test_same_inode_same_size_rewrite_after_final_identity_check_is_retained(self) -> None:
+        if os.name == "nt":
+            self.skipTest("POSIX in-place rewrite race requires a Linux filesystem")
+        rel, target, digest = self._source()
+        replacement = b"mutated-data"
+        self.assertEqual(len(replacement), target.stat().st_size)
+
+        def rewrite_after_final_check(_opened: object) -> None:
+            target.write_bytes(replacement)
+
+        with patch.object(self.storage, "_after_final_identity_check", side_effect=rewrite_after_final_check):
+            result = self.storage.delete_verified_local(rel, digest)
+
+        self.assertEqual(result.status, "retained")
+        self.assertEqual(result.reason, "source-changed")
+        self.assertTrue(target.exists())
+        self.assertEqual(target.read_bytes(), replacement)
+
+    def test_same_inode_rewrite_after_posix_tombstone_is_restored(self) -> None:
+        if os.name == "nt" or not hasattr(os, "pwrite"):
+            self.skipTest("POSIX descriptor rewrite race requires Linux pwrite")
+        rel, target, digest = self._source()
+        replacement = b"mutated-data"
+        self.assertEqual(len(replacement), target.stat().st_size)
+
+        def rewrite_after_tombstone(opened: object) -> None:
+            os.pwrite(opened.descriptor, replacement, 0)
+            os.fsync(opened.descriptor)
+
+        with patch.object(self.storage, "_after_posix_tombstone", side_effect=rewrite_after_tombstone):
+            result = self.storage.delete_verified_local(rel, digest)
+
+        self.assertEqual(result.status, "retained")
+        self.assertEqual(result.reason, "source-changed")
+        self.assertEqual(result.detail, "restored-original-entry")
+        self.assertTrue(target.exists())
+        self.assertEqual(target.read_bytes(), replacement)
+        leftovers = [
+            path.name
+            for path in target.parent.iterdir()
+            if path.name.startswith((".genbox-cleanup-", ".genbox-retained-"))
+        ]
+        self.assertEqual(leftovers, [])
+
+    def test_cross_process_writer_cannot_turn_delete_into_changed_source(self) -> None:
+        if os.name == "nt":
+            self.skipTest("POSIX write-lease race requires Linux")
+        rel, target, digest = self._source()
+        context = multiprocessing.get_context("spawn")
+        started_queue = context.Queue()
+        result_queue = context.Queue()
+        writer = None
+
+        def start_writer(_opened: object) -> None:
+            nonlocal writer
+            writer = context.Process(
+                target=_posix_write_attempt_worker,
+                args=(str(target), started_queue, result_queue),
+            )
+            writer.start()
+            self.assertEqual(started_queue.get(timeout=5), "started")
+
+        try:
+            with patch.object(self.storage, "_before_posix_exchange", side_effect=start_writer):
+                result = self.storage.delete_verified_local(rel, digest)
+            self.assertIsNotNone(writer)
+            writer.join(timeout=15)
+            if writer.is_alive():
+                writer.terminate()
+                writer.join(timeout=5)
+            writer_result = result_queue.get(timeout=5)
+            if result.status == "deleted":
+                self.assertNotEqual(writer_result, "wrote")
+                self.assertFalse(target.exists())
+            else:
+                self.assertEqual(result.status, "retained")
+                self.assertTrue(target.exists())
+                self.assertEqual(target.read_bytes(), b"mutated-data")
+        finally:
+            if writer is not None and writer.is_alive():
+                writer.terminate()
+                writer.join(timeout=5)
 
     def test_hard_link_added_during_posix_exchange_restores_original_entry(self) -> None:
         if os.name == "nt":
