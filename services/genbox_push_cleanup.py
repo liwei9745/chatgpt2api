@@ -5,6 +5,7 @@ import hashlib
 import hmac
 import ipaddress
 import os
+import re
 import threading
 import uuid
 from pathlib import Path
@@ -25,6 +26,17 @@ CLEANUP_RECORD_VERSION = 1
 MAX_AUDIT_EVENTS = 2000
 VALID_RECEIPT_STATUSES = {"imported", "already-imported", "duplicate-local"}
 TERMINAL_CLEANUP_STATUSES = {"deleted", "retained", "delete_failed", "delete_unknown"}
+ISOLATED_MARKER_VERSION = 1
+ISOLATED_MARKER_FIELDS = {
+    "version",
+    "instance_id",
+    "role",
+    "storage_root",
+    "compose_project",
+    "container_name",
+    "service_port",
+    "image_digest",
+}
 
 
 def _clean(value: object) -> str:
@@ -52,6 +64,31 @@ def _valid_digest(value: object) -> str:
 
 def _bool_env(value: object) -> bool:
     return _clean(value).lower() in {"1", "true", "yes", "on"}
+
+
+def _valid_runtime_name(value: object, *, max_length: int = 128) -> str:
+    name = _clean(value)
+    if not name or len(name) > max_length or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", name) is None:
+        return ""
+    return name
+
+
+def _valid_service_port(value: object) -> int:
+    try:
+        port = int(_clean(value))
+    except (TypeError, ValueError):
+        return 0
+    return port if 1 <= port <= 65535 else 0
+
+
+def _valid_image_digest(value: object) -> str:
+    digest = _clean(value).lower()
+    if not digest.startswith("sha256:"):
+        return ""
+    hex_digest = digest.removeprefix("sha256:")
+    if len(hex_digest) != 64 or any(char not in "0123456789abcdef" for char in hex_digest):
+        return ""
+    return digest
 
 
 def settings_coordination_lock_path(settings_file: Path) -> Path:
@@ -83,6 +120,10 @@ class CleanupEnvironmentGate:
             return False
         instance_id = _clean(self.environ.get("CHATGPT2API_CLEANUP_INSTANCE_ID"))
         role = _clean(self.environ.get("CHATGPT2API_CLEANUP_INSTANCE_ROLE"))
+        compose_project = _valid_runtime_name(self.environ.get("CHATGPT2API_CLEANUP_COMPOSE_PROJECT"))
+        container_name = _valid_runtime_name(self.environ.get("CHATGPT2API_CLEANUP_CONTAINER_NAME"))
+        service_port = _valid_service_port(self.environ.get("CHATGPT2API_CLEANUP_SERVICE_PORT"))
+        image_digest = _valid_image_digest(self.environ.get("CHATGPT2API_CLEANUP_IMAGE_DIGEST"))
         try:
             configured_path = Path(configured_root)
             configured_stat = configured_path.lstat()
@@ -118,7 +159,9 @@ class CleanupEnvironmentGate:
                 os.close(descriptor)
             if len(marker_bytes) != marker_stat.st_size:
                 return False
-            marker = marker_bytes.decode("utf-8").replace("\r\n", "\n").strip()
+            marker = json.loads(marker_bytes.decode("utf-8"))
+            if not isinstance(marker, dict) or set(marker) != ISOLATED_MARKER_FIELDS:
+                return False
             expected_marker_hash = _clean(self.environ.get("CHATGPT2API_CLEANUP_MARKER_SHA256")).lower()
             if (
                 len(expected_marker_hash) != 64
@@ -126,14 +169,27 @@ class CleanupEnvironmentGate:
                 or hashlib.sha256(marker_bytes).hexdigest() != expected_marker_hash
             ):
                 return False
-            marker_matches = marker == f"{instance_id}\n{role}\n{configured_resolved}"
+            marker_matches = marker == {
+                "version": ISOLATED_MARKER_VERSION,
+                "instance_id": instance_id,
+                "role": role,
+                "storage_root": str(configured_resolved),
+                "compose_project": compose_project,
+                "container_name": container_name,
+                "service_port": service_port,
+                "image_digest": image_digest,
+            }
         except (OSError, RuntimeError, TypeError, UnicodeError, ValueError):
             roots_match = False
             marker_matches = False
         return bool(
             role == "isolated-development"
-            and instance_id
-            and _clean(self.environ.get("CHATGPT2API_CLEANUP_CAPABILITY"))
+            and _valid_runtime_name(instance_id)
+            and compose_project
+            and container_name
+            and service_port
+            and image_digest
+            and len(_clean(self.environ.get("CHATGPT2API_CLEANUP_CAPABILITY"))) >= 32
             and roots_match
             and marker_matches
         )
@@ -336,8 +392,18 @@ class GenBoxPushCleanupService:
         status = _clean(receipt_status)
         if not scope or not sid or status not in VALID_RECEIPT_STATUSES:
             raise ValueError("cleanup receipt identity is invalid")
+        identity_result = self.image_storage.verify_local_identity(
+            path,
+            digest,
+            expected_size=max(0, int(size_bytes or 0)) or None,
+        )
+        source_identity = identity_result.get("source_identity") if identity_result.get("ok") else None
+        source_identity_reason = "" if source_identity else str(
+            identity_result.get("reason") or "source-identity-unverified"
+        )
         key = self._record_key(scope, sid, path, digest)
         now = self.now()
+        cleanup_authorized = safe_to_delete_source is True and isinstance(source_identity, dict)
         record = {
             "record_version": CLEANUP_RECORD_VERSION,
             "destination_scope": scope,
@@ -354,15 +420,23 @@ class GenBoxPushCleanupService:
             "receipt_validated_at": now,
             "transfer_status": "confirmed",
             "cleanup_policy_snapshot": self.policy_enabled(),
-            "cleanup_status": "eligible" if safe_to_delete_source is True else "ineligible",
-            "decision_reason": "receipt-confirmed" if safe_to_delete_source is True else "receipt-no-cleanup-permission",
+            "cleanup_status": "eligible" if cleanup_authorized else "ineligible",
+            "decision_reason": (
+                "receipt-no-cleanup-permission"
+                if safe_to_delete_source is not True
+                else "receipt-confirmed"
+                if cleanup_authorized
+                else source_identity_reason
+            ),
             "decided_at": now,
             "size_bytes": max(0, int(size_bytes or 0)),
+            "source_identity": source_identity,
+            "source_identity_reason": source_identity_reason,
         }
         with self._lock:
             records = self._load_state_locked()
             existing = records.get(key)
-            if isinstance(existing, dict) and existing.get("cleanup_status") in {"deleted", "deleting", "delete_unknown"}:
+            if isinstance(existing, dict) and existing.get("cleanup_status") in {"deleted", "deleting", "delete_failed", "delete_unknown"}:
                 return dict(existing)
             records[key] = record
             self._save_state_locked(records)
@@ -403,6 +477,9 @@ class GenBoxPushCleanupService:
             return "retained", "receipt-invalid", 0
         if receipt.get("safe_to_delete_source") is not True:
             return "retained", "receipt-no-cleanup-permission", 0
+        source_identity = record.get("source_identity")
+        if not isinstance(source_identity, dict):
+            return "retained", str(record.get("source_identity_reason") or "source-identity-missing"), 0
         current_scope, current_url = self._current_destination()
         if not current_scope or current_scope != str(record.get("destination_scope") or ""):
             return "retained", "destination-scope-changed", 0
@@ -412,6 +489,7 @@ class GenBoxPushCleanupService:
             str(record.get("remote_path") or ""),
             str(record.get("source_sha256") or ""),
             expected_size=int(record.get("size_bytes") or 0) or None,
+            expected_identity=source_identity,
         )
         if not result.get("ok"):
             reason = str(result.get("reason") or "source-unverified")
@@ -495,6 +573,34 @@ class GenBoxPushCleanupService:
                     "decision_reason": "already-deleted",
                     "size_bytes": 0,
                     "reclaimed_bytes": 0,
+                })
+                continue
+            elif current_status == "deleting":
+                # A durable intent means another cleanup attempt may have
+                # reached the storage boundary. Only recovery may resolve it;
+                # normal preview/execute runs must never delete again.
+                summary["unknown"] = int(summary.get("unknown", 0)) + 1
+                summary["items"].append({
+                    **self._public_record(record),
+                    "decision": "delete-inflight",
+                    "decision_reason": "recovery-required",
+                    "size_bytes": 0,
+                    "reclaimed_bytes": 0,
+                    "source_retained": True,
+                    "source_state": "unknown",
+                })
+                continue
+            elif current_status == "delete_failed":
+                # Storage failures are terminal until an explicit future
+                # recovery policy changes the record; do not retry silently.
+                summary["failed"] = int(summary.get("failed", 0)) + 1
+                summary["items"].append({
+                    **self._public_record(record),
+                    "decision": "delete-failed-terminal",
+                    "decision_reason": "delete-failed-terminal",
+                    "size_bytes": 0,
+                    "reclaimed_bytes": 0,
+                    "source_retained": True,
                 })
                 continue
             elif current_status == "delete_unknown":
@@ -616,12 +722,77 @@ class GenBoxPushCleanupService:
                             "cleanup_token": cleanup_token,
                         })
                         live[key] = intent
-                        self._save_state_locked(live)
+                        try:
+                            self._save_state_locked(live)
+                        except Exception:
+                            # The storage operation is forbidden until the
+                            # deletion intent is durable. Make one direct
+                            # atomic attempt to persist a terminal unknown
+                            # record, bypassing a failing state-save wrapper.
+                            fallback = dict(current)
+                            fallback.update({
+                                "cleanup_status": "delete_unknown",
+                                "decision_reason": "deletion-intent-state-write-failed",
+                                "decided_at": self.now(),
+                                "operation_id": operation_id,
+                                "cleanup_token": cleanup_token,
+                            })
+                            fallback_records = dict(live)
+                            fallback_records[key] = fallback
+                            try:
+                                _atomic_json_write(
+                                    self.state_file,
+                                    {"record_version": CLEANUP_RECORD_VERSION, "records": fallback_records},
+                                )
+                            except Exception:
+                                # If neither the intent nor the terminal
+                                # fallback is durable, retain the source and
+                                # leave the original eligible record intact.
+                                summary["eligible"] = max(0, int(summary["eligible"]) - 1)
+                                summary["potential_bytes"] = max(0, int(summary["potential_bytes"]) - size)
+                                summary["retained"] = int(summary["retained"]) + 1
+                                item_result.update({
+                                    "decision": "retained",
+                                    "decision_reason": "deletion-intent-state-write-failed",
+                                    "size_bytes": 0,
+                                    "source_retained": True,
+                                })
+                                summary["items"].append(item_result)
+                                continue
+                            live = fallback_records
+                            current = fallback
+                            try:
+                                self._append_audit_locked(self._audit_event(
+                                    operation_id=operation_id,
+                                    mode=mode,
+                                    record=current,
+                                    prior_status=current_status,
+                                    decision="delete_unknown",
+                                    reason="deletion-intent-state-write-failed",
+                                    size_bytes=size,
+                                ))
+                            except Exception:
+                                # The terminal state is already durable; an
+                                # audit write must not reopen deletion.
+                                pass
+                            summary["eligible"] = max(0, int(summary["eligible"]) - 1)
+                            summary["potential_bytes"] = max(0, int(summary["potential_bytes"]) - size)
+                            summary["failed"] = int(summary["failed"]) + 1
+                            item_result.update({
+                                "decision": "delete_unknown",
+                                "decision_reason": "deletion-intent-state-write-failed",
+                                "size_bytes": size,
+                                "source_retained": True,
+                                "source_state": "unknown",
+                            })
+                            summary["items"].append(item_result)
+                            continue
                         self._append_audit_locked(self._audit_event(operation_id=operation_id, mode=mode, record=intent, prior_status=current_status, decision="deleting", reason="deletion-intent", size_bytes=size))
                     deletion = self.image_storage.delete_verified_local(
                         str(record.get("remote_path") or ""),
                         str(record.get("source_sha256") or ""),
                         expected_size=size,
+                        expected_identity=current.get("source_identity"),
                         claim_held=True,
                         cleanup_token=cleanup_token,
                     )
@@ -698,10 +869,18 @@ class GenBoxPushCleanupService:
                 ) if cleanup_token else {"artifacts": [], "matching_artifacts": []}
                 artifact_names = [str(name) for name in artifact_evidence.get("artifacts") or []]
                 matching_artifacts = [str(name) for name in artifact_evidence.get("matching_artifacts") or []]
-                target_matches = artifact_evidence.get("target_matches") is True
                 detail = f"artifacts:{';'.join(artifact_names)}" if artifact_names else ""
-                identity = self.image_storage.verify_local_identity(path, digest, expected_size=int(record.get("size_bytes") or 0) or None)
-                if identity.get("ok") or target_matches:
+                identity = self.image_storage.verify_local_identity(
+                    path,
+                    digest,
+                    expected_size=int(record.get("size_bytes") or 0) or None,
+                    expected_identity=record.get("source_identity"),
+                )
+                # Recovery may only claim that the source was retained when
+                # the durable device/inode identity still matches. Matching
+                # bytes or size alone is insufficient: a replacement inode
+                # can contain identical content after a crash.
+                if identity.get("ok"):
                     record.update({
                         "cleanup_status": "retained",
                         "decision_reason": "interrupted-before-delete",

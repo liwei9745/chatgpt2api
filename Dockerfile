@@ -21,9 +21,15 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     UV_LINK_MODE=copy \
     TZ=Asia/Shanghai \
-    CHATGPT2API_THREAD_TOKENS=80
+    CHATGPT2API_THREAD_TOKENS=80 \
+    GENBOX_CLEANUP_PROTECTED_STAGING_ROOT=/app/.genbox-cleanup-staging
 
 WORKDIR /app
+
+# Cleanup staging is deliberately owned by a different uid and is not
+# writable through the image volume. POSIX source deletion remains fail-closed
+# when this boundary is missing or misconfigured.
+RUN install -d -o nobody -g nogroup -m 700 /app/.genbox-cleanup-staging
 
 # 安装系统依赖
 # - git: Git 存储后端需要

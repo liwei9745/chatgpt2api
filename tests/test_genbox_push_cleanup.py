@@ -208,17 +208,42 @@ def _cleanup_crash_after_terminal_audit_worker(
 
 class GenBoxPushCleanupTests(unittest.TestCase):
     def setUp(self) -> None:
+        self.config_patch = None
+        self.claim_path_patch = None
+        self.staging_env_patch = None
         self.tmp = Path(tempfile.mkdtemp(prefix="genbox-cleanup-"))
         self.images = self.tmp / "images"
+        self.protected_staging = self.tmp / "protected-staging"
+        self.protected_staging.mkdir()
+        if os.name != "nt":
+            try:
+                os.chown(self.protected_staging, 65534, 65534)
+            except (AttributeError, PermissionError, OSError):
+                self.skipTest("protected POSIX staging requires a provisioned ownership boundary")
+            self.staging_env_patch = patch.dict(
+                os.environ,
+                {"GENBOX_CLEANUP_PROTECTED_STAGING_ROOT": str(self.protected_staging)},
+            )
+            self.staging_env_patch.start()
         self.settings = self.tmp / "settings.json"
         self.state = self.tmp / "cleanup.json"
         self.audit = self.tmp / "audit.json"
         self.instance_id = "synthetic-isolated-sender"
+        self.compose_project = "genbox-phase6-synthetic"
+        self.container_name = "genbox-phase6-sender"
+        self.service_port = 33010
+        self.image_digest = "sha256:" + "a" * 64
         self.instance_marker = self.tmp / ".genbox-isolated-cleanup"
-        self.instance_marker.write_text(
-            f"{self.instance_id}\nisolated-development\n{self.images.resolve()}",
-            encoding="utf-8",
-        )
+        self.instance_marker.write_text(json.dumps({
+            "version": 1,
+            "instance_id": self.instance_id,
+            "role": "isolated-development",
+            "storage_root": str(self.images.resolve()),
+            "compose_project": self.compose_project,
+            "container_name": self.container_name,
+            "service_port": self.service_port,
+            "image_digest": self.image_digest,
+        }, separators=(",", ":"), sort_keys=True), encoding="utf-8")
         marker_hash = hashlib.sha256(self.instance_marker.read_bytes()).hexdigest()
         write_json_file(self.settings, {
             "enabled": True,
@@ -234,6 +259,10 @@ class GenBoxPushCleanupTests(unittest.TestCase):
             "CHATGPT2API_CLEANUP_INSTANCE_ROLE": "isolated-development",
             "CHATGPT2API_CLEANUP_INSTANCE_ID": self.instance_id,
             "CHATGPT2API_CLEANUP_STORAGE_ROOT": str(self.images.resolve()),
+            "CHATGPT2API_CLEANUP_COMPOSE_PROJECT": self.compose_project,
+            "CHATGPT2API_CLEANUP_CONTAINER_NAME": self.container_name,
+            "CHATGPT2API_CLEANUP_SERVICE_PORT": str(self.service_port),
+            "CHATGPT2API_CLEANUP_IMAGE_DIGEST": self.image_digest,
             "CHATGPT2API_CLEANUP_CAPABILITY": "synthetic-capability-32-bytes-000000000000",
             "CHATGPT2API_CLEANUP_MARKER_SHA256": marker_hash,
             "CHATGPT2API_CLEANUP_TRUSTED_DESTINATION_KIND": "https",
@@ -259,8 +288,12 @@ class GenBoxPushCleanupTests(unittest.TestCase):
         self.claim_path_patch.start()
 
     def tearDown(self) -> None:
-        self.config_patch.stop()
-        self.claim_path_patch.stop()
+        if self.staging_env_patch is not None:
+            self.staging_env_patch.stop()
+        if self.config_patch is not None:
+            self.config_patch.stop()
+        if self.claim_path_patch is not None:
+            self.claim_path_patch.stop()
         for path in sorted(self.tmp.rglob("*"), key=lambda item: len(item.parts), reverse=True):
             if path.is_file() or path.is_symlink():
                 path.unlink()
@@ -358,6 +391,35 @@ class GenBoxPushCleanupTests(unittest.TestCase):
         self.assertEqual(result["deleted"], 0)
         self.assertTrue(target.exists())
         self.assertEqual(result["items"][0]["decision_reason"], "source-changed")
+
+    def test_same_content_new_file_identity_after_receipt_is_retained(self) -> None:
+        target = self._record()
+        self._enable_policy()
+        replacement = target.with_name("same-content-replacement.png")
+        replacement.write_bytes(target.read_bytes())
+        os.replace(replacement, target)
+
+        result = self.service.execute()
+
+        self.assertEqual(result["deleted"], 0)
+        self.assertTrue(target.exists())
+        self.assertEqual(target.read_bytes(), b"synthetic-image")
+        self.assertEqual(result["items"][0]["decision_reason"], "source-changed")
+
+    def test_receipt_without_durable_source_identity_is_retained(self) -> None:
+        target = self._record()
+        self._enable_policy()
+        payload = json.loads(self.state.read_text(encoding="utf-8"))
+        record = next(iter(payload["records"].values()))
+        record.pop("source_identity", None)
+        record.pop("source_identity_reason", None)
+        write_json_file(self.state, payload)
+
+        result = self.service.execute()
+
+        self.assertEqual(result["deleted"], 0)
+        self.assertTrue(target.exists())
+        self.assertEqual(result["items"][0]["decision_reason"], "source-identity-missing")
 
     def test_destination_rotation_invalidates_old_receipt(self) -> None:
         target = self._record()
@@ -586,6 +648,56 @@ class GenBoxPushCleanupTests(unittest.TestCase):
         self.assertTrue(target.exists())
         self.assertEqual(result.get("blocked_reason"), "runtime-identity-unverified")
 
+    def test_each_isolated_runtime_identity_mismatch_blocks_execute(self) -> None:
+        target = self._record()
+        self._enable_policy()
+        mismatches = {
+            "CHATGPT2API_CLEANUP_INSTANCE_ID": "wrong-instance",
+            "CHATGPT2API_CLEANUP_INSTANCE_ROLE": "production",
+            "CHATGPT2API_CLEANUP_STORAGE_ROOT": str(self.tmp / "wrong-images"),
+            "CHATGPT2API_CLEANUP_COMPOSE_PROJECT": "wrong-project",
+            "CHATGPT2API_CLEANUP_CONTAINER_NAME": "wrong-container",
+            "CHATGPT2API_CLEANUP_SERVICE_PORT": "33018",
+            "CHATGPT2API_CLEANUP_IMAGE_DIGEST": "sha256:" + "b" * 64,
+            "CHATGPT2API_CLEANUP_CAPABILITY": "too-short",
+        }
+
+        for field, value in mismatches.items():
+            with self.subTest(field=field):
+                original = self.gate.environ.get(field)
+                self.gate.environ[field] = value
+                try:
+                    result = self.service.execute()
+                finally:
+                    if original is None:
+                        self.gate.environ.pop(field, None)
+                    else:
+                        self.gate.environ[field] = original
+                self.assertEqual(result.get("blocked_reason"), "runtime-identity-unverified")
+                self.assertTrue(target.exists())
+
+    def test_marker_with_extra_or_missing_identity_field_blocks_execute(self) -> None:
+        target = self._record()
+        self._enable_policy()
+        original_marker = json.loads(self.instance_marker.read_text(encoding="utf-8"))
+        for mutation in ("extra", "missing"):
+            with self.subTest(mutation=mutation):
+                marker = dict(original_marker)
+                if mutation == "extra":
+                    marker["unexpected"] = "value"
+                else:
+                    marker.pop("compose_project")
+                self.instance_marker.write_text(
+                    json.dumps(marker, separators=(",", ":"), sort_keys=True),
+                    encoding="utf-8",
+                )
+                self.gate.environ["CHATGPT2API_CLEANUP_MARKER_SHA256"] = hashlib.sha256(
+                    self.instance_marker.read_bytes()
+                ).hexdigest()
+                result = self.service.execute()
+                self.assertEqual(result.get("blocked_reason"), "runtime-identity-unverified")
+                self.assertTrue(target.exists())
+
     def test_cleanup_admin_rejects_cross_origin_browser_request(self) -> None:
         from api.support import require_cleanup_admin
 
@@ -674,6 +786,99 @@ class GenBoxPushCleanupTests(unittest.TestCase):
         self.assertTrue(substitute.exists())
         recovered = json.loads(self.state.read_text(encoding="utf-8"))["records"][key]
         self.assertEqual(recovered["cleanup_status"], "delete_unknown")
+
+    def test_restart_recovery_marks_same_content_replacement_unknown(self) -> None:
+        if os.name == "nt":
+            self.skipTest("POSIX inode replacement requires Linux")
+        target = self._record()
+        records = json.loads(self.state.read_text(encoding="utf-8"))["records"]
+        key, record = next(iter(records.items()))
+        record["cleanup_status"] = "deleting"
+        record["decision_reason"] = "deletion-intent"
+        records[key] = record
+        write_json_file(self.state, {"record_version": 1, "records": records})
+
+        replacement = target.with_name("same-content-replacement.tmp")
+        replacement.write_bytes(b"synthetic-image")
+        original_identity = record["source_identity"]
+        os.replace(replacement, target)
+        current_identity = self.storage.verify_local_identity(
+            "2026/08/01/image.png",
+            hashlib.sha256(b"synthetic-image").hexdigest(),
+            expected_size=len(b"synthetic-image"),
+        )["source_identity"]
+        self.assertNotEqual(current_identity, original_identity)
+
+        result = self.service.recover_inflight()
+
+        self.assertEqual(result, {"retained": 0, "unknown": 1})
+        self.assertTrue(target.exists())
+        recovered = json.loads(self.state.read_text(encoding="utf-8"))["records"][key]
+        self.assertEqual(recovered["cleanup_status"], "delete_unknown")
+        self.assertEqual(recovered["decision_reason"], "interrupted-ambiguous")
+
+    def test_execute_never_reprocesses_durable_deleting_intent(self) -> None:
+        target = self._record()
+        self._enable_policy()
+        records = json.loads(self.state.read_text(encoding="utf-8"))["records"]
+        key, record = next(iter(records.items()))
+        record["cleanup_status"] = "deleting"
+        record["decision_reason"] = "deletion-intent"
+        records[key] = record
+        write_json_file(self.state, {"record_version": 1, "records": records})
+
+        with patch.object(self.storage, "delete_verified_local") as delete:
+            result = self.service.execute()
+
+        self.assertFalse(delete.called)
+        self.assertTrue(target.exists())
+        self.assertEqual(result["unknown"], 1)
+        self.assertEqual(result["items"][0]["decision"], "delete-inflight")
+        self.assertEqual(result["items"][0]["decision_reason"], "recovery-required")
+
+    def test_intent_state_write_failure_is_terminal_unknown_and_not_retried(self) -> None:
+        target = self._record()
+        self._enable_policy()
+
+        with patch.object(self.service, "_save_state_locked", side_effect=OSError("synthetic intent write failure")):
+            first = self.service.execute()
+
+        self.assertTrue(target.exists())
+        self.assertEqual(first["items"][0]["decision"], "delete_unknown")
+        self.assertEqual(first["items"][0]["decision_reason"], "deletion-intent-state-write-failed")
+        records = json.loads(self.state.read_text(encoding="utf-8"))["records"]
+        self.assertEqual(next(iter(records.values()))["cleanup_status"], "delete_unknown")
+
+        second = self.service.execute()
+
+        self.assertTrue(target.exists())
+        self.assertEqual(second["unknown"], 1)
+        self.assertEqual(second["items"][0]["decision"], "delete-unknown-terminal")
+
+    def test_delete_failed_is_terminal_on_repeat_execute_and_receipt(self) -> None:
+        target = self._record()
+        self._enable_policy()
+        failed = VerifiedDeleteResult("delete_failed", "synthetic-delete-failure", len(b"synthetic-image"))
+        with patch.object(self.storage, "delete_verified_local", return_value=failed) as delete:
+            first = self.service.execute()
+            second = self.service.execute()
+
+        self.assertEqual(first["items"][0]["decision"], "delete_failed")
+        self.assertEqual(second["items"][0]["decision"], "delete-failed-terminal")
+        self.assertEqual(delete.call_count, 1)
+        self.assertTrue(target.exists())
+
+        digest = hashlib.sha256(b"synthetic-image").hexdigest()
+        receipt = self.service.record_receipt(
+            destination_scope=self._scope(),
+            source_id="chatgpt2api-dev",
+            remote_path="2026/08/01/image.png",
+            source_sha256=digest,
+            receipt_status="imported",
+            safe_to_delete_source=True,
+            size_bytes=len(b"synthetic-image"),
+        )
+        self.assertEqual(receipt["cleanup_status"], "delete_failed")
 
     def test_concurrent_execute_has_one_terminal_delete(self) -> None:
         target = self._record()
@@ -811,7 +1016,7 @@ class GenBoxPushCleanupTests(unittest.TestCase):
         record = next(record for record in records.values() if record["remote_path"] == relative_path)
         self.assertEqual(record["cleanup_status"], "delete_unknown")
 
-    def test_restart_after_atomic_exchange_retains_source_and_lists_artifacts(self) -> None:
+    def test_restart_after_atomic_exchange_marks_state_unknown_and_lists_artifacts(self) -> None:
         if os.name == "nt":
             self.skipTest("POSIX atomic exchange crash requires Linux")
         target = self._record("2026/08/01/crash-after-exchange.png")
@@ -843,9 +1048,9 @@ class GenBoxPushCleanupTests(unittest.TestCase):
 
         recovered = self.service.recover_inflight()
 
-        self.assertEqual(recovered, {"retained": 1, "unknown": 0})
+        self.assertEqual(recovered, {"retained": 0, "unknown": 1})
         record = next(iter(json.loads(self.state.read_text(encoding="utf-8"))["records"].values()))
-        self.assertEqual(record["cleanup_status"], "retained")
+        self.assertEqual(record["cleanup_status"], "delete_unknown")
         self.assertIn(f".genbox-cleanup-{token}.", record.get("recovery_detail") or "")
         self.assertTrue(target.exists())
 
@@ -884,7 +1089,12 @@ class GenBoxPushCleanupTests(unittest.TestCase):
         )
         self.assertGreaterEqual(len(evidence["matching_artifacts"]), 1)
         for name in evidence["matching_artifacts"]:
-            self.assertEqual((target.parent / name).read_bytes(), b"synthetic-image")
+            artifact = (
+                self.protected_staging / name.split("/", 1)[1]
+                if name.startswith("protected-staging/")
+                else target.parent / name
+            )
+            self.assertEqual(artifact.read_bytes(), b"synthetic-image")
 
         recovered = self.service.recover_inflight()
 

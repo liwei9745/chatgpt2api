@@ -145,7 +145,7 @@ wheels = [
 
 [[package]]
 name = "chatgpt2api"
-version = "2.7.0-rc.7"
+version = "2.7.0"
 source = { virtual = "." }
 dependencies = [
     { name = "curl-cffi" },

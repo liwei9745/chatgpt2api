@@ -22,6 +22,7 @@ from utils.timezone import beijing_datetime_from_timestamp, beijing_now, beijing
 IMAGE_INDEX_FILE = DATA_DIR / "image_index.json"
 IMAGE_INDEX_LOCK = Lock()
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp"}
+PROTECTED_CLEANUP_STAGING_ENV = "GENBOX_CLEANUP_PROTECTED_STAGING_ROOT"
 
 
 class ImageStorageError(RuntimeError):
@@ -123,6 +124,33 @@ def _same_cleanup_identity(left: os.stat_result, right: os.stat_result) -> bool:
         and int(getattr(left, "st_nlink", 1) or 1) == 1
         and int(getattr(right, "st_nlink", 1) or 1) == 1
     )
+
+
+_CLEANUP_SOURCE_IDENTITY_FIELDS = {
+    "device",
+    "inode",
+    "size_bytes",
+}
+
+
+def _cleanup_source_identity(file_stat: os.stat_result) -> dict[str, int]:
+    return {
+        "device": int(file_stat.st_dev),
+        "inode": int(file_stat.st_ino),
+        "size_bytes": int(file_stat.st_size),
+    }
+
+
+def _valid_cleanup_source_identity(value: object) -> dict[str, int] | None:
+    if not isinstance(value, dict) or set(value) != _CLEANUP_SOURCE_IDENTITY_FIELDS:
+        return None
+    try:
+        identity = {field: int(value[field]) for field in _CLEANUP_SOURCE_IDENTITY_FIELDS}
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if any(number < 0 for number in identity.values()):
+        return None
+    return identity
 
 
 def _same_cleanup_inode(left: os.stat_result, right: os.stat_result) -> bool:
@@ -500,6 +528,74 @@ class ImageStorageService:
         return target.candidate.lstat()
 
     @staticmethod
+    def _descriptor_mount_id(descriptor: int) -> int | None:
+        try:
+            for line in Path(f"/proc/self/fdinfo/{descriptor}").read_text(encoding="ascii").splitlines():
+                if line.startswith("mnt_id:"):
+                    return int(line.split(":", 1)[1].strip())
+        except (OSError, UnicodeError, ValueError):
+            return None
+        return None
+
+    def _cleanup_parent_is_anchored(self, target: _OpenedCleanupTarget) -> bool:
+        """Prove the retained parent fd still names the authorized root path."""
+        if target.parent_descriptor is None:
+            try:
+                parent_stat = target.candidate.parent.lstat()
+            except OSError:
+                return False
+            return stat.S_ISDIR(parent_stat.st_mode) and not _is_filesystem_alias(parent_stat)
+
+        root = Path(self.local_root())
+        nofollow = int(getattr(os, "O_NOFOLLOW", 0))
+        directory_flags = os.O_RDONLY | int(getattr(os, "O_DIRECTORY", 0)) | nofollow
+        descriptor: int | None = None
+        try:
+            root_stat = root.lstat()
+            if not stat.S_ISDIR(root_stat.st_mode) or _is_filesystem_alias(root_stat):
+                return False
+            descriptor = os.open(root, directory_flags)
+            opened_root = os.fstat(descriptor)
+            if opened_root.st_dev != root_stat.st_dev or opened_root.st_ino != root_stat.st_ino:
+                return False
+            for component in Path(target.relative_path).parts[:-1]:
+                component_stat = os.stat(component, dir_fd=descriptor, follow_symlinks=False)
+                if not stat.S_ISDIR(component_stat.st_mode) or _is_filesystem_alias(component_stat):
+                    return False
+                next_descriptor = os.open(component, directory_flags, dir_fd=descriptor)
+                opened_component = os.fstat(next_descriptor)
+                if (
+                    opened_component.st_dev != component_stat.st_dev
+                    or opened_component.st_ino != component_stat.st_ino
+                ):
+                    os.close(next_descriptor)
+                    return False
+                os.close(descriptor)
+                descriptor = next_descriptor
+            current_parent = os.fstat(descriptor)
+            retained_parent = os.fstat(target.parent_descriptor)
+            if (
+                current_parent.st_dev != retained_parent.st_dev
+                or current_parent.st_ino != retained_parent.st_ino
+            ):
+                return False
+            current_mount = self._descriptor_mount_id(descriptor)
+            retained_mount = self._descriptor_mount_id(target.parent_descriptor)
+            # An unreadable mount identity is not evidence of continuity.
+            # Treat it as a boundary failure instead of accepting a path that
+            # may have crossed mounts or been replaced behind the descriptor.
+            return (
+                current_mount is not None
+                and retained_mount is not None
+                and current_mount == retained_mount
+            )
+        except OSError:
+            return False
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
+
+    @staticmethod
     def _acquire_posix_write_guard(descriptor: int) -> bool:
         """Acquire a kernel-enforced write lease or fail closed.
 
@@ -555,6 +651,8 @@ class ImageStorageService:
         digest: str,
         *,
         expected_size: int | None,
+        expected_identity: dict[str, int] | None,
+        write_guard: bool,
     ) -> _OpenedCleanupTarget | dict[str, object]:
         """Open a cleanup target through anchored directory descriptors.
 
@@ -607,8 +705,14 @@ class ImageStorageService:
                 return {"ok": False, "reason": "path-alias"}
             if expected_size is not None and int(file_stat.st_size) != int(expected_size):
                 return {"ok": False, "reason": "source-changed", "size_bytes": int(file_stat.st_size)}
-            descriptor = os.open(parent_name, os.O_RDWR | nofollow, dir_fd=parent_descriptor)
-            if not self._acquire_posix_write_guard(descriptor):
+            if expected_identity is not None and _cleanup_source_identity(file_stat) != expected_identity:
+                return {"ok": False, "reason": "source-changed", "size_bytes": int(file_stat.st_size)}
+            descriptor = os.open(
+                parent_name,
+                (os.O_RDWR if write_guard else os.O_RDONLY) | nofollow,
+                dir_fd=parent_descriptor,
+            )
+            if write_guard and not self._acquire_posix_write_guard(descriptor):
                 return {"ok": False, "reason": "source-busy"}
             opened_stat = os.fstat(descriptor)
             if not _same_cleanup_identity(opened_stat, file_stat):
@@ -629,7 +733,7 @@ class ImageStorageService:
                 file_stat=file_stat,
                 digest=actual,
                 size_bytes=int(file_stat.st_size),
-                write_guard_held=True,
+                write_guard_held=write_guard,
             )
             descriptor = None
             parent_descriptor = None
@@ -650,6 +754,8 @@ class ImageStorageService:
         expected_sha256: str,
         *,
         expected_size: int | None = None,
+        expected_identity: dict[str, int] | None = None,
+        write_guard: bool = False,
     ) -> _OpenedCleanupTarget | dict[str, object]:
         """Open and hash a source while retaining its identity handle.
 
@@ -672,6 +778,8 @@ class ImageStorageService:
                 safe_rel,
                 digest,
                 expected_size=expected_size,
+                expected_identity=expected_identity,
+                write_guard=write_guard,
             )
         descriptor: int | None = None
         parent_descriptor: int | None = None
@@ -703,6 +811,8 @@ class ImageStorageService:
         if int(getattr(file_stat, "st_nlink", 1) or 1) != 1:
             return {"ok": False, "reason": "path-alias"}
         if expected_size is not None and int(file_stat.st_size) != int(expected_size):
+            return {"ok": False, "reason": "source-changed", "size_bytes": int(file_stat.st_size)}
+        if expected_identity is not None and _cleanup_source_identity(file_stat) != expected_identity:
             return {"ok": False, "reason": "source-changed", "size_bytes": int(file_stat.st_size)}
         try:
             descriptor = self._open_cleanup_descriptor(candidate)
@@ -763,9 +873,21 @@ class ImageStorageService:
         expected_sha256: str,
         *,
         expected_size: int | None = None,
+        expected_identity: dict[str, int] | None = None,
     ) -> dict[str, object]:
         """Inspect one local source without following aliases."""
-        target = self._open_verified_cleanup_target(rel, expected_sha256, expected_size=expected_size)
+        normalized_identity = None
+        if expected_identity is not None:
+            normalized_identity = _valid_cleanup_source_identity(expected_identity)
+            if normalized_identity is None:
+                return {"ok": False, "reason": "source-identity-invalid"}
+        target = self._open_verified_cleanup_target(
+            rel,
+            expected_sha256,
+            expected_size=expected_size,
+            expected_identity=normalized_identity,
+            write_guard=False,
+        )
         if isinstance(target, dict):
             return target
         try:
@@ -775,6 +897,7 @@ class ImageStorageService:
                 "sha256": target.digest,
                 "size_bytes": target.size_bytes,
                 "stat": target.file_stat,
+                "source_identity": _cleanup_source_identity(target.file_stat),
             }
         finally:
             self._close_cleanup_target(target)
@@ -797,6 +920,370 @@ class ImageStorageService:
     def _after_posix_exchange(self, _target: _OpenedCleanupTarget) -> None:
         """Test seam immediately after the atomic directory-entry exchange."""
 
+    @staticmethod
+    def _open_protected_cleanup_staging(parent_fd: int) -> int | None:
+        """Open a pre-provisioned staging boundary owned by another uid."""
+        configured = str(os.environ.get(PROTECTED_CLEANUP_STAGING_ENV) or "").strip()
+        if not configured or not os.path.isabs(configured):
+            return None
+        staging = Path(configured)
+        try:
+            source_stat = os.fstat(parent_fd)
+            current = staging
+            while True:
+                item = current.lstat()
+                writable_ancestor = bool(int(item.st_mode) & 0o022)
+                sticky_shared_root = bool(
+                    writable_ancestor
+                    and int(item.st_mode) & stat.S_ISVTX
+                    and int(item.st_uid) == 0
+                )
+                if _is_filesystem_alias(item) or not stat.S_ISDIR(item.st_mode) or (
+                    writable_ancestor and not sticky_shared_root
+                ):
+                    return None
+                if current == current.parent:
+                    break
+                current = current.parent
+            staging_stat = staging.lstat()
+            if int(staging_stat.st_uid) == int(source_stat.st_uid):
+                return None
+            flags = os.O_RDONLY | int(getattr(os, "O_DIRECTORY", 0)) | int(getattr(os, "O_NOFOLLOW", 0))
+            descriptor = os.open(staging, flags)
+            opened = os.fstat(descriptor)
+            if (
+                opened.st_dev != staging_stat.st_dev
+                or opened.st_ino != staging_stat.st_ino
+                or int(opened.st_uid) == int(source_stat.st_uid)
+                or int(opened.st_mode) & 0o022
+            ):
+                os.close(descriptor)
+                return None
+            probe = f".genbox-staging-probe-{os.getpid()}-{uuid.uuid4().hex}"
+            try:
+                probe_fd = os.open(
+                    probe,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | int(getattr(os, "O_NOFOLLOW", 0)),
+                    0o600,
+                    dir_fd=descriptor,
+                )
+                os.close(probe_fd)
+                os.unlink(probe, dir_fd=descriptor)
+            except OSError:
+                os.close(descriptor)
+                return None
+            return descriptor
+        except OSError:
+            return None
+
+    def _unlink_posix_protected_staging(
+        self,
+        target: _OpenedCleanupTarget,
+        *,
+        cleanup_token: str | None = None,
+    ) -> VerifiedDeleteResult:
+        """Transfer the verified inode into a protected namespace first."""
+        parent_fd = target.parent_descriptor
+        if parent_fd is None:
+            return VerifiedDeleteResult("retained", "protected-staging-unavailable", target.size_bytes)
+        initial_parent = os.fstat(parent_fd)
+        initial_parent_generation = (
+            int(initial_parent.st_dev),
+            int(initial_parent.st_ino),
+            int(getattr(initial_parent, "st_ctime_ns", 0)),
+            int(getattr(initial_parent, "st_mtime_ns", 0)),
+        )
+        if not self._cleanup_parent_is_anchored(target):
+            return VerifiedDeleteResult(
+                "retained", "source-changed", target.size_bytes, detail="restored-original-entry",
+            )
+        rechecked_parent = os.fstat(parent_fd)
+        if initial_parent_generation != (
+            int(rechecked_parent.st_dev),
+            int(rechecked_parent.st_ino),
+            int(getattr(rechecked_parent, "st_ctime_ns", 0)),
+            int(getattr(rechecked_parent, "st_mtime_ns", 0)),
+        ):
+            return VerifiedDeleteResult("retained", "source-parent-changed", target.size_bytes)
+        staging_fd = self._open_protected_cleanup_staging(parent_fd)
+        if staging_fd is None:
+            return VerifiedDeleteResult("retained", "protected-staging-unavailable", target.size_bytes)
+        import ctypes
+
+        libc = ctypes.CDLL(None, use_errno=True)
+        linkat = getattr(libc, "linkat", None)
+        renameat2 = getattr(libc, "renameat2", None)
+        if linkat is None or renameat2 is None:
+            os.close(staging_fd)
+            return VerifiedDeleteResult("retained", "protected-staging-unavailable", target.size_bytes)
+        linkat.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_int]
+        linkat.restype = ctypes.c_int
+        renameat2.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+        renameat2.restype = ctypes.c_int
+        at_empty_path = 0x1000
+        rename_noreplace = 0x1
+        rename_exchange = 0x2
+        suffix = _cleanup_transaction_token(cleanup_token) or f"{os.getpid()}-{uuid.uuid4().hex}"
+        temp_name = f".genbox-cleanup-{suffix}.tmp"
+        staged_original = f".genbox-cleanup-{suffix}.staged"
+        staged_observed = f".genbox-cleanup-{suffix}.observed"
+
+        def syscall_error(message: str) -> OSError:
+            return OSError(ctypes.get_errno(), message)
+
+        def stat_source(name: str) -> os.stat_result:
+            return os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+
+        def stat_staging(name: str) -> os.stat_result:
+            return os.stat(name, dir_fd=staging_fd, follow_symlinks=False)
+
+        def rename(source_fd: int, source: str, destination_fd: int, destination: str, flags: int) -> None:
+            if renameat2(
+                source_fd,
+                os.fsencode(source),
+                destination_fd,
+                os.fsencode(destination),
+                flags,
+            ) != 0:
+                raise syscall_error("renameat2 failed")
+
+        def unlink(fd: int, name: str) -> None:
+            os.unlink(name, dir_fd=fd)
+
+        def unlink_staged_exact(name: str, expected: os.stat_result) -> bool:
+            """Remove a staging entry only after an atomic identity handoff."""
+            # Keep the deletion tomb name independent from the entry being
+            # removed, so a watcher keyed to the transaction name cannot
+            # substitute a different object at the final unlink boundary.
+            tomb = f".genbox-staging-delete-{suffix}-{uuid.uuid4().hex}"
+            rename(staging_fd, name, staging_fd, tomb, rename_noreplace)
+            try:
+                moved = stat_staging(tomb)
+                if not _same_cleanup_inode(moved, expected):
+                    try:
+                        rename(staging_fd, tomb, staging_fd, name, rename_noreplace)
+                    except OSError:
+                        pass
+                    return False
+                # Re-check immediately before the destructive primitive. A
+                # replacement is then left as an artifact rather than being
+                # removed under the original transaction name.
+                moved_again = stat_staging(tomb)
+                if not _same_cleanup_inode(moved_again, expected):
+                    try:
+                        rename(staging_fd, tomb, staging_fd, name, rename_noreplace)
+                    except OSError:
+                        pass
+                    return False
+                unlink(staging_fd, tomb)
+                return True
+            except OSError:
+                try:
+                    rename(staging_fd, tomb, staging_fd, name, rename_noreplace)
+                except OSError:
+                    pass
+                return False
+
+        def digest_opened() -> str:
+            os.lseek(target.descriptor, 0, os.SEEK_SET)
+            value = self._read_open_digest(target.descriptor)
+            os.lseek(target.descriptor, 0, os.SEEK_SET)
+            return value
+
+        def parent_generation() -> tuple[int, int, int, int]:
+            current = os.fstat(parent_fd)
+            return (
+                int(current.st_dev),
+                int(current.st_ino),
+                int(getattr(current, "st_ctime_ns", 0)),
+                int(getattr(current, "st_mtime_ns", 0)),
+            )
+
+        def drop_owned_temp() -> None:
+            try:
+                if _same_cleanup_inode(stat_source(temp_name), target.file_stat):
+                    unlink(parent_fd, temp_name)
+            except OSError:
+                pass
+
+        step = "start"
+        try:
+            step = "link"
+            initial_nlink = int(getattr(os.fstat(target.descriptor), "st_nlink", 0) or 0)
+            if initial_nlink == 0:
+                return VerifiedDeleteResult("retained", "source-changed", target.size_bytes)
+            if initial_nlink > 1:
+                return VerifiedDeleteResult(
+                    "retained", "path-alias", target.size_bytes, detail="restored-original-entry",
+                )
+            if linkat(target.descriptor, b"", parent_fd, os.fsencode(temp_name), at_empty_path) != 0:
+                raise syscall_error("linkat(AT_EMPTY_PATH) failed")
+            if int(getattr(os.fstat(target.descriptor), "st_nlink", 0) or 0) != initial_nlink + 1:
+                drop_owned_temp()
+                return VerifiedDeleteResult(
+                    "retained", "path-alias", target.size_bytes, detail="restored-original-entry",
+                )
+            step = "before-exchange"
+            before_exchange_generation = parent_generation()
+            self._before_posix_exchange(target)
+            after_hook_generation = parent_generation()
+            if (
+                after_hook_generation[:2] != before_exchange_generation[:2]
+                or (
+                    after_hook_generation[3] == before_exchange_generation[3]
+                    and after_hook_generation[2] != before_exchange_generation[2]
+                )
+                or not self._cleanup_parent_is_anchored(target)
+            ):
+                # Entry changes update mtime and ctime together; a ctime-only
+                # change means the parent object itself was renamed or replaced,
+                # so the anchor is gone. Drop only the service-owned link and
+                # keep the verified source untouched.
+                drop_owned_temp()
+                return VerifiedDeleteResult(
+                    "retained", "source-parent-changed", target.size_bytes,
+                )
+            post_hook_nlink = int(getattr(os.fstat(target.descriptor), "st_nlink", 0) or 0)
+            if post_hook_nlink > initial_nlink + 1 or post_hook_nlink < max(0, initial_nlink - 1):
+                drop_owned_temp()
+                return VerifiedDeleteResult(
+                    "retained", "path-alias", target.size_bytes, detail="restored-original-entry",
+                )
+            if digest_opened() != target.digest or not self._posix_write_guard_active(target.descriptor):
+                drop_owned_temp()
+                return VerifiedDeleteResult("retained", "source-changed", target.size_bytes)
+            step = "exchange"
+            rename(parent_fd, temp_name, parent_fd, target.parent_name, rename_exchange)
+            after_exchange_generation = parent_generation()
+            self._after_posix_exchange(target)
+            if parent_generation() != after_exchange_generation:
+                return VerifiedDeleteResult(
+                    "delete_unknown", "source-parent-changed", target.size_bytes, detail=temp_name,
+                )
+            step = "identify"
+            temp_stat = stat_source(temp_name)
+            try:
+                target_stat = stat_source(target.parent_name)
+            except FileNotFoundError:
+                target_stat = None
+            temp_is_original = _same_cleanup_inode(temp_stat, target.file_stat)
+            target_is_original = bool(target_stat is not None and _same_cleanup_inode(target_stat, target.file_stat))
+            if not temp_is_original and not target_is_original:
+                return VerifiedDeleteResult("retained", "source-changed", target.size_bytes)
+            original_name = temp_name if temp_is_original else target.parent_name
+            observed_name = target.parent_name if original_name == temp_name else temp_name
+            step = "stage-original"
+            rename(parent_fd, original_name, staging_fd, staged_original, rename_noreplace)
+            try:
+                step = "stage-observed"
+                rename(parent_fd, observed_name, staging_fd, staged_observed, rename_noreplace)
+            except FileNotFoundError:
+                pass
+            step = "after-tombstone"
+            self._after_posix_tombstone(target)
+            if not self._cleanup_parent_is_anchored(target):
+                return VerifiedDeleteResult(
+                    "delete_unknown", "source-parent-changed", target.size_bytes,
+                    detail=staged_original,
+                )
+            if digest_opened() != target.digest:
+                # The opened inode changed after the source name was moved
+                # into staging. Restore a surviving entry before reporting
+                # anything. When both staging names still reference the same
+                # inode, discard only the duplicate link; when a replacement
+                # differs, restore it and retain the changed original as an
+                # explicit unknown artifact.
+                try:
+                    original_stat = stat_staging(staged_original)
+                except FileNotFoundError:
+                    return VerifiedDeleteResult(
+                        "delete_unknown", "source-changed", target.size_bytes, detail=staged_original,
+                    )
+                try:
+                    observed_stat = stat_staging(staged_observed)
+                except FileNotFoundError:
+                    observed_stat = None
+                if observed_stat is not None and _same_cleanup_inode(observed_stat, original_stat):
+                    try:
+                        rename(staging_fd, staged_observed, parent_fd, target.parent_name, rename_noreplace)
+                        if not unlink_staged_exact(staged_original, original_stat):
+                            return VerifiedDeleteResult(
+                                "delete_unknown", "staging-identity-ambiguous", target.size_bytes,
+                                detail=staged_original,
+                            )
+                    except OSError:
+                        return VerifiedDeleteResult(
+                            "delete_unknown", "replacement-restore-ambiguous", target.size_bytes,
+                            detail=staged_original,
+                        )
+                    return VerifiedDeleteResult(
+                        "retained", "source-changed", target.size_bytes, detail="restored-original-entry",
+                    )
+                if observed_stat is not None:
+                    try:
+                        rename(staging_fd, staged_observed, parent_fd, target.parent_name, rename_noreplace)
+                    except OSError:
+                        return VerifiedDeleteResult(
+                            "delete_unknown", "replacement-restore-ambiguous", target.size_bytes,
+                            detail=staged_original,
+                        )
+                    return VerifiedDeleteResult(
+                        "delete_unknown", "source-changed", target.size_bytes, detail=staged_original,
+                    )
+                try:
+                    rename(staging_fd, staged_original, parent_fd, target.parent_name, rename_noreplace)
+                except OSError:
+                    return VerifiedDeleteResult(
+                        "delete_unknown", "source-restore-ambiguous", target.size_bytes, detail=staged_original,
+                    )
+                return VerifiedDeleteResult(
+                    "retained", "source-changed", target.size_bytes, detail="restored-original-entry",
+                )
+            original_stat = stat_staging(staged_original)
+            if not _same_cleanup_inode(original_stat, target.file_stat):
+                return VerifiedDeleteResult("delete_unknown", "staging-identity-ambiguous", target.size_bytes)
+            try:
+                observed_stat = stat_staging(staged_observed)
+            except FileNotFoundError:
+                observed_stat = None
+            if observed_stat is not None and _same_cleanup_inode(observed_stat, target.file_stat):
+                if not self._cleanup_parent_is_anchored(target):
+                    return VerifiedDeleteResult(
+                        "delete_unknown", "source-parent-changed", target.size_bytes,
+                        detail=staged_original,
+                    )
+                if not unlink_staged_exact(staged_observed, observed_stat):
+                    return VerifiedDeleteResult(
+                        "delete_unknown", "staging-identity-ambiguous", target.size_bytes,
+                        detail=staged_observed,
+                    )
+                if not unlink_staged_exact(staged_original, original_stat):
+                    return VerifiedDeleteResult(
+                        "delete_unknown", "staging-identity-ambiguous", target.size_bytes,
+                        detail=staged_original,
+                    )
+                return VerifiedDeleteResult("deleted", "deleted", target.size_bytes)
+            if observed_stat is not None:
+                try:
+                    step = "restore-observed"
+                    rename(staging_fd, staged_observed, parent_fd, target.parent_name, rename_noreplace)
+                except OSError:
+                    return VerifiedDeleteResult(
+                        "delete_unknown", "replacement-restore-ambiguous", target.size_bytes, detail=staged_observed,
+                    )
+            return VerifiedDeleteResult(
+                "retained", "source-changed", target.size_bytes, detail=staged_original,
+            )
+        except (FileNotFoundError, OSError) as exc:
+            return VerifiedDeleteResult(
+                "delete_unknown",
+                "protected-staging-operation-failed",
+                target.size_bytes,
+                detail=f"{staged_original}:{step}:{type(exc).__name__}:{getattr(exc, 'errno', '')}",
+            )
+        finally:
+            os.close(staging_fd)
+
     def _unlink_posix_exact(
         self,
         target: _OpenedCleanupTarget,
@@ -811,189 +1298,7 @@ class ImageStorageService:
         every unexpected object is quarantined instead of being deleted. When
         the required syscalls are unavailable, cleanup fails closed.
         """
-        parent_fd = target.parent_descriptor
-        if parent_fd is None:
-            return VerifiedDeleteResult("retained", "atomic-delete-unavailable", target.size_bytes)
-        import ctypes
-
-        libc = ctypes.CDLL(None, use_errno=True)
-        linkat = getattr(libc, "linkat", None)
-        renameat2 = getattr(libc, "renameat2", None)
-        if linkat is None or renameat2 is None:
-            return VerifiedDeleteResult("retained", "atomic-delete-unavailable", target.size_bytes)
-        linkat.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_int]
-        linkat.restype = ctypes.c_int
-        renameat2.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
-        renameat2.restype = ctypes.c_int
-
-        at_empty_path = 0x1000
-        rename_noreplace = 0x1
-        rename_exchange = 0x2
-        suffix = _cleanup_transaction_token(cleanup_token) or f"{os.getpid()}-{uuid.uuid4().hex}"
-        temp_name = f".genbox-cleanup-{suffix}.tmp"
-        hold_name = f".genbox-cleanup-{suffix}.hold"
-        tomb_name = f".genbox-cleanup-{suffix}.tomb"
-        names = [temp_name, hold_name, tomb_name]
-        exchanged = False
-        tombstoned = False
-        quarantined: list[str] = []
-
-        def syscall_error(message: str) -> OSError:
-            return OSError(ctypes.get_errno(), message)
-
-        def link_from_fd(name: str) -> None:
-            if linkat(target.descriptor, b"", parent_fd, os.fsencode(name), at_empty_path) != 0:
-                raise syscall_error("linkat(AT_EMPTY_PATH) failed")
-
-        def rename_name(source: str, destination: str, flags: int) -> None:
-            if renameat2(parent_fd, os.fsencode(source), parent_fd, os.fsencode(destination), flags) != 0:
-                raise syscall_error("renameat2 failed")
-
-        def stat_name(name: str) -> os.stat_result:
-            return os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
-
-        def unlink_name(name: str) -> None:
-            os.unlink(name, dir_fd=parent_fd)
-
-        def quarantine_name(name: str) -> None:
-            quarantine = f".genbox-retained-{suffix}-{uuid.uuid4().hex}"
-            try:
-                rename_name(name, quarantine, rename_noreplace)
-            except OSError:
-                return
-            quarantined.append(quarantine)
-
-        def open_digest() -> str:
-            os.lseek(target.descriptor, 0, os.SEEK_SET)
-            digest = self._read_open_digest(target.descriptor)
-            os.lseek(target.descriptor, 0, os.SEEK_SET)
-            return digest
-
-        def drop_service_links(*service_names: str) -> None:
-            for service_name in service_names:
-                try:
-                    unlink_name(service_name)
-                except OSError:
-                    pass
-
-        try:
-            link_from_fd(temp_name)
-            link_from_fd(hold_name)
-            # The two temporary links must be the only additional references
-            # to the opened inode. An external hard-link alias is ambiguous,
-            # so retain the source and quarantine only our own links.
-            linked_stat = os.fstat(target.descriptor)
-            if int(getattr(linked_stat, "st_nlink", 0) or 0) != 3:
-                drop_service_links(temp_name, hold_name)
-                return VerifiedDeleteResult("retained", "path-alias", target.size_bytes)
-            self._before_posix_exchange(target)
-            if open_digest() != target.digest:
-                drop_service_links(temp_name, hold_name)
-                return VerifiedDeleteResult("retained", "source-changed", target.size_bytes)
-            if not self._posix_write_guard_active(target.descriptor):
-                drop_service_links(temp_name, hold_name)
-                return VerifiedDeleteResult("retained", "write-guard-lost", target.size_bytes)
-            rename_name(temp_name, target.parent_name, rename_exchange)
-            exchanged = True
-            self._after_posix_exchange(target)
-            rename_name(target.parent_name, tomb_name, rename_noreplace)
-            tombstoned = True
-            self._after_posix_tombstone(target)
-            tomb_stat = stat_name(tomb_name)
-            temp_stat = stat_name(temp_name)
-            tomb_is_target = _same_cleanup_inode(tomb_stat, target.file_stat)
-            temp_is_target = _same_cleanup_inode(temp_stat, target.file_stat)
-            if tomb_is_target and temp_is_target and open_digest() != target.digest:
-                rename_name(tomb_name, target.parent_name, rename_noreplace)
-                tombstoned = False
-                names.remove(tomb_name)
-                drop_service_links(temp_name, hold_name)
-                names.remove(temp_name)
-                names.remove(hold_name)
-                return VerifiedDeleteResult(
-                    "retained",
-                    "source-changed",
-                    target.size_bytes,
-                    detail="restored-original-entry",
-                )
-            if int(getattr(tomb_stat, "st_nlink", 0) or 0) != 3:
-                if tomb_is_target and temp_is_target:
-                    # An external hard-link alias appeared between the
-                    # pre-exchange check and the exchange. Put the opened
-                    # inode back at its recorded name and drop only our own
-                    # links; the ambiguous source is retained exactly where
-                    # it was, and no racer's entry stays hidden.
-                    rename_name(temp_name, target.parent_name, rename_noreplace)
-                    names.remove(temp_name)
-                    unlink_name(tomb_name)
-                    names.remove(tomb_name)
-                    unlink_name(hold_name)
-                    names.remove(hold_name)
-                    return VerifiedDeleteResult(
-                        "retained",
-                        "path-alias",
-                        target.size_bytes,
-                        detail="restored-original-entry",
-                    )
-            elif tomb_is_target and temp_is_target:
-                unlink_name(tomb_name)
-                unlink_name(temp_name)
-                unlink_name(hold_name)
-                return VerifiedDeleteResult("deleted", "deleted", target.size_bytes)
-
-            # A replacement was observed. Restore the newest non-target entry
-            # at the original name, then retain every other object under an
-            # opaque quarantine name. No unexpected inode is unlinked.
-            if not tomb_is_target:
-                rename_name(tomb_name, target.parent_name, rename_noreplace)
-                tombstoned = False
-            elif not temp_is_target:
-                rename_name(temp_name, target.parent_name, rename_noreplace)
-                names.remove(temp_name)
-            if tomb_is_target and tomb_name in names:
-                unlink_name(tomb_name)
-                names.remove(tomb_name)
-            for name in list(names):
-                if name == target.parent_name:
-                    continue
-                try:
-                    stat_name(name)
-                except OSError:
-                    continue
-                quarantine_name(name)
-            return VerifiedDeleteResult(
-                "retained",
-                "source-changed",
-                target.size_bytes,
-                detail=_quarantine_detail(quarantined),
-            )
-        except (FileNotFoundError, OSError):
-            # Best-effort recovery never deletes a leftover object. If the
-            # original name is absent after a partial exchange, restore a
-            # remaining entry before quarantining temporary links.
-            if exchanged and tombstoned:
-                try:
-                    stat_name(target.parent_name)
-                except OSError:
-                    for candidate in (tomb_name, temp_name):
-                        try:
-                            stat_name(candidate)
-                            rename_name(candidate, target.parent_name, rename_noreplace)
-                            break
-                        except OSError:
-                            continue
-            for name in names:
-                try:
-                    stat_name(name)
-                except OSError:
-                    continue
-                quarantine_name(name)
-            return VerifiedDeleteResult(
-                "retained",
-                "atomic-delete-failed",
-                target.size_bytes,
-                detail=_quarantine_detail(quarantined),
-            )
+        return self._unlink_posix_protected_staging(target, cleanup_token=cleanup_token)
 
     def _unlink_open_cleanup_target(
         self,
@@ -1076,6 +1381,7 @@ class ImageStorageService:
         expected_sha256: str,
         *,
         expected_size: int | None = None,
+        expected_identity: dict[str, int] | None = None,
         claim_held: bool = False,
         cleanup_token: str | None = None,
     ) -> VerifiedDeleteResult:
@@ -1090,6 +1396,9 @@ class ImageStorageService:
         from services.source_claim import source_claim
 
         safe_rel = str(rel or "")
+        normalized_identity = _valid_cleanup_source_identity(expected_identity)
+        if normalized_identity is None:
+            return VerifiedDeleteResult("retained", "source-identity-missing")
         lock = None
         if not claim_held:
             lock = source_claim(safe_rel, str(expected_sha256 or "").strip().lower())
@@ -1101,6 +1410,8 @@ class ImageStorageService:
                 safe_rel,
                 expected_sha256,
                 expected_size=expected_size,
+                expected_identity=normalized_identity,
+                write_guard=True,
             )
             if isinstance(opened, dict):
                 return VerifiedDeleteResult(
@@ -1147,6 +1458,7 @@ class ImageStorageService:
         expected_sha256: str,
         *,
         expected_size: int | None = None,
+        expected_identity: dict[str, int] | None = None,
         claim_held: bool = False,
         cleanup_token: str | None = None,
     ) -> VerifiedDeleteResult:
@@ -1155,6 +1467,7 @@ class ImageStorageService:
             rel,
             expected_sha256,
             expected_size=expected_size,
+            expected_identity=expected_identity,
             claim_held=claim_held,
             cleanup_token=cleanup_token,
         )
@@ -1192,6 +1505,7 @@ class ImageStorageService:
         target_matches = False
         parent_descriptor: int | None = None
         descriptor: int | None = None
+        staging_descriptor: int | None = None
         try:
             if os.name == "nt" or not hasattr(os, "O_DIRECTORY"):
                 return {"artifacts": [], "matching_artifacts": [], "target_matches": False, "reason": "not-posix"}
@@ -1242,6 +1556,36 @@ class ImageStorageService:
                         matching.append(name)
                 os.close(descriptor)
                 descriptor = None
+            staging_root = str(os.environ.get(PROTECTED_CLEANUP_STAGING_ENV) or "").strip()
+            if staging_root and os.path.isabs(staging_root):
+                try:
+                    staging_descriptor = os.open(staging_root, directory_flags)
+                    prefix = f".genbox-cleanup-{token}."
+                    for name in os.listdir(staging_descriptor):
+                        if not name.startswith(prefix):
+                            continue
+                        try:
+                            file_stat = os.stat(name, dir_fd=staging_descriptor, follow_symlinks=False)
+                        except FileNotFoundError:
+                            continue
+                        display_name = f"protected-staging/{name}"
+                        artifacts.append(display_name)
+                        if not stat.S_ISREG(file_stat.st_mode) or _is_filesystem_alias(file_stat):
+                            continue
+                        descriptor = os.open(name, os.O_RDONLY | nofollow, dir_fd=staging_descriptor)
+                        opened_stat = os.fstat(descriptor)
+                        if (
+                            opened_stat.st_dev == file_stat.st_dev
+                            and opened_stat.st_ino == file_stat.st_ino
+                            and opened_stat.st_size == file_stat.st_size
+                            and (expected_size is None or int(opened_stat.st_size) == int(expected_size))
+                            and self._read_open_digest(descriptor) == digest
+                        ):
+                            matching.append(display_name)
+                        os.close(descriptor)
+                        descriptor = None
+                except OSError:
+                    pass
         except OSError:
             return {
                 "artifacts": artifacts,
@@ -1254,6 +1598,8 @@ class ImageStorageService:
                 os.close(descriptor)
             if parent_descriptor is not None:
                 os.close(parent_descriptor)
+            if staging_descriptor is not None:
+                os.close(staging_descriptor)
         return {
             "artifacts": artifacts,
             "matching_artifacts": matching,

@@ -43,8 +43,25 @@ class _ImageConfig:
 
 class ImageStorageCleanupTests(unittest.TestCase):
     def setUp(self) -> None:
+        self.config_patch = None
+        self.claim_path_patch = None
+        self.staging_env_patch = None
         self.tmp = Path(tempfile.mkdtemp(prefix="image-storage-cleanup-"))
         self.images = self.tmp / "images"
+        self.protected_staging = self.tmp / "protected-staging"
+        self.protected_staging.mkdir()
+        if os.name != "nt":
+            try:
+                os.chown(self.protected_staging, 65534, 65534)
+            except (AttributeError, PermissionError, OSError):
+                self.skipTest("protected POSIX staging requires a provisioned ownership boundary")
+            self.staging_env_patch = patch.dict(
+                os.environ,
+                {"GENBOX_CLEANUP_PROTECTED_STAGING_ROOT": str(self.protected_staging)},
+            )
+            self.staging_env_patch.start()
+        else:
+            self.staging_env_patch = None
         self.storage = ImageStorageService(index_file=self.tmp / "index.json")
         self.config_patch = patch("services.image_storage_service.config", _ImageConfig(self.images))
         self.config_patch.start()
@@ -55,8 +72,12 @@ class ImageStorageCleanupTests(unittest.TestCase):
         self.claim_path_patch.start()
 
     def tearDown(self) -> None:
-        self.config_patch.stop()
-        self.claim_path_patch.stop()
+        if self.staging_env_patch is not None:
+            self.staging_env_patch.stop()
+        if self.config_patch is not None:
+            self.config_patch.stop()
+        if self.claim_path_patch is not None:
+            self.claim_path_patch.stop()
         for path in sorted(self.tmp.rglob("*"), key=lambda item: len(item.parts), reverse=True):
             if path.is_file() or path.is_symlink():
                 path.unlink()
@@ -71,8 +92,14 @@ class ImageStorageCleanupTests(unittest.TestCase):
         target.write_bytes(payload)
         return rel, target, hashlib.sha256(payload).hexdigest()
 
+    def _identity(self, rel: str, digest: str) -> dict[str, int]:
+        identity = self.storage.verify_local_identity(rel, digest)
+        self.assertTrue(identity.get("ok"), identity)
+        return dict(identity["source_identity"])
+
     def test_replacement_after_verification_is_retained(self) -> None:
         rel, target, digest = self._source()
+        source_identity = self._identity(rel, digest)
         replacement = target.with_name("replacement.png")
         replacement_blocked = []
 
@@ -87,7 +114,7 @@ class ImageStorageCleanupTests(unittest.TestCase):
                 replacement_blocked.append(exc)
 
         with patch.object(self.storage, "_before_verified_unlink", side_effect=replace_after_hash):
-            result = self.storage.delete_verified_local(rel, digest)
+            result = self.storage.delete_verified_local(rel, digest, expected_identity=source_identity)
 
         if replacement_blocked:
             self.assertEqual(result.status, "deleted")
@@ -98,8 +125,27 @@ class ImageStorageCleanupTests(unittest.TestCase):
             self.assertTrue(target.exists())
             self.assertEqual(target.read_bytes(), b"replacement-bytes")
 
+    def test_same_content_different_identity_is_retained(self) -> None:
+        rel, target, digest = self._source()
+        source_identity = self._identity(rel, digest)
+        replacement = target.with_name("same-content-replacement.png")
+        replacement.write_bytes(target.read_bytes())
+        os.replace(replacement, target)
+
+        result = self.storage.delete_verified_local(
+            rel,
+            digest,
+            expected_identity=source_identity,
+        )
+
+        self.assertEqual(result.status, "retained")
+        self.assertEqual(result.reason, "source-changed")
+        self.assertTrue(target.exists())
+        self.assertEqual(target.read_bytes(), b"source-bytes")
+
     def test_replacement_after_final_identity_check_is_retained(self) -> None:
         rel, target, digest = self._source()
+        source_identity = self._identity(rel, digest)
         replacement = target.with_name("replacement-after-final-check.png")
         replacement_blocked = []
 
@@ -111,8 +157,7 @@ class ImageStorageCleanupTests(unittest.TestCase):
                 replacement_blocked.append(exc)
 
         with patch.object(self.storage, "_after_final_identity_check", side_effect=replace_after_final_check):
-            result = self.storage.delete_verified_local(rel, digest)
-
+            result = self.storage.delete_verified_local(rel, digest, expected_identity=source_identity)
         if replacement_blocked:
             self.assertEqual(result.status, "deleted")
             self.assertFalse(target.exists())
@@ -122,17 +167,123 @@ class ImageStorageCleanupTests(unittest.TestCase):
             self.assertTrue(target.exists())
             self.assertEqual(target.read_bytes(), b"replacement-after-final-check")
 
+    def test_parent_directory_move_after_final_identity_check_is_retained(self) -> None:
+        if os.name == "nt":
+            self.skipTest("POSIX parent-directory anchoring requires Linux")
+        rel, target, digest = self._source()
+        source_identity = self._identity(rel, digest)
+        original_parent = target.parent
+        moved_parent = original_parent.with_name(original_parent.name + "-moved")
+
+        def move_parent(_opened: object) -> None:
+            original_parent.rename(moved_parent)
+            original_parent.mkdir()
+            (original_parent / target.name).write_bytes(b"replacement-bytes")
+
+        with patch.object(self.storage, "_after_final_identity_check", side_effect=move_parent):
+            result = self.storage.delete_verified_local(
+                rel,
+                digest,
+                expected_identity=source_identity,
+            )
+
+        self.assertEqual(result.status, "retained")
+        self.assertEqual(result.reason, "source-changed")
+        self.assertEqual(result.detail, "restored-original-entry")
+        self.assertTrue((moved_parent / target.name).exists())
+        self.assertEqual((moved_parent / target.name).read_bytes(), b"source-bytes")
+        self.assertEqual(target.read_bytes(), b"replacement-bytes")
+
+    def test_parent_directory_aba_before_exchange_is_retained(self) -> None:
+        if os.name == "nt":
+            self.skipTest("POSIX parent-directory ABA detection requires Linux")
+        rel, target, digest = self._source()
+        source_identity = self._identity(rel, digest)
+        moved_parent = target.parent.with_name(target.parent.name + "-moved")
+        original_anchor_check = self.storage._cleanup_parent_is_anchored
+
+        def move_away_and_back(opened: object) -> bool:
+            anchored = original_anchor_check(opened)
+            self.assertTrue(anchored)
+            target.parent.rename(moved_parent)
+            moved_parent.rename(target.parent)
+            return anchored
+
+        with patch.object(self.storage, "_cleanup_parent_is_anchored", side_effect=move_away_and_back):
+            result = self.storage.delete_verified_local(rel, digest, expected_identity=source_identity)
+
+        self.assertEqual(result.status, "retained")
+        self.assertEqual(result.reason, "source-parent-changed")
+        self.assertTrue(target.exists())
+        self.assertEqual(target.read_bytes(), b"source-bytes")
+
+    def test_unknown_posix_mount_identity_is_not_anchored(self) -> None:
+        if os.name == "nt":
+            self.skipTest("POSIX mount identity requires Linux")
+        rel, _target, digest = self._source()
+        source_identity = self._identity(rel, digest)
+        opened = self.storage._open_verified_cleanup_target(
+            rel,
+            digest,
+            expected_identity=source_identity,
+            write_guard=False,
+        )
+        self.assertFalse(isinstance(opened, dict), opened)
+        try:
+            with patch.object(self.storage, "_descriptor_mount_id", return_value=None):
+                self.assertFalse(self.storage._cleanup_parent_is_anchored(opened))
+        finally:
+            self.storage._close_cleanup_target(opened)
+
+    def test_staging_replacement_is_not_unlinked(self) -> None:
+        if os.name == "nt":
+            self.skipTest("POSIX staging race requires Linux")
+        rel, target, digest = self._source()
+        source_identity = self._identity(rel, digest)
+        victim = self.protected_staging / "unrelated-victim"
+        victim.write_bytes(b"unrelated-victim")
+        staging_descriptors: list[int] = []
+        real_open_staging = ImageStorageService._open_protected_cleanup_staging
+        real_unlink = os.unlink
+
+        def capture_staging(parent_fd: int) -> int | None:
+            descriptor = real_open_staging(parent_fd)
+            if descriptor is not None:
+                staging_descriptors.append(descriptor)
+            return descriptor
+
+        def replace_before_legacy_unlink(name: str, *, dir_fd: int | None = None) -> None:
+            if (
+                staging_descriptors
+                and dir_fd == staging_descriptors[0]
+                and name.endswith(".observed")
+            ):
+                observed = Path(f"/proc/self/fd/{dir_fd}").resolve() / name
+                os.replace(victim, observed)
+            real_unlink(name, dir_fd=dir_fd)
+
+        with patch.object(self.storage, "_open_protected_cleanup_staging", side_effect=capture_staging), patch(
+            "services.image_storage_service.os.unlink", side_effect=replace_before_legacy_unlink,
+        ):
+            result = self.storage.delete_verified_local(rel, digest, expected_identity=source_identity)
+
+        self.assertEqual(result.status, "deleted")
+        self.assertFalse(target.exists())
+        self.assertTrue(victim.exists())
+        self.assertEqual(victim.read_bytes(), b"unrelated-victim")
+
     def test_hard_link_added_after_final_identity_check_is_retained(self) -> None:
         if os.name == "nt":
             self.skipTest("POSIX hard-link race requires a Linux filesystem")
         rel, target, digest = self._source()
+        source_identity = self._identity(rel, digest)
         alias = target.with_name("alias-after-final-check.png")
 
         def add_alias(_opened: object) -> None:
             os.link(target, alias)
 
         with patch.object(self.storage, "_after_final_identity_check", side_effect=add_alias):
-            result = self.storage.delete_verified_local(rel, digest)
+            result = self.storage.delete_verified_local(rel, digest, expected_identity=source_identity)
 
         self.assertEqual(result.status, "retained")
         self.assertEqual(result.reason, "path-alias")
@@ -143,6 +294,7 @@ class ImageStorageCleanupTests(unittest.TestCase):
         if os.name == "nt":
             self.skipTest("POSIX in-place rewrite race requires a Linux filesystem")
         rel, target, digest = self._source()
+        source_identity = self._identity(rel, digest)
         replacement = b"mutated-data"
         self.assertEqual(len(replacement), target.stat().st_size)
 
@@ -150,7 +302,7 @@ class ImageStorageCleanupTests(unittest.TestCase):
             target.write_bytes(replacement)
 
         with patch.object(self.storage, "_after_final_identity_check", side_effect=rewrite_after_final_check):
-            result = self.storage.delete_verified_local(rel, digest)
+            result = self.storage.delete_verified_local(rel, digest, expected_identity=source_identity)
 
         self.assertEqual(result.status, "retained")
         self.assertEqual(result.reason, "source-changed")
@@ -161,6 +313,7 @@ class ImageStorageCleanupTests(unittest.TestCase):
         if os.name == "nt" or not hasattr(os, "pwrite"):
             self.skipTest("POSIX descriptor rewrite race requires Linux pwrite")
         rel, target, digest = self._source()
+        source_identity = self._identity(rel, digest)
         replacement = b"mutated-data"
         self.assertEqual(len(replacement), target.stat().st_size)
 
@@ -169,7 +322,7 @@ class ImageStorageCleanupTests(unittest.TestCase):
             os.fsync(opened.descriptor)
 
         with patch.object(self.storage, "_after_posix_tombstone", side_effect=rewrite_after_tombstone):
-            result = self.storage.delete_verified_local(rel, digest)
+            result = self.storage.delete_verified_local(rel, digest, expected_identity=source_identity)
 
         self.assertEqual(result.status, "retained")
         self.assertEqual(result.reason, "source-changed")
@@ -187,6 +340,7 @@ class ImageStorageCleanupTests(unittest.TestCase):
         if os.name == "nt":
             self.skipTest("POSIX write-lease race requires Linux")
         rel, target, digest = self._source()
+        source_identity = self._identity(rel, digest)
         context = multiprocessing.get_context("spawn")
         started_queue = context.Queue()
         result_queue = context.Queue()
@@ -203,7 +357,7 @@ class ImageStorageCleanupTests(unittest.TestCase):
 
         try:
             with patch.object(self.storage, "_before_posix_exchange", side_effect=start_writer):
-                result = self.storage.delete_verified_local(rel, digest)
+                result = self.storage.delete_verified_local(rel, digest, expected_identity=source_identity)
             self.assertIsNotNone(writer)
             writer.join(timeout=15)
             if writer.is_alive():
@@ -211,8 +365,13 @@ class ImageStorageCleanupTests(unittest.TestCase):
                 writer.join(timeout=5)
             writer_result = result_queue.get(timeout=5)
             if result.status == "deleted":
-                self.assertNotEqual(writer_result, "wrote")
                 self.assertFalse(target.exists())
+                # The racer's file must never be the object that was deleted:
+                # when the path write landed after the verified inode moved
+                # into staging, the replacement stays behind at the path.
+                if writer_result == "wrote":
+                    self.assertTrue(target.exists())
+                    self.assertEqual(target.read_bytes(), b"mutated-data")
             else:
                 self.assertEqual(result.status, "retained")
                 self.assertTrue(target.exists())
@@ -226,13 +385,14 @@ class ImageStorageCleanupTests(unittest.TestCase):
         if os.name == "nt":
             self.skipTest("POSIX exchange race requires a Linux filesystem")
         rel, target, digest = self._source()
+        source_identity = self._identity(rel, digest)
         alias = target.with_name("alias-during-exchange.png")
 
         def add_alias(_opened: object) -> None:
             os.link(target, alias)
 
         with patch.object(self.storage, "_before_posix_exchange", side_effect=add_alias):
-            result = self.storage.delete_verified_local(rel, digest)
+            result = self.storage.delete_verified_local(rel, digest, expected_identity=source_identity)
 
         # The ambiguous source is retained exactly where it was: the original
         # directory entry is restored and only the service's own links are
@@ -254,6 +414,7 @@ class ImageStorageCleanupTests(unittest.TestCase):
         if os.name == "nt":
             self.skipTest("POSIX exchange race requires a Linux filesystem")
         rel, target, digest = self._source()
+        source_identity = self._identity(rel, digest)
         replacement = target.with_name("replacement-during-exchange.png")
 
         def replace_entry(_opened: object) -> None:
@@ -261,40 +422,57 @@ class ImageStorageCleanupTests(unittest.TestCase):
             os.replace(replacement, target)
 
         with patch.object(self.storage, "_before_posix_exchange", side_effect=replace_entry):
-            result = self.storage.delete_verified_local(rel, digest)
-
+            result = self.storage.delete_verified_local(rel, digest, expected_identity=source_identity)
         # The racer's file is restored at the recorded name and the original
-        # inode is retained under one opaque quarantine name, which the
-        # result detail must disclose for the cleanup audit trail.
+        # inode is retained under the protected staging boundary.
         self.assertEqual(result.status, "retained")
         self.assertEqual(result.reason, "source-changed")
         self.assertTrue(target.exists())
         self.assertEqual(target.read_bytes(), b"replacement-during-exchange")
-        quarantined = [
+        staged = [
             path
-            for path in target.parent.iterdir()
-            if path.name.startswith(".genbox-retained-")
+            for path in self.protected_staging.iterdir()
+            if path.name.endswith(".staged")
         ]
-        self.assertEqual(len(quarantined), 1)
-        self.assertEqual(quarantined[0].read_bytes(), b"source-bytes")
-        self.assertIn("quarantined:", result.detail)
-        self.assertIn(quarantined[0].name, result.detail)
+        self.assertEqual(len(staged), 1)
+        self.assertEqual(staged[0].read_bytes(), b"source-bytes")
+        self.assertIn(staged[0].name, result.detail)
+
+    def test_parent_move_during_posix_exchange_drops_owned_temp_link(self) -> None:
+        if os.name == "nt":
+            self.skipTest("POSIX exchange race requires a Linux filesystem")
+        rel, target, digest = self._source()
+        source_identity = self._identity(rel, digest)
+        moved_parent = target.parent.with_name(target.parent.name + "-moved")
+
+        def move_parent(_opened: object) -> None:
+            target.parent.rename(moved_parent)
+
+        with patch.object(self.storage, "_before_posix_exchange", side_effect=move_parent):
+            result = self.storage.delete_verified_local(rel, digest, expected_identity=source_identity)
+
+        self.assertEqual(result.status, "retained")
+        self.assertEqual(result.reason, "source-parent-changed")
+        moved_source = moved_parent / target.name
+        self.assertTrue(moved_source.exists())
+        self.assertEqual(moved_source.read_bytes(), b"source-bytes")
         leftovers = [
             path.name
-            for path in target.parent.iterdir()
-            if path.name.startswith(".genbox-cleanup-")
+            for path in moved_parent.iterdir()
+            if path.name.startswith((".genbox-cleanup-", ".genbox-retained-"))
         ]
         self.assertEqual(leftovers, [])
 
     def test_hard_link_alias_is_retained(self) -> None:
         rel, target, digest = self._source()
+        source_identity = self._identity(rel, digest)
         alias = target.with_name("alias.png")
         try:
             os.link(target, alias)
         except (OSError, NotImplementedError) as exc:
             self.skipTest(f"hard links unavailable: {exc}")
 
-        result = self.storage.delete_verified_local(rel, digest)
+        result = self.storage.delete_verified_local(rel, digest, expected_identity=source_identity)
 
         self.assertEqual(result.status, "retained")
         self.assertEqual(result.reason, "path-alias")
@@ -313,7 +491,16 @@ class ImageStorageCleanupTests(unittest.TestCase):
         except (OSError, NotImplementedError) as exc:
             self.skipTest(f"directory symlinks unavailable: {exc}")
 
-        result = self.storage.delete_verified_local(rel, hashlib.sha256(b"outside-bytes").hexdigest())
+        outside_stat = (outside / "source.png").stat()
+        source_identity = {
+            "device": int(outside_stat.st_dev), "inode": int(outside_stat.st_ino),
+            "size_bytes": int(outside_stat.st_size),
+        }
+        result = self.storage.delete_verified_local(
+            rel,
+            hashlib.sha256(b"outside-bytes").hexdigest(),
+            expected_identity=source_identity,
+        )
 
         self.assertEqual(result.status, "retained")
         self.assertEqual(result.reason, "path-alias")
@@ -338,9 +525,15 @@ class ImageStorageCleanupTests(unittest.TestCase):
         if created.returncode != 0 or not alias_dir.exists():
             self.skipTest(f"junction unavailable: {created.stderr.strip() or created.stdout.strip()}")
         try:
+            outside_stat = (outside / "source.png").stat()
+            source_identity = {
+                "device": int(outside_stat.st_dev), "inode": int(outside_stat.st_ino),
+                "size_bytes": int(outside_stat.st_size),
+            }
             result = self.storage.delete_verified_local(
                 rel,
                 hashlib.sha256(b"outside-bytes").hexdigest(),
+                expected_identity=source_identity,
             )
             self.assertEqual(result.status, "retained")
             self.assertEqual(result.reason, "path-alias")
@@ -350,9 +543,10 @@ class ImageStorageCleanupTests(unittest.TestCase):
 
     def test_index_write_failure_is_delete_unknown(self) -> None:
         rel, target, digest = self._source()
+        source_identity = self._identity(rel, digest)
         self.storage._save_index({rel: {"rel": rel, "local": True, "webdav": False}})
         with patch.object(self.storage, "_save_index", side_effect=OSError("index unavailable")):
-            result = self.storage.delete_verified_local(rel, digest)
+            result = self.storage.delete_verified_local(rel, digest, expected_identity=source_identity)
 
         self.assertEqual(result.status, "delete_unknown")
         self.assertEqual(result.reason, "index-write-failed")
