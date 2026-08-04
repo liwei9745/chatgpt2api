@@ -168,9 +168,14 @@ class CleanupEnvironmentGate:
         # The capability is injected by the service launcher and is never
         # accepted from HTTP or recovered from durable cleanup state.
         self._capability = capability or ""
-        self._attestation_file = attestation_file or Path(
-            _clean(self.environ.get("CHATGPT2API_CLEANUP_ATTESTATION_FILE"))
-        ) if _clean(self.environ.get("CHATGPT2API_CLEANUP_ATTESTATION_FILE")) else None
+        configured_attestation = _clean(self.environ.get("CHATGPT2API_CLEANUP_ATTESTATION_FILE"))
+        self._attestation_file = (
+            attestation_file
+            if attestation_file is not None
+            else Path(configured_attestation)
+            if configured_attestation
+            else None
+        )
         self._storage_root_provider: Callable[[], Path] | None = None
 
     def bind_storage_root(self, provider: Callable[[], Path]) -> None:

@@ -751,6 +751,22 @@ class GenBoxPushCleanupTests(unittest.TestCase):
         self.assertEqual(result.get("blocked_reason"), "runtime-identity-unverified")
         self.assertTrue(target.exists())
 
+    def test_startup_attestation_uses_explicit_path_without_environment_override(self) -> None:
+        self.images.mkdir()
+        environment = dict(self.gate.environ)
+        environment.pop("CHATGPT2API_CLEANUP_ATTESTATION_FILE")
+        gate = CleanupEnvironmentGate(environment, attestation_file=self.attestation)
+        service = GenBoxPushCleanupService(
+            state_file=self.state,
+            audit_file=self.audit,
+            settings_file=self.settings,
+            image_storage=self.storage,
+            environment_gate=gate,
+        )
+
+        self.assertTrue(service.initialize_runtime_capability())
+        self.assertTrue(service.environment_gate.can_execute())
+
     def test_full_cloned_state_and_attestation_cannot_inherit_cleanup_authority(self) -> None:
         target = self._record()
         self._enable_policy()
