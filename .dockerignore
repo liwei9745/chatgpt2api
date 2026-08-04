@@ -30,10 +30,9 @@ standalone
 test
 tests
 docs/*.md
-scripts/test_*.py
-# The host-only cleanup tools must never be packaged with the application.
-scripts/issue_cleanup_attestation.py
-scripts/start_isolated_cleanup_runtime.py
+# Scripts are host/deployment tooling. The application image has no need for
+# them, so exclude the whole directory rather than maintaining a denylist.
+scripts/
 
 web
 web-vue/dist

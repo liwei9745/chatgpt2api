@@ -114,10 +114,41 @@ def _valid_image_digest(value: object) -> str:
     return digest
 
 
+_CGROUP_V1_LINE = re.compile(r"^[0-9]+:[^:\r\n]+:(?P<path>/[^\r\n]*)$")
+_CGROUP_V2_LINE = re.compile(r"^0::(?P<path>/[^\r\n]*)$")
+_CGROUP_CONTAINER_PATHS = (
+    re.compile(r"^/docker/(?P<id>[0-9a-f]{64})$"),
+    re.compile(r"^/system\.slice/docker-(?P<id>[0-9a-f]{64})\.scope$"),
+    re.compile(
+        r"^/kubepods\.slice/(?:kubepods-(?:besteffort|burstable)\.slice/)?"
+        r"kubepods-(?:besteffort|burstable)-pod[0-9a-f_]{36}\.slice/"
+        r"cri-containerd-(?P<id>[0-9a-f]{64})\.scope$"
+    ),
+)
+_CGROUP_ID_TOKEN = re.compile(r"(?<![0-9a-f])[0-9a-f]{64}(?![0-9a-f])")
+
+
 def _container_runtime_identity_from_cgroup(cgroup_data: str) -> str:
-    """Accept one distinct Docker ID; repeated cgroup-v1 controller rows are normal."""
-    matches = set(re.findall(r"(?<![0-9a-f])[0-9a-f]{64}(?![0-9a-f])", cgroup_data.lower()))
-    return next(iter(matches)) if len(matches) == 1 else ""
+    """Accept one ID only from known Docker/containerd cgroup path formats."""
+    if not isinstance(cgroup_data, str) or not cgroup_data:
+        return ""
+    identities: set[str] = set()
+    for raw_line in cgroup_data.splitlines():
+        line = raw_line.lower()
+        match = _CGROUP_V2_LINE.fullmatch(line) or _CGROUP_V1_LINE.fullmatch(line)
+        if match is None:
+            return ""
+        path = match.group("path")
+        path_identity = next((
+            path_match.group("id")
+            for path_pattern in _CGROUP_CONTAINER_PATHS
+            if (path_match := path_pattern.fullmatch(path)) is not None
+        ), "")
+        if _CGROUP_ID_TOKEN.search(path) and not path_identity:
+            return ""
+        if path_identity:
+            identities.add(path_identity)
+    return next(iter(identities)) if len(identities) == 1 else ""
 
 
 def _container_runtime_identity() -> str:
@@ -446,9 +477,11 @@ class CleanupEnvironmentGate:
     def reason(self) -> str:
         if self.environment_class() != "isolated-vps":
             return "development-disabled"
+        if not _bool_env(self.environ.get("CHATGPT2API_CLEANUP_EXECUTE")):
+            return "cleanup-execute-disabled"
         if not self._runtime_identity_matches():
             return "runtime-identity-unverified"
-        return "cleanup-execute-disabled"
+        return "available"
 
 
 def _atomic_json_write(path: Path, payload: object) -> None:
@@ -589,6 +622,7 @@ class GenBoxPushCleanupService:
             "enabled": self.policy_enabled(),
             "environment_class": self.environment_gate.environment_class() or "unknown",
             "execute_available": self.environment_gate.can_execute(),
+            "execute_reason": self.environment_gate.reason(),
             "default": False,
         }
 

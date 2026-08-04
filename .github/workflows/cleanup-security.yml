@@ -16,8 +16,26 @@ jobs:
             --build-arg CHATGPT2API_CLEANUP_ATTESTATION_TRUST_ANCHOR_SHA256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
             --tag cleanup-anchor-contract .
           test "$(docker run --rm --entrypoint /bin/cat cleanup-anchor-contract /app/services/cleanup_attestation_anchor.py)" = "CLEANUP_ATTESTATION_PUBLIC_KEY_SHA256 = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'"
-          ! docker run --rm --entrypoint /usr/bin/test cleanup-anchor-contract -e /app/scripts/issue_cleanup_attestation.py
-          ! docker run --rm --entrypoint /usr/bin/test cleanup-anchor-contract -e /app/scripts/start_isolated_cleanup_runtime.py
+          docker run --rm --entrypoint /bin/sh cleanup-anchor-contract -ec '
+            test ! -e /app/scripts
+            test ! -e /app/scripts/issue_cleanup_attestation.py
+            test ! -e /app/scripts/start_isolated_cleanup_runtime.py
+            ! find /app -type f \( -name "*.pem" -o -name "*.key" -o -name "*.p12" -o -name "*.pfx" \) -print -quit | grep -q .
+          '
+          docker run --rm --entrypoint python cleanup-anchor-contract -c '
+          import re
+          import sys
+          from pathlib import Path
+
+          pattern = re.compile(rb"-----BEGIN ([A-Z0-9 ]*PRIVATE KEY)-----\r?\n(?:[A-Za-z0-9+/=]+\r?\n)+-----END \1-----")
+          matches = []
+          for path in Path("/app").rglob("*"):
+              if path.is_file() and pattern.search(path.read_bytes()):
+                  matches.append(str(path))
+          if matches:
+              print("application image contains a PEM private key:\\n" + "\\n".join(matches))
+              raise SystemExit(1)
+          '
 
   cleanup-security:
     strategy:

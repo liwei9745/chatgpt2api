@@ -59,7 +59,8 @@ COPY services ./services
 # The private signing key is never copied into this image.
 RUN python -c "import re, sys; from pathlib import Path; value = sys.argv[1].strip().lower(); assert not value or re.fullmatch(r'[0-9a-f]{64}', value), 'trust anchor must be an empty value or SHA-256'; Path('services/cleanup_attestation_anchor.py').write_text(f'CLEANUP_ATTESTATION_PUBLIC_KEY_SHA256 = {value!r}\\n', encoding='ascii')" "$CHATGPT2API_CLEANUP_ATTESTATION_TRUST_ANCHOR_SHA256"
 COPY utils ./utils
-COPY scripts ./scripts
+# Host-side deployment tooling, including the cleanup issuer and launcher, is
+# intentionally absent from the application image.
 COPY --from=web-build /app/web-vue/dist ./web_dist
 
 EXPOSE 80

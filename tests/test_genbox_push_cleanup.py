@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import hashlib
+import http.client
 import json
 import multiprocessing
 import os
 import base64
+import socket
 import subprocess
 import sys
 from pathlib import Path
@@ -12,6 +14,9 @@ import tempfile
 import threading
 import time
 import unittest
+import uuid
+from urllib import error as urllib_error
+from urllib import request as urllib_request
 from contextlib import ExitStack
 from unittest.mock import patch
 
@@ -24,7 +29,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 os.environ.setdefault("CHATGPT2API_AUTH_KEY", "local-test-admin-key")
 
 from services.config import config
-from services.cleanup_attestation import canonical_attestation_bytes
+from services.cleanup_attestation import canonical_attestation_bytes, verify_attestation_signature
 from services.genbox_push_cleanup import (
     CleanupEnvironmentGate,
     GenBoxPushCleanupService,
@@ -407,6 +412,29 @@ class GenBoxPushCleanupTests(unittest.TestCase):
 
         self.assertEqual(_container_runtime_identity_from_cgroup(cgroup_data), container_id)
 
+    def test_cgroup_v1_systemd_docker_scope_is_one_runtime_identity(self) -> None:
+        container_id = "a" * 64
+        cgroup_data = (
+            "12:cpuset:/\n"
+            f"11:memory:/system.slice/docker-{container_id}.scope\n"
+            f"10:cpu,cpuacct:/system.slice/docker-{container_id}.scope\n"
+        )
+
+        self.assertEqual(_container_runtime_identity_from_cgroup(cgroup_data), container_id)
+
+    def test_cgroup_v2_docker_and_containerd_paths_are_one_runtime_identity(self) -> None:
+        docker_id = "a" * 64
+        containerd_id = "b" * 64
+        docker_cgroup = f"0::/docker/{docker_id}\n"
+        containerd_cgroup = (
+            "0::/kubepods.slice/kubepods-burstable.slice/"
+            "kubepods-burstable-pod01234567_89ab_cdef_0123_456789abcdef.slice/"
+            f"cri-containerd-{containerd_id}.scope\n"
+        )
+
+        self.assertEqual(_container_runtime_identity_from_cgroup(docker_cgroup), docker_id)
+        self.assertEqual(_container_runtime_identity_from_cgroup(containerd_cgroup), containerd_id)
+
     def test_cgroup_multiple_distinct_container_ids_fail_closed(self) -> None:
         cgroup_data = f"2:cpu:/docker/{'a' * 64}\n1:memory:/docker/{'b' * 64}\n"
 
@@ -414,6 +442,23 @@ class GenBoxPushCleanupTests(unittest.TestCase):
 
     def test_cgroup_missing_or_malformed_container_id_fails_closed(self) -> None:
         self.assertEqual(_container_runtime_identity_from_cgroup("0::/docker/not-a-container-id\n"), "")
+
+    def test_cgroup_malformed_line_with_one_container_id_fails_closed(self) -> None:
+        self.assertEqual(
+            _container_runtime_identity_from_cgroup(f"malformed cgroup payload /not/docker/{'a' * 64}\n"),
+            "",
+        )
+
+    def test_cgroup_legal_line_mixed_with_malformed_id_fails_closed(self) -> None:
+        self.assertEqual(
+            _container_runtime_identity_from_cgroup(
+                f"0::/docker/{'a' * 64}\nnot-a-cgroup /not/docker/{'b' * 64}\n"
+            ),
+            "",
+        )
+
+    def test_cgroup_unknown_path_with_one_container_id_fails_closed(self) -> None:
+        self.assertEqual(_container_runtime_identity_from_cgroup(f"0::/not/docker/{'a' * 64}\n"), "")
 
     def _write_signed_attestation(self, private_key: Ed25519PrivateKey, capability: str) -> None:
         payload = {
@@ -1049,6 +1094,49 @@ class GenBoxPushCleanupTests(unittest.TestCase):
         private_key_file = self.tmp / "launcher-private.pem"
         artifacts = self.tmp / "launcher-artifacts"
         storage_parent = self.tmp / "launcher-data"
+        artifacts.mkdir()
+        inspect_payload = {
+            "Id": container_id,
+            "Name": f"/{self.container_name}",
+            "Image": self.image_digest,
+            "Config": {
+                "Image": "registry.test/chatgpt2api@" + self.image_digest,
+                "Labels": {
+                    "com.docker.compose.project": self.compose_project,
+                    "com.docker.compose.service": "app",
+                },
+                "Env": [
+                    "CHATGPT2API_CLEANUP_ENVIRONMENT=isolated-vps",
+                    "CHATGPT2API_CLEANUP_EXECUTE=1",
+                    f"CHATGPT2API_CLEANUP_INSTANCE_ID={self.instance_id}",
+                    "CHATGPT2API_CLEANUP_INSTANCE_ROLE=isolated-development",
+                    f"CHATGPT2API_CLEANUP_STORAGE_ROOT={container_storage}",
+                    f"CHATGPT2API_CLEANUP_COMPOSE_PROJECT={self.compose_project}",
+                    f"CHATGPT2API_CLEANUP_CONTAINER_NAME={self.container_name}",
+                    f"CHATGPT2API_CLEANUP_SERVICE_PORT={self.service_port}",
+                    f"CHATGPT2API_CLEANUP_IMAGE_DIGEST={self.image_digest}",
+                    f"CHATGPT2API_CLEANUP_MARKER_SHA256={identity['marker_sha256']}",
+                    f"CHATGPT2API_CLEANUP_TRUSTED_DESTINATION_SCOPE={identity['trusted_destination_scope']}",
+                    "CHATGPT2API_CLEANUP_TRUSTED_DESTINATION_KIND=https",
+                    "CHATGPT2API_CLEANUP_TRUSTED_DESTINATION_URL=https://genbox.test",
+                    "CHATGPT2API_CLEANUP_TRUSTED_PRIVATE_HOST=genbox.test",
+                    "CHATGPT2API_CLEANUP_CAPABILITY_FILE=/run/genbox-cleanup/capability",
+                    "CHATGPT2API_CLEANUP_DEPLOYMENT_NONCE_FILE=/run/genbox-cleanup/deployment-nonce",
+                    "CHATGPT2API_CLEANUP_ATTESTATION_FILE=/run/genbox-cleanup/attestation.json",
+                    "CHATGPT2API_CLEANUP_ATTESTATION_PUBLIC_KEY_FILE=/run/genbox-cleanup/public-key.pem",
+                ],
+            },
+            "State": {"Running": False, "Status": "created"},
+            "HostConfig": {
+                "CgroupnsMode": "host",
+                "PortBindings": {"80/tcp": [{"HostPort": str(self.service_port)}]},
+            },
+            "NetworkSettings": {"Ports": {"80/tcp": [{"HostPort": str(self.service_port)}]}},
+            "Mounts": [
+                {"Type": "bind", "Source": str(artifacts.resolve()), "Destination": "/run/genbox-cleanup", "RW": False},
+                {"Type": "bind", "Source": str(storage_parent.resolve()), "Destination": "/app/data", "RW": True},
+            ],
+        }
         identity_file.write_text(json.dumps(identity), encoding="utf-8")
         private_key_file.write_bytes(self.private_key.private_bytes(
             serialization.Encoding.PEM,
@@ -1059,9 +1147,10 @@ class GenBoxPushCleanupTests(unittest.TestCase):
             "import json, os, sys\n"
             "args = sys.argv[1:]\n"
             "with open(os.environ['FAKE_DOCKER_LOG'], 'a', encoding='utf-8') as out: out.write(json.dumps(args) + '\\n')\n"
-            "if args[:2] == ['image', 'inspect']: print(os.environ.get('FAKE_DOCKER_REPO_DIGESTS', '[\\\"registry.test/chatgpt2api@sha256:' + 'a' * 64 + '\\\"]'))\n"
-            "elif args[:1] == ['create']: print('c' * 64)\n"
-            "elif args[:1] == ['inspect']: print('c' * 64)\n"
+            "if args[:2] == ['image', 'inspect'] and '{{.Id}}' in args: print('sha256:' + 'a' * 64)\n"
+            "elif args[:2] == ['image', 'inspect']: print(os.environ.get('FAKE_DOCKER_REPO_DIGESTS', '[\\\"registry.test/chatgpt2api@sha256:' + 'a' * 64 + '\\\"]'))\n"
+            "elif args[:1] == ['inspect'] and '{{.Id}}' in args: print('c' * 64)\n"
+            "elif args[:1] == ['inspect']: print(os.environ['FAKE_DOCKER_INSPECT'])\n"
             "elif args[:1] == ['start']: print('c' * 64)\n"
             "elif args[:1] == ['rm']: pass\n"
             "else: raise SystemExit(9)\n",
@@ -1074,6 +1163,7 @@ class GenBoxPushCleanupTests(unittest.TestCase):
             "registry.test/other@sha256:" + "a" * 64,
             "registry.test/chatgpt2api@sha256:" + "a" * 64,
         ])
+        launcher_environment["FAKE_DOCKER_INSPECT"] = json.dumps(inspect_payload)
         result = subprocess.run([
             sys.executable, str(launcher), "--image", "registry.test/chatgpt2api@sha256:" + "a" * 64,
             "--identity-file", str(identity_file),
@@ -1091,12 +1181,123 @@ class GenBoxPushCleanupTests(unittest.TestCase):
         self.assertTrue((artifacts / "public-key.pem").is_file())
         self.assertTrue((storage_parent / ".genbox-isolated-cleanup").is_file())
         commands = [json.loads(line) for line in docker_log.read_text(encoding="utf-8").splitlines()]
-        self.assertEqual([command[0] for command in commands], ["image", "create", "inspect", "start"])
-        create_command = commands[1]
-        self.assertIn(f"type=bind,src={artifacts.resolve()},dst=/run/genbox-cleanup,readonly", create_command)
-        self.assertNotIn(str(private_key_file), create_command)
-        self.assertIn("33010:80", create_command)
-        self.assertIn("CHATGPT2API_CLEANUP_TRUSTED_DESTINATION_URL=https://genbox.test", create_command)
+        self.assertEqual([command[0] for command in commands], ["image", "inspect", "image", "inspect", "start"])
+        self.assertIn("{{json .}}", commands[3])
+        self.assertIn("{{.Id}}", commands[1])
+        self.assertIn("{{.Id}}", commands[2])
+        self.assertNotIn(str(private_key_file), json.dumps(inspect_payload))
+
+    def test_host_launcher_rejects_inspect_contract_mismatches_and_cleans_host_artifacts(self) -> None:
+        launcher = Path(__file__).resolve().parents[1] / "scripts" / "start_isolated_cleanup_runtime.py"
+        fake_docker = self.tmp / "inspect-contract-docker.py"
+        docker_log = self.tmp / "inspect-contract.jsonl"
+        container_id = "c" * 64
+        storage_root = "/app/data/images"
+        marker = {
+            "version": 1, "instance_id": self.instance_id, "role": "isolated-development",
+            "storage_root": storage_root, "compose_project": self.compose_project,
+            "container_name": self.container_name, "service_port": self.service_port,
+            "image_digest": self.image_digest,
+        }
+        identity = {
+            **{key: value for key, value in marker.items() if key != "version"},
+            "marker_sha256": hashlib.sha256(
+                json.dumps(marker, separators=(",", ":"), sort_keys=True).encode("utf-8")
+            ).hexdigest(),
+            "trusted_destination_scope": self._scope(),
+        }
+        identity_file = self.tmp / "inspect-contract-identity.json"
+        private_key_file = self.tmp / "inspect-contract-private.pem"
+        identity_file.write_text(json.dumps(identity), encoding="utf-8")
+        private_key_file.write_bytes(self.private_key.private_bytes(
+            serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8, serialization.NoEncryption(),
+        ))
+        fake_docker.write_text(
+            "import json, os, sys\n"
+            "args = sys.argv[1:]\n"
+            "with open(os.environ['FAKE_DOCKER_LOG'], 'a', encoding='utf-8') as out: out.write(json.dumps(args) + '\\n')\n"
+            "if args[:2] == ['image', 'inspect'] and '{{.Id}}' in args: print('sha256:' + 'a' * 64)\n"
+            "elif args[:2] == ['image', 'inspect']: print(os.environ['FAKE_DOCKER_REPO_DIGESTS'])\n"
+            "elif args[:1] == ['inspect'] and '{{.Id}}' in args: print('c' * 64)\n"
+            "elif args[:1] == ['inspect']: print(os.environ['FAKE_DOCKER_INSPECT'])\n"
+            "elif args[:1] == ['start']: raise SystemExit(8)\n"
+            "else: raise SystemExit(9)\n",
+            encoding="utf-8",
+        )
+        mutations = {
+            "missing-compose-label": lambda value: value["Config"]["Labels"].pop("com.docker.compose.project"),
+            "wrong-compose-label": lambda value: value["Config"]["Labels"].update({"com.docker.compose.project": "other"}),
+            "wrong-container-name": lambda value: value.update({"Name": "/other"}),
+            "wrong-image-id": lambda value: value.update({"Image": "sha256:" + "b" * 64}),
+            "artifact-mount-writable": lambda value: value["Mounts"][0].update({"RW": True}),
+            "wrong-storage-mount": lambda value: value["Mounts"][1].update({"Source": str((self.tmp / "other").resolve())}),
+        }
+        for name, mutate in mutations.items():
+            with self.subTest(name=name):
+                artifacts = self.tmp / f"inspect-artifacts-{name}"
+                storage_parent = self.tmp / f"inspect-data-{name}"
+                artifacts.mkdir()
+                expected_env = [
+                    "CHATGPT2API_CLEANUP_ENVIRONMENT=isolated-vps",
+                    "CHATGPT2API_CLEANUP_EXECUTE=1",
+                    f"CHATGPT2API_CLEANUP_INSTANCE_ID={self.instance_id}",
+                    "CHATGPT2API_CLEANUP_INSTANCE_ROLE=isolated-development",
+                    f"CHATGPT2API_CLEANUP_STORAGE_ROOT={storage_root}",
+                    f"CHATGPT2API_CLEANUP_COMPOSE_PROJECT={self.compose_project}",
+                    f"CHATGPT2API_CLEANUP_CONTAINER_NAME={self.container_name}",
+                    f"CHATGPT2API_CLEANUP_SERVICE_PORT={self.service_port}",
+                    f"CHATGPT2API_CLEANUP_IMAGE_DIGEST={self.image_digest}",
+                    f"CHATGPT2API_CLEANUP_MARKER_SHA256={identity['marker_sha256']}",
+                    f"CHATGPT2API_CLEANUP_TRUSTED_DESTINATION_SCOPE={identity['trusted_destination_scope']}",
+                    "CHATGPT2API_CLEANUP_TRUSTED_DESTINATION_KIND=https",
+                    "CHATGPT2API_CLEANUP_TRUSTED_DESTINATION_URL=https://genbox.test",
+                    "CHATGPT2API_CLEANUP_TRUSTED_PRIVATE_HOST=genbox.test",
+                    "CHATGPT2API_CLEANUP_CAPABILITY_FILE=/run/genbox-cleanup/capability",
+                    "CHATGPT2API_CLEANUP_DEPLOYMENT_NONCE_FILE=/run/genbox-cleanup/deployment-nonce",
+                    "CHATGPT2API_CLEANUP_ATTESTATION_FILE=/run/genbox-cleanup/attestation.json",
+                    "CHATGPT2API_CLEANUP_ATTESTATION_PUBLIC_KEY_FILE=/run/genbox-cleanup/public-key.pem",
+                ]
+                inspection = {
+                    "Id": container_id, "Name": f"/{self.container_name}", "Image": self.image_digest,
+                    "State": {"Running": False, "Status": "created"},
+                    "HostConfig": {
+                        "CgroupnsMode": "host",
+                        "PortBindings": {"80/tcp": [{"HostPort": str(self.service_port)}]},
+                    },
+                    "Config": {
+                        "Image": "registry.test/chatgpt2api@" + self.image_digest,
+                        "Labels": {"com.docker.compose.project": self.compose_project},
+                        "Env": expected_env,
+                    },
+                    "NetworkSettings": {"Ports": {"80/tcp": [{"HostPort": str(self.service_port)}]}},
+                    "Mounts": [
+                        {"Type": "bind", "Source": str(artifacts.resolve()), "Destination": "/run/genbox-cleanup", "RW": False},
+                        {"Type": "bind", "Source": str(storage_parent.resolve()), "Destination": "/app/data", "RW": True},
+                    ],
+                }
+                mutate(inspection)
+                environment = dict(os.environ)
+                environment.pop("PYTHONPATH", None)
+                environment.update({
+                    "FAKE_DOCKER_LOG": str(docker_log),
+                    "FAKE_DOCKER_REPO_DIGESTS": json.dumps(["registry.test/chatgpt2api@sha256:" + "a" * 64]),
+                    "FAKE_DOCKER_INSPECT": json.dumps(inspection),
+                })
+                result = subprocess.run([
+                    sys.executable, str(launcher), "--image", "registry.test/chatgpt2api@sha256:" + "a" * 64,
+                    "--identity-file", str(identity_file), "--private-key-file", str(private_key_file),
+                    "--artifact-dir", str(artifacts), "--storage-parent-host", str(storage_parent),
+                    "--trusted-destination-kind", "https", "--trusted-destination-url", "https://genbox.test",
+                    "--trusted-private-host", "genbox.test", "--docker-command", sys.executable, str(fake_docker),
+                ], cwd=self.tmp, env=environment, capture_output=True, text=True)
+
+                self.assertNotEqual(result.returncode, 0)
+                self.assertTrue(artifacts.is_dir())
+                self.assertEqual(list(artifacts.iterdir()), [])
+                self.assertFalse((storage_parent / ".genbox-isolated-cleanup").exists())
+                commands = [json.loads(line) for line in docker_log.read_text(encoding="utf-8").splitlines()]
+                self.assertNotIn("start", [command[0] for command in commands])
+                docker_log.unlink()
 
     def test_host_launcher_rejects_other_repository_digest_with_same_hash(self) -> None:
         launcher = Path(__file__).resolve().parents[1] / "scripts" / "start_isolated_cleanup_runtime.py"
@@ -1616,6 +1817,65 @@ class GenBoxPushCleanupTests(unittest.TestCase):
         self.assertEqual(recovered["decision_reason"], "interrupted-before-delete")
         self.assertTrue(target.exists())
 
+    def test_application_lifespan_loads_only_external_cleanup_capability(self) -> None:
+        """Keep capability loading covered without paying for a Docker rebuild."""
+        self.images.mkdir(exist_ok=True)
+        uninitialized_gate = CleanupEnvironmentGate(
+            dict(self.gate.environ),
+            attestation_file=self.attestation,
+            public_key_file=self.public_key,
+            trusted_public_key_sha256=self.trusted_public_key_sha256,
+            deployment_nonce_file=self.deployment_nonce_file,
+            runtime_binding_provider=lambda: self.runtime_binding,
+        )
+        service = GenBoxPushCleanupService(
+            state_file=self.state,
+            audit_file=self.audit,
+            settings_file=self.settings,
+            image_storage=self.storage,
+            environment_gate=uninitialized_gate,
+        )
+        with ExitStack() as stack:
+            for target_name in (
+                "genbox_push_outbox.resume",
+                "genbox_push_batch_service.resume",
+                "genbox_push_schedule_service.resume",
+                "account_service.cleanup_auto_remove_accounts",
+                "backup_service.start",
+                "backup_service.stop",
+                "config.cleanup_old_images",
+                "cleanup_old_logs",
+                "dashboard_metrics_service.flush",
+                "genbox_push_schedule_service.stop",
+            ):
+                stack.enter_context(patch(f"api.app.{target_name}"))
+            for target_name in (
+                "start_limited_account_watcher",
+                "start_image_cleanup_scheduler",
+                "start_log_cleanup_scheduler",
+            ):
+                stack.enter_context(patch(f"api.app.{target_name}", return_value=_NoopThread()))
+            stack.enter_context(patch("api.app.genbox_push_cleanup_service", service))
+            stack.enter_context(patch("api.genbox_push.genbox_push_cleanup_service", service))
+            from api.app import create_app
+
+            with TestClient(create_app()) as client:
+                response = client.get(
+                    "/api/genbox-push/cleanup/settings",
+                    headers={"Authorization": "Bearer local-test-admin-key"},
+                )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(
+            response.json()["settings"]["execute_available"],
+            {
+                "settings": response.json()["settings"],
+                "capability_length": len(service.environment_gate._capability),
+                "initialized_gate": service.environment_gate.can_execute(),
+            },
+        )
+        self.assertEqual(response.json()["settings"]["execute_reason"], "available")
+
     def test_application_lifespan_recovery_audit_failure_persists_terminal_unknown(self) -> None:
         target = self._record()
         records = json.loads(self.state.read_text(encoding="utf-8"))["records"]
@@ -1951,6 +2211,562 @@ class GenBoxPushCleanupTests(unittest.TestCase):
 
         self.assertTrue(target.exists())
         self.assertEqual(result.get("blocked_reason"), "runtime-identity-unverified")
+
+    def test_host_launcher_retains_an_existing_marker_when_it_refuses_to_start(self) -> None:
+        launcher = Path(__file__).resolve().parents[1] / "scripts" / "start_isolated_cleanup_runtime.py"
+        digest = "a" * 64
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            temporary = Path(temporary_directory)
+            storage_parent = temporary / "storage"
+            storage_parent.mkdir()
+            marker_payload = {
+                "version": 1,
+                "instance_id": "isolated-a9",
+                "role": "isolated-development",
+                "storage_root": "/app/data/images",
+                "compose_project": "phase6-a9",
+                "container_name": "phase6-a9-app",
+                "service_port": 33010,
+                "image_digest": f"sha256:{digest}",
+            }
+            marker_bytes = json.dumps(marker_payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
+            marker = storage_parent / ".genbox-isolated-cleanup"
+            marker.write_bytes(marker_bytes)
+            identity = {
+                **{key: value for key, value in marker_payload.items() if key != "version"},
+                "marker_sha256": hashlib.sha256(marker_bytes).hexdigest(),
+                "trusted_destination_scope": "b" * 64,
+            }
+            identity_file = temporary / "identity.json"
+            identity_file.write_text(json.dumps(identity), encoding="utf-8")
+            private_key = temporary / "private-key.pem"
+            private_key.write_text("unused because the existing marker blocks startup", encoding="ascii")
+            artifacts = temporary / "artifacts"
+            artifacts.mkdir()
+            fake_docker = temporary / "docker.py"
+            fake_docker.write_text(
+                "import json, sys\n"
+                "if sys.argv[1:3] == ['image', 'inspect']:\n"
+                f"    print(json.dumps(['registry.test/chatgpt2api@sha256:{digest}']))\n"
+                "else:\n"
+                "    raise SystemExit(9)\n",
+                encoding="utf-8",
+            )
+
+            result = subprocess.run([
+                sys.executable, str(launcher), "--image", f"registry.test/chatgpt2api@sha256:{digest}",
+                "--identity-file", str(identity_file), "--private-key-file", str(private_key),
+                "--artifact-dir", str(artifacts), "--storage-parent-host", str(storage_parent),
+                "--trusted-destination-kind", "https", "--trusted-destination-url", "https://genbox.test",
+                "--trusted-private-host", "genbox.test", "--docker-command", sys.executable, str(fake_docker),
+            ], cwd=temporary, env={key: value for key, value in os.environ.items() if key != "PYTHONPATH"},
+                capture_output=True, text=True)
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(marker.read_bytes(), marker_bytes)
+            self.assertTrue(artifacts.is_dir())
+            self.assertEqual(list(artifacts.iterdir()), [])
+
+    def test_linux_compose_launcher_binds_real_cgroup_and_read_only_artifacts(self) -> None:
+        """Exercise the launcher against a local Linux Docker Compose container only."""
+        if os.environ.get("GENBOX_A9_DOCKER_INTEGRATION") != "1":
+            self.skipTest("set GENBOX_A9_DOCKER_INTEGRATION=1 to run local Docker integration")
+        try:
+            server_os = json.loads(subprocess.run(
+                ["docker", "version", "--format", "{{json .Server}}"],
+                check=True, capture_output=True, text=True,
+            ).stdout).get("Os")
+        except (json.JSONDecodeError, subprocess.CalledProcessError):
+            self.skipTest("local Docker engine is unavailable")
+        if server_os != "linux":
+            self.skipTest("requires a local Linux Docker engine")
+
+        image_digest = "sha256:ff602c575b3bcabae24f73ef079582ff147cf25c3506dddb9b190f04fe67e5ac"
+        image = f"ghcr.io/liwei9745/chatgpt2api-genbox-p5@{image_digest}"
+        try:
+            repository_digests = json.loads(subprocess.run(
+                ["docker", "image", "inspect", "--format", "{{json .RepoDigests}}", image],
+                check=True, capture_output=True, text=True,
+            ).stdout)
+        except (json.JSONDecodeError, subprocess.CalledProcessError):
+            self.skipTest("required local immutable test image is unavailable")
+        if image not in repository_digests:
+            self.skipTest("local test image does not retain its immutable repository digest")
+
+        launcher = Path(__file__).resolve().parents[1] / "scripts" / "start_isolated_cleanup_runtime.py"
+        token = uuid.uuid4().hex[:12]
+        compose_project = f"p6a9{token}"
+        container_name = f"p6a9-{token}"
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as reserved_port:
+            reserved_port.bind(("127.0.0.1", 0))
+            service_port = reserved_port.getsockname()[1]
+        with tempfile.TemporaryDirectory(prefix=f"{compose_project}-") as temporary_directory:
+            temporary = Path(temporary_directory)
+            artifact_dir = temporary / "artifacts"
+            storage_parent = temporary / "storage"
+            artifact_dir.mkdir()
+            storage_parent.mkdir()
+            marker_payload = {
+                "version": 1,
+                "instance_id": f"isolated-{token}",
+                "role": "isolated-development",
+                "storage_root": "/app/data/images",
+                "compose_project": compose_project,
+                "container_name": container_name,
+                "service_port": service_port,
+                "image_digest": image_digest,
+            }
+            marker_bytes = json.dumps(marker_payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
+            identity = {
+                **{key: value for key, value in marker_payload.items() if key != "version"},
+                "marker_sha256": hashlib.sha256(marker_bytes).hexdigest(),
+                "trusted_destination_scope": hashlib.sha256(b"https://genbox.test").hexdigest(),
+            }
+            identity_file = temporary / "identity.json"
+            private_key_file = temporary / "launcher-private.pem"
+            compose_file = temporary / "compose.json"
+            identity_file.write_text(json.dumps(identity), encoding="utf-8")
+            private_key_file.write_bytes(self.private_key.private_bytes(
+                serialization.Encoding.PEM,
+                serialization.PrivateFormat.PKCS8,
+                serialization.NoEncryption(),
+            ))
+            environment = {
+                "CHATGPT2API_CLEANUP_ENVIRONMENT": "isolated-vps",
+                "CHATGPT2API_CLEANUP_EXECUTE": "1",
+                "CHATGPT2API_CLEANUP_INSTANCE_ID": str(identity["instance_id"]),
+                "CHATGPT2API_CLEANUP_INSTANCE_ROLE": "isolated-development",
+                "CHATGPT2API_CLEANUP_STORAGE_ROOT": "/app/data/images",
+                "CHATGPT2API_CLEANUP_COMPOSE_PROJECT": compose_project,
+                "CHATGPT2API_CLEANUP_CONTAINER_NAME": container_name,
+                "CHATGPT2API_CLEANUP_SERVICE_PORT": str(service_port),
+                "CHATGPT2API_CLEANUP_IMAGE_DIGEST": image_digest,
+                "CHATGPT2API_CLEANUP_MARKER_SHA256": str(identity["marker_sha256"]),
+                "CHATGPT2API_CLEANUP_TRUSTED_DESTINATION_SCOPE": str(identity["trusted_destination_scope"]),
+                "CHATGPT2API_CLEANUP_TRUSTED_DESTINATION_KIND": "https",
+                "CHATGPT2API_CLEANUP_TRUSTED_DESTINATION_URL": "https://genbox.test",
+                "CHATGPT2API_CLEANUP_TRUSTED_PRIVATE_HOST": "genbox.test",
+                "CHATGPT2API_CLEANUP_CAPABILITY_FILE": "/run/genbox-cleanup/capability",
+                "CHATGPT2API_CLEANUP_DEPLOYMENT_NONCE_FILE": "/run/genbox-cleanup/deployment-nonce",
+                "CHATGPT2API_CLEANUP_ATTESTATION_FILE": "/run/genbox-cleanup/attestation.json",
+                "CHATGPT2API_CLEANUP_ATTESTATION_PUBLIC_KEY_FILE": "/run/genbox-cleanup/public-key.pem",
+            }
+            compose_file.write_text(json.dumps({
+                "services": {
+                    "app": {
+                        "image": image,
+                        "container_name": container_name,
+                        "cgroup": "host",
+                        "entrypoint": ["python", "-c"],
+                        "command": ["import time; time.sleep(60)"],
+                        "environment": environment,
+                        "ports": [f"127.0.0.1:{service_port}:80"],
+                        "volumes": [
+                            {"type": "bind", "source": str(artifact_dir), "target": "/run/genbox-cleanup", "read_only": True},
+                            {"type": "bind", "source": str(storage_parent), "target": "/app/data", "read_only": False},
+                        ],
+                    },
+                },
+            }), encoding="utf-8")
+            compose_command = ["docker", "compose", "--project-name", compose_project, "--file", str(compose_file)]
+            try:
+                subprocess.run([*compose_command, "create"], check=True, capture_output=True, text=True)
+                created = json.loads(subprocess.run(
+                    ["docker", "inspect", "--format", "{{json .}}", container_name],
+                    check=True, capture_output=True, text=True,
+                ).stdout)
+                self.assertEqual(created["State"]["Status"], "created")
+                self.assertFalse(created["State"]["Running"])
+
+                result = subprocess.run([
+                    sys.executable, str(launcher), "--image", image,
+                    "--identity-file", str(identity_file), "--private-key-file", str(private_key_file),
+                    "--artifact-dir", str(artifact_dir), "--storage-parent-host", str(storage_parent),
+                    "--trusted-destination-kind", "https", "--trusted-destination-url", "https://genbox.test",
+                    "--trusted-private-host", "genbox.test",
+                ], cwd=temporary, env={key: value for key, value in os.environ.items() if key != "PYTHONPATH"},
+                    capture_output=True, text=True)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                runtime_id = result.stdout.strip()
+                self.assertRegex(runtime_id, r"^[0-9a-f]{64}$")
+
+                cgroup = subprocess.run(
+                    ["docker", "exec", container_name, "cat", "/proc/self/cgroup"],
+                    check=True, capture_output=True, text=True,
+                ).stdout
+                self.assertEqual(_container_runtime_identity_from_cgroup(cgroup), runtime_id)
+                self.assertNotEqual(subprocess.run(
+                    ["docker", "exec", container_name, "sh", "-c", "test -w /run/genbox-cleanup"],
+                    capture_output=True, text=True,
+                ).returncode, 0)
+                attestation = json.loads((artifact_dir / "attestation.json").read_text(encoding="utf-8"))
+                self.assertEqual(attestation["runtime_binding"], runtime_id)
+                self.assertEqual(attestation["deployment_nonce_sha256"], hashlib.sha256(
+                    (artifact_dir / "deployment-nonce").read_bytes()
+                ).hexdigest())
+                self.assertTrue(verify_attestation_signature(attestation, (artifact_dir / "public-key.pem").read_bytes()))
+            finally:
+                subprocess.run([*compose_command, "down", "--remove-orphans"], capture_output=True, text=True)
+
+    def test_linux_compose_launcher_refuses_real_contract_replacements(self) -> None:
+        """A real stopped Compose container must not start after any bound field changes."""
+        if os.environ.get("GENBOX_A9_DOCKER_INTEGRATION") != "1":
+            self.skipTest("set GENBOX_A9_DOCKER_INTEGRATION=1 to run local Docker integration")
+        try:
+            server_os = json.loads(subprocess.run(
+                ["docker", "version", "--format", "{{json .Server}}"],
+                check=True, capture_output=True, text=True,
+            ).stdout).get("Os")
+            subprocess.run(["docker", "image", "inspect", "python:3.13-slim"], check=True, capture_output=True)
+        except (json.JSONDecodeError, subprocess.CalledProcessError):
+            self.skipTest("local Linux Docker engine or replacement image is unavailable")
+        if server_os != "linux":
+            self.skipTest("requires a local Linux Docker engine")
+
+        image_digest = "sha256:ff602c575b3bcabae24f73ef079582ff147cf25c3506dddb9b190f04fe67e5ac"
+        image = f"ghcr.io/liwei9745/chatgpt2api-genbox-p5@{image_digest}"
+        try:
+            repository_digests = json.loads(subprocess.run(
+                ["docker", "image", "inspect", "--format", "{{json .RepoDigests}}", image],
+                check=True, capture_output=True, text=True,
+            ).stdout)
+        except (json.JSONDecodeError, subprocess.CalledProcessError):
+            self.skipTest("required local immutable test image is unavailable")
+        if image not in repository_digests:
+            self.skipTest("local test image does not retain its immutable repository digest")
+
+        launcher = Path(__file__).resolve().parents[1] / "scripts" / "start_isolated_cleanup_runtime.py"
+        for replacement in (
+            "compose-project", "container-name", "image", "port", "writable-artifacts", "storage-root", "replayed-artifacts",
+        ):
+            with self.subTest(replacement=replacement), tempfile.TemporaryDirectory(prefix=f"p6a9-{replacement}-") as temporary_directory:
+                temporary = Path(temporary_directory)
+                token = uuid.uuid4().hex[:12]
+                expected_project = f"p6a9{token}"
+                actual_project = f"{expected_project}x" if replacement == "compose-project" else expected_project
+                expected_name = f"p6a9-{token}"
+                actual_name = f"{expected_name}-other" if replacement == "container-name" else expected_name
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as reserved_port:
+                    reserved_port.bind(("127.0.0.1", 0))
+                    expected_port = reserved_port.getsockname()[1]
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as reserved_port:
+                    reserved_port.bind(("127.0.0.1", 0))
+                    actual_port = reserved_port.getsockname()[1] if replacement == "port" else expected_port
+                artifact_dir = temporary / "artifacts"
+                expected_storage = temporary / "storage"
+                actual_storage = temporary / "other-storage" if replacement == "storage-root" else expected_storage
+                artifact_dir.mkdir()
+                expected_storage.mkdir()
+                actual_storage.mkdir(exist_ok=True)
+                if replacement == "replayed-artifacts":
+                    (artifact_dir / "capability").write_text("copied-old-capability\n", encoding="ascii")
+                marker_payload = {
+                    "version": 1,
+                    "instance_id": f"isolated-{token}",
+                    "role": "isolated-development",
+                    "storage_root": "/app/data/images",
+                    "compose_project": expected_project,
+                    "container_name": expected_name,
+                    "service_port": expected_port,
+                    "image_digest": image_digest,
+                }
+                marker_bytes = json.dumps(marker_payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
+                identity = {
+                    **{key: value for key, value in marker_payload.items() if key != "version"},
+                    "marker_sha256": hashlib.sha256(marker_bytes).hexdigest(),
+                    "trusted_destination_scope": hashlib.sha256(b"https://genbox.test").hexdigest(),
+                }
+                identity_file = temporary / "identity.json"
+                private_key_file = temporary / "launcher-private.pem"
+                compose_file = temporary / "compose.json"
+                identity_file.write_text(json.dumps(identity), encoding="utf-8")
+                private_key_file.write_bytes(self.private_key.private_bytes(
+                    serialization.Encoding.PEM,
+                    serialization.PrivateFormat.PKCS8,
+                    serialization.NoEncryption(),
+                ))
+                environment = {
+                    "CHATGPT2API_CLEANUP_ENVIRONMENT": "isolated-vps",
+                    "CHATGPT2API_CLEANUP_EXECUTE": "1",
+                    "CHATGPT2API_CLEANUP_INSTANCE_ID": str(identity["instance_id"]),
+                    "CHATGPT2API_CLEANUP_INSTANCE_ROLE": "isolated-development",
+                    "CHATGPT2API_CLEANUP_STORAGE_ROOT": "/app/data/images",
+                    "CHATGPT2API_CLEANUP_COMPOSE_PROJECT": expected_project,
+                    "CHATGPT2API_CLEANUP_CONTAINER_NAME": expected_name,
+                    "CHATGPT2API_CLEANUP_SERVICE_PORT": str(expected_port),
+                    "CHATGPT2API_CLEANUP_IMAGE_DIGEST": image_digest,
+                    "CHATGPT2API_CLEANUP_MARKER_SHA256": str(identity["marker_sha256"]),
+                    "CHATGPT2API_CLEANUP_TRUSTED_DESTINATION_SCOPE": str(identity["trusted_destination_scope"]),
+                    "CHATGPT2API_CLEANUP_TRUSTED_DESTINATION_KIND": "https",
+                    "CHATGPT2API_CLEANUP_TRUSTED_DESTINATION_URL": "https://genbox.test",
+                    "CHATGPT2API_CLEANUP_TRUSTED_PRIVATE_HOST": "genbox.test",
+                    "CHATGPT2API_CLEANUP_CAPABILITY_FILE": "/run/genbox-cleanup/capability",
+                    "CHATGPT2API_CLEANUP_DEPLOYMENT_NONCE_FILE": "/run/genbox-cleanup/deployment-nonce",
+                    "CHATGPT2API_CLEANUP_ATTESTATION_FILE": "/run/genbox-cleanup/attestation.json",
+                    "CHATGPT2API_CLEANUP_ATTESTATION_PUBLIC_KEY_FILE": "/run/genbox-cleanup/public-key.pem",
+                }
+                compose_file.write_text(json.dumps({
+                    "services": {
+                        "app": {
+                            "image": "python:3.13-slim" if replacement == "image" else image,
+                            "container_name": actual_name,
+                            "cgroup": "host",
+                            "entrypoint": ["python", "-c"],
+                            "command": ["import time; time.sleep(60)"],
+                            "environment": environment,
+                            "ports": [f"127.0.0.1:{actual_port}:80"],
+                            "volumes": [
+                                {
+                                    "type": "bind", "source": str(artifact_dir), "target": "/run/genbox-cleanup",
+                                    "read_only": replacement != "writable-artifacts",
+                                },
+                                {"type": "bind", "source": str(actual_storage), "target": "/app/data", "read_only": False},
+                            ],
+                        },
+                    },
+                }), encoding="utf-8")
+                compose_command = ["docker", "compose", "--project-name", actual_project, "--file", str(compose_file)]
+                try:
+                    subprocess.run([*compose_command, "create"], check=True, capture_output=True, text=True)
+                    result = subprocess.run([
+                        sys.executable, str(launcher), "--image", image,
+                        "--identity-file", str(identity_file), "--private-key-file", str(private_key_file),
+                        "--artifact-dir", str(artifact_dir), "--storage-parent-host", str(expected_storage),
+                        "--trusted-destination-kind", "https", "--trusted-destination-url", "https://genbox.test",
+                        "--trusted-private-host", "genbox.test",
+                    ], cwd=temporary, env={key: value for key, value in os.environ.items() if key != "PYTHONPATH"},
+                        capture_output=True, text=True)
+                    self.assertNotEqual(result.returncode, 0, replacement)
+                    actual_state = json.loads(subprocess.run(
+                        ["docker", "inspect", "--format", "{{json .State}}", actual_name],
+                        check=True, capture_output=True, text=True,
+                    ).stdout)
+                    self.assertEqual(actual_state["Status"], "created", replacement)
+                    self.assertFalse(actual_state["Running"], replacement)
+                    if replacement == "replayed-artifacts":
+                        self.assertEqual((artifact_dir / "capability").read_text(encoding="ascii"), "copied-old-capability\n")
+                    else:
+                        self.assertEqual(list(artifact_dir.iterdir()), [], replacement)
+                finally:
+                    subprocess.run([*compose_command, "down", "--remove-orphans"], capture_output=True, text=True)
+
+    def test_linux_fastapi_settings_reflects_external_attestation_and_tampering(self) -> None:
+        """Start the final Compose container once, then prove its live settings gate is dynamic."""
+        if os.environ.get("GENBOX_A9_FASTAPI_DOCKER_INTEGRATION") != "1":
+            self.skipTest("set GENBOX_A9_FASTAPI_DOCKER_INTEGRATION=1 to run local FastAPI Docker integration")
+        try:
+            server_os = json.loads(subprocess.run(
+                ["docker", "version", "--format", "{{json .Server}}"],
+                check=True, capture_output=True, text=True,
+            ).stdout).get("Os")
+        except (json.JSONDecodeError, subprocess.CalledProcessError):
+            self.skipTest("local Docker engine is unavailable")
+        if server_os != "linux":
+            self.skipTest("requires a local Linux Docker engine")
+
+        token = uuid.uuid4().hex[:12]
+        image_tag = f"chatgpt2api:a9-fastapi-{token}"
+        compose_project = f"p6a9{token}"
+        container_name = f"p6a9-{token}"
+        auth_key = f"phase6-local-{token}"
+        public_key = self.private_key.public_key().public_bytes(
+            serialization.Encoding.PEM,
+            serialization.PublicFormat.SubjectPublicKeyInfo,
+        )
+        trust_anchor = hashlib.sha256(public_key).hexdigest()
+        issuer = Path(__file__).resolve().parents[1] / "scripts" / "issue_cleanup_attestation.py"
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as reserved_port:
+            reserved_port.bind(("127.0.0.1", 0))
+            service_port = reserved_port.getsockname()[1]
+        with tempfile.TemporaryDirectory(prefix=f"{compose_project}-") as temporary_directory:
+            temporary = Path(temporary_directory)
+            artifact_dir = temporary / "artifacts"
+            storage_parent = temporary / "storage"
+            artifact_dir.mkdir()
+            storage_parent.mkdir()
+            (storage_parent / "images").mkdir()
+            identity_file = temporary / "identity.json"
+            private_key_file = temporary / "launcher-private.pem"
+            compose_file = temporary / "compose.json"
+            built_image = False
+            compose_command: list[str] | None = None
+            try:
+                subprocess.run([
+                    "docker", "build", "--target", "app", "--tag", image_tag,
+                    "--build-arg", f"CHATGPT2API_CLEANUP_ATTESTATION_TRUST_ANCHOR_SHA256={trust_anchor}", ".",
+                ], cwd=Path(__file__).resolve().parents[1], check=True, capture_output=True, text=True)
+                built_image = True
+                image_digest = subprocess.run(
+                    ["docker", "image", "inspect", "--format", "{{.Id}}", image_tag],
+                    check=True, capture_output=True, text=True,
+                ).stdout.strip().lower()
+                self.assertRegex(image_digest, r"^sha256:[0-9a-f]{64}$")
+                marker_payload = {
+                    "version": 1,
+                    "instance_id": f"isolated-{token}",
+                    "role": "isolated-development",
+                    "storage_root": "/app/data/images",
+                    "compose_project": compose_project,
+                    "container_name": container_name,
+                    "service_port": service_port,
+                    "image_digest": image_digest,
+                }
+                marker_bytes = json.dumps(marker_payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
+                identity = {
+                    **{key: value for key, value in marker_payload.items() if key != "version"},
+                    "marker_sha256": hashlib.sha256(marker_bytes).hexdigest(),
+                    "trusted_destination_scope": hashlib.sha256(b"https://genbox.test").hexdigest(),
+                }
+                (storage_parent / ".genbox-isolated-cleanup").write_bytes(marker_bytes)
+                identity_file.write_text(json.dumps(identity), encoding="utf-8")
+                private_key_file.write_bytes(self.private_key.private_bytes(
+                    serialization.Encoding.PEM,
+                    serialization.PrivateFormat.PKCS8,
+                    serialization.NoEncryption(),
+                ))
+                environment = {
+                    "CHATGPT2API_AUTH_KEY": auth_key,
+                    "CHATGPT2API_CLEANUP_ENVIRONMENT": "isolated-vps",
+                    "CHATGPT2API_CLEANUP_EXECUTE": "1",
+                    "CHATGPT2API_CLEANUP_INSTANCE_ID": str(identity["instance_id"]),
+                    "CHATGPT2API_CLEANUP_INSTANCE_ROLE": "isolated-development",
+                    "CHATGPT2API_CLEANUP_STORAGE_ROOT": "/app/data/images",
+                    "CHATGPT2API_CLEANUP_COMPOSE_PROJECT": compose_project,
+                    "CHATGPT2API_CLEANUP_CONTAINER_NAME": container_name,
+                    "CHATGPT2API_CLEANUP_SERVICE_PORT": str(service_port),
+                    "CHATGPT2API_CLEANUP_IMAGE_DIGEST": image_digest,
+                    "CHATGPT2API_CLEANUP_MARKER_SHA256": str(identity["marker_sha256"]),
+                    "CHATGPT2API_CLEANUP_TRUSTED_DESTINATION_SCOPE": str(identity["trusted_destination_scope"]),
+                    "CHATGPT2API_CLEANUP_TRUSTED_DESTINATION_KIND": "https",
+                    "CHATGPT2API_CLEANUP_TRUSTED_DESTINATION_URL": "https://genbox.test",
+                    "CHATGPT2API_CLEANUP_TRUSTED_PRIVATE_HOST": "genbox.test",
+                    "CHATGPT2API_CLEANUP_CAPABILITY_FILE": "/run/genbox-cleanup/capability",
+                    "CHATGPT2API_CLEANUP_DEPLOYMENT_NONCE_FILE": "/run/genbox-cleanup/deployment-nonce",
+                    "CHATGPT2API_CLEANUP_ATTESTATION_FILE": "/run/genbox-cleanup/attestation.json",
+                    "CHATGPT2API_CLEANUP_ATTESTATION_PUBLIC_KEY_FILE": "/run/genbox-cleanup/public-key.pem",
+                }
+                compose_file.write_text(json.dumps({
+                    "services": {
+                        "app": {
+                            "image": image_tag,
+                            "container_name": container_name,
+                            "cgroup": "host",
+                            "environment": environment,
+                            "ports": [f"127.0.0.1:{service_port}:80"],
+                            "volumes": [
+                                {"type": "bind", "source": str(artifact_dir), "target": "/run/genbox-cleanup", "read_only": True},
+                                {"type": "bind", "source": str(storage_parent), "target": "/app/data", "read_only": False},
+                            ],
+                        },
+                    },
+                }), encoding="utf-8")
+                compose_command = ["docker", "compose", "--project-name", compose_project, "--file", str(compose_file)]
+                subprocess.run([*compose_command, "create"], check=True, capture_output=True, text=True)
+                created_id = subprocess.run(
+                    ["docker", "inspect", "--format", "{{.Id}}", container_name],
+                    check=True, capture_output=True, text=True,
+                ).stdout.strip().lower()
+                created_state = json.loads(subprocess.run(
+                    ["docker", "inspect", "--format", "{{json .State}}", container_name],
+                    check=True, capture_output=True, text=True,
+                ).stdout)
+                self.assertRegex(created_id, r"^[0-9a-f]{64}$")
+                self.assertEqual(created_state["Status"], "created")
+                self.assertFalse(created_state["Running"])
+
+                subprocess.run([
+                    sys.executable, str(issuer), "--identity-file", str(identity_file),
+                    "--capability-file", str(artifact_dir / "capability"),
+                    "--deployment-nonce-file", str(artifact_dir / "deployment-nonce"),
+                    "--private-key-file", str(private_key_file),
+                    "--public-key-file", str(artifact_dir / "public-key.pem"),
+                    "--output", str(artifact_dir / "attestation.json"),
+                    "--container-runtime-id", created_id,
+                ], cwd=temporary, check=True, capture_output=True, text=True)
+                subprocess.run(["docker", "start", created_id], check=True, capture_output=True, text=True)
+                self.assertEqual(subprocess.run(
+                    ["docker", "inspect", "--format", "{{.Id}}", container_name],
+                    check=True, capture_output=True, text=True,
+                ).stdout.strip().lower(), created_id)
+
+                def get_settings() -> dict[str, object]:
+                    request = urllib_request.Request(
+                        f"http://127.0.0.1:{service_port}/api/genbox-push/cleanup/settings",
+                        headers={"Authorization": f"Bearer {auth_key}"},
+                    )
+                    with urllib_request.urlopen(request, timeout=2) as response:
+                        return json.loads(response.read().decode("utf-8"))
+
+                deadline = time.monotonic() + 45
+                last_error: Exception | None = None
+                response: dict[str, object] | None = None
+                while time.monotonic() < deadline:
+                    try:
+                        response = get_settings()
+                        if response.get("settings", {}).get("execute_available") is True:
+                            break
+                    except (OSError, http.client.HTTPException, urllib_error.URLError, urllib_error.HTTPError, TimeoutError, json.JSONDecodeError) as exc:
+                        last_error = exc
+                    time.sleep(0.5)
+                self.assertIsNotNone(response, f"FastAPI settings endpoint was unavailable: {last_error}")
+                if not response["settings"]["execute_available"]:
+                    diagnostic_script = """
+import hashlib, json, os
+from pathlib import Path
+from services.cleanup_attestation import verify_attestation_signature
+from services.genbox_push_cleanup import genbox_push_cleanup_service as service
+gate = service.environment_gate
+attestation = json.loads(Path('/run/genbox-cleanup/attestation.json').read_text(encoding='utf-8'))
+marker = Path('/app/data/.genbox-isolated-cleanup')
+files = {}
+for name in ('capability', 'deployment-nonce', 'attestation.json', 'public-key.pem'):
+    stat_result = (Path('/run/genbox-cleanup') / name).stat()
+    files[name] = {'size': stat_result.st_size, 'nlink': stat_result.st_nlink}
+print(json.dumps({
+    'can_execute': gate.can_execute(),
+    'runtime_binding': gate._runtime_binding_provider(),
+    'attested_runtime_binding': attestation.get('runtime_binding'),
+    'storage_root': str(gate._storage_root_provider()),
+    'marker_sha256': hashlib.sha256(marker.read_bytes()).hexdigest(),
+    'expected_marker_sha256': os.environ.get('CHATGPT2API_CLEANUP_MARKER_SHA256'),
+    'public_key_sha256': hashlib.sha256(Path('/run/genbox-cleanup/public-key.pem').read_bytes()).hexdigest(),
+    'trust_anchor_sha256': gate._trusted_public_key_sha256,
+    'nonce_matches': hashlib.sha256(Path('/run/genbox-cleanup/deployment-nonce').read_bytes()).hexdigest() == attestation.get('deployment_nonce_sha256'),
+    'capability_matches': hashlib.sha256(gate._capability.encode('utf-8')).hexdigest() == attestation.get('capability_sha256'),
+    'signature_matches': verify_attestation_signature(attestation, Path('/run/genbox-cleanup/public-key.pem').read_bytes()),
+    'files': files,
+}, sort_keys=True))
+"""
+                    diagnostic = subprocess.run(
+                        ["docker", "exec", container_name, "uv", "run", "python", "-c", diagnostic_script],
+                        capture_output=True,
+                        text=True,
+                    )
+                    self.fail(
+                        f"FastAPI rejected a matching external attestation: {response}; "
+                        f"diagnostic={diagnostic.stdout.strip()}; stderr={diagnostic.stderr.strip()}"
+                    )
+
+                tampered = json.loads((artifact_dir / "attestation.json").read_text(encoding="utf-8"))
+                tampered["runtime_binding"] = "0" * 64
+                (artifact_dir / "attestation.json").write_text(json.dumps(tampered), encoding="utf-8")
+                deadline = time.monotonic() + 20
+                tampered_response: dict[str, object] | None = None
+                while time.monotonic() < deadline:
+                    try:
+                        tampered_response = get_settings()
+                        if tampered_response.get("settings", {}).get("execute_available") is False:
+                            break
+                    except (OSError, http.client.HTTPException, urllib_error.URLError, urllib_error.HTTPError, TimeoutError, json.JSONDecodeError):
+                        pass
+                    time.sleep(0.5)
+                self.assertIsNotNone(tampered_response, "FastAPI settings endpoint did not recover after tampering")
+                self.assertFalse(tampered_response["settings"]["execute_available"])
+            finally:
+                if compose_command is not None:
+                    subprocess.run([*compose_command, "down", "--remove-orphans"], capture_output=True, text=True)
+                if built_image:
+                    subprocess.run(["docker", "image", "rm", "--force", image_tag], capture_output=True, text=True)
 
 
 if __name__ == "__main__":
