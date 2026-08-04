@@ -6,6 +6,7 @@ import hmac
 import ipaddress
 import os
 import re
+import secrets
 import threading
 import uuid
 from pathlib import Path
@@ -36,6 +37,21 @@ ISOLATED_MARKER_FIELDS = {
     "container_name",
     "service_port",
     "image_digest",
+}
+RUNTIME_ATTESTATION_VERSION = 1
+RUNTIME_ATTESTATION_FIELDS = {
+    "version",
+    "instance_id",
+    "role",
+    "storage_root",
+    "compose_project",
+    "container_name",
+    "service_port",
+    "image_digest",
+    "marker_sha256",
+    "trusted_destination_scope",
+    "capability_sha256",
+    "attestation_id",
 }
 
 
@@ -96,6 +112,43 @@ def settings_coordination_lock_path(settings_file: Path) -> Path:
     return settings_file.with_name(f".{settings_file.name}.coord.lock")
 
 
+def issue_runtime_attestation(
+    path: Path,
+    *,
+    identity: dict[str, object],
+    capability: str,
+) -> str:
+    """Write a launcher-owned runtime proof and return its identity digest.
+
+    Production startup calls this with a freshly generated capability held in
+    process memory. The durable file contains only its hash, so copying clone
+    state or environment cannot recreate execution authority.
+    """
+    if len(capability) < 32:
+        raise ValueError("cleanup capability is too short")
+    required = {
+        "instance_id", "role", "storage_root", "compose_project",
+        "container_name", "service_port", "image_digest", "marker_sha256",
+        "trusted_destination_scope",
+    }
+    if set(identity) != required:
+        raise ValueError("runtime identity fields are invalid")
+    canonical = {key: identity[key] for key in sorted(required)}
+    canonical["attestation_id"] = secrets.token_hex(32)
+    identity_digest = hashlib.sha256(
+        json.dumps(canonical, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    ).hexdigest()
+    payload = {
+        **canonical,
+        "version": RUNTIME_ATTESTATION_VERSION,
+        "capability_sha256": hashlib.sha256(capability.encode("utf-8")).hexdigest(),
+        "identity_digest": identity_digest,
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    _atomic_json_write(path, payload)
+    return identity_digest
+
+
 class CleanupEnvironmentGate:
     """Server-side capability gate for destructive cleanup.
 
@@ -104,8 +157,20 @@ class CleanupEnvironmentGate:
     Browser payloads never reach this class.
     """
 
-    def __init__(self, environ: dict[str, str] | None = None) -> None:
+    def __init__(
+        self,
+        environ: dict[str, str] | None = None,
+        *,
+        capability: str | None = None,
+        attestation_file: Path | None = None,
+    ) -> None:
         self.environ = environ if environ is not None else os.environ
+        # The capability is injected by the service launcher and is never
+        # accepted from HTTP or recovered from durable cleanup state.
+        self._capability = capability or ""
+        self._attestation_file = attestation_file or Path(
+            _clean(self.environ.get("CHATGPT2API_CLEANUP_ATTESTATION_FILE"))
+        ) if _clean(self.environ.get("CHATGPT2API_CLEANUP_ATTESTATION_FILE")) else None
         self._storage_root_provider: Callable[[], Path] | None = None
 
     def bind_storage_root(self, provider: Callable[[], Path]) -> None:
@@ -124,6 +189,7 @@ class CleanupEnvironmentGate:
         container_name = _valid_runtime_name(self.environ.get("CHATGPT2API_CLEANUP_CONTAINER_NAME"))
         service_port = _valid_service_port(self.environ.get("CHATGPT2API_CLEANUP_SERVICE_PORT"))
         image_digest = _valid_image_digest(self.environ.get("CHATGPT2API_CLEANUP_IMAGE_DIGEST"))
+        attestation_matches = False
         try:
             configured_path = Path(configured_root)
             configured_stat = configured_path.lstat()
@@ -179,6 +245,55 @@ class CleanupEnvironmentGate:
                 "service_port": service_port,
                 "image_digest": image_digest,
             }
+            if not marker_matches or self._attestation_file is None or not self._capability:
+                return False
+            attestation_stat = self._attestation_file.lstat()
+            if (
+                not self._attestation_file.is_file()
+                or _is_filesystem_alias(attestation_stat)
+                or int(getattr(attestation_stat, "st_nlink", 1) or 1) != 1
+            ):
+                return False
+            attestation = json.loads(self._attestation_file.read_text(encoding="utf-8"))
+            if not isinstance(attestation, dict):
+                return False
+            identity = {
+                "instance_id": instance_id,
+                "role": role,
+                "storage_root": str(configured_resolved),
+                "compose_project": compose_project,
+                "container_name": container_name,
+                "service_port": service_port,
+                "image_digest": image_digest,
+                "marker_sha256": expected_marker_hash,
+                "trusted_destination_scope": _clean(self.environ.get("CHATGPT2API_CLEANUP_TRUSTED_DESTINATION_SCOPE")),
+            }
+            attestation_id = str(attestation.get("attestation_id") or "")
+            if len(attestation_id) != 64 or any(char not in "0123456789abcdef" for char in attestation_id):
+                return False
+            identity_digest = hashlib.sha256(
+                json.dumps(
+                    {**identity, "attestation_id": attestation_id},
+                    separators=(",", ":"),
+                    sort_keys=True,
+                ).encode("utf-8")
+            ).hexdigest()
+            attestation_matches = (
+                attestation.get("version") == RUNTIME_ATTESTATION_VERSION
+                and attestation.get("identity_digest") == identity_digest
+                if "identity_digest" in attestation
+                else False
+            )
+            # Keep the on-disk schema strict while accepting the digest as a
+            # derived field rather than an authority supplied by the browser.
+            if set(attestation) != RUNTIME_ATTESTATION_FIELDS | {"identity_digest"}:
+                return False
+            attestation_matches = attestation_matches and all(
+                attestation.get(key) == value for key, value in identity.items()
+            ) and hmac.compare_digest(
+                str(attestation.get("capability_sha256") or ""),
+                hashlib.sha256(self._capability.encode("utf-8")).hexdigest(),
+            )
         except (OSError, RuntimeError, TypeError, UnicodeError, ValueError):
             roots_match = False
             marker_matches = False
@@ -189,10 +304,21 @@ class CleanupEnvironmentGate:
             and container_name
             and service_port
             and image_digest
-            and len(_clean(self.environ.get("CHATGPT2API_CLEANUP_CAPABILITY"))) >= 32
+            and len(self._capability) >= 32
             and roots_match
             and marker_matches
+            and attestation_matches
         )
+
+    def runtime_identity_digest(self) -> str:
+        if not self._runtime_identity_matches():
+            return ""
+        try:
+            attestation = json.loads(self._attestation_file.read_text(encoding="utf-8")) if self._attestation_file else {}
+            digest = str(attestation.get("identity_digest") or "")
+        except (OSError, TypeError, ValueError, UnicodeError):
+            return ""
+        return digest if len(digest) == 64 and all(char in "0123456789abcdef" for char in digest) else ""
 
     def destination_trusted(self, destination_scope: str, base_url: str) -> bool:
         trusted = _clean(self.environ.get("CHATGPT2API_CLEANUP_TRUSTED_DESTINATION_SCOPE"))
@@ -319,6 +445,43 @@ class GenBoxPushCleanupService:
         self._settings_lock = ProcessReentrantLock(settings_coordination_lock_path(self.settings_file))
         self.environment_gate.bind_storage_root(lambda: self.image_storage_root())
 
+    def initialize_runtime_capability(self) -> bool:
+        """Issue a fresh process-held capability during service startup.
+
+        The environment describes the deployment, but never supplies the
+        capability. A cloned data directory therefore receives a new runtime
+        identity digest and cannot reuse old cleanup records.
+        """
+        gate = self.environment_gate
+        if gate.environment_class() != "isolated-vps" or not _bool_env(gate.environ.get("CHATGPT2API_CLEANUP_EXECUTE")):
+            return False
+        root = _clean(gate.environ.get("CHATGPT2API_CLEANUP_STORAGE_ROOT"))
+        marker_hash = _clean(gate.environ.get("CHATGPT2API_CLEANUP_MARKER_SHA256")).lower()
+        identity = {
+            "instance_id": _clean(gate.environ.get("CHATGPT2API_CLEANUP_INSTANCE_ID")),
+            "role": _clean(gate.environ.get("CHATGPT2API_CLEANUP_INSTANCE_ROLE")),
+            "storage_root": str(Path(root).resolve()) if root else "",
+            "compose_project": _valid_runtime_name(gate.environ.get("CHATGPT2API_CLEANUP_COMPOSE_PROJECT")),
+            "container_name": _valid_runtime_name(gate.environ.get("CHATGPT2API_CLEANUP_CONTAINER_NAME")),
+            "service_port": _valid_service_port(gate.environ.get("CHATGPT2API_CLEANUP_SERVICE_PORT")),
+            "image_digest": _valid_image_digest(gate.environ.get("CHATGPT2API_CLEANUP_IMAGE_DIGEST")),
+            "marker_sha256": marker_hash,
+            "trusted_destination_scope": _clean(gate.environ.get("CHATGPT2API_CLEANUP_TRUSTED_DESTINATION_SCOPE")),
+        }
+        attestation_file = gate._attestation_file or (DATA_DIR / ".genbox-runtime-attestation.json")
+        capability = secrets.token_urlsafe(48)
+        try:
+            issue_runtime_attestation(attestation_file, identity=identity, capability=capability)
+        except (OSError, ValueError, TypeError):
+            return False
+        self.environment_gate = CleanupEnvironmentGate(
+            gate.environ,
+            capability=capability,
+            attestation_file=attestation_file,
+        )
+        self.environment_gate.bind_storage_root(lambda: self.image_storage_root())
+        return self.environment_gate.can_execute()
+
     def image_storage_root(self) -> Path:
         provider = getattr(self.image_storage, "local_root", None)
         if callable(provider):
@@ -413,7 +576,12 @@ class GenBoxPushCleanupService:
         )
         key = self._record_key(scope, sid, path, digest)
         now = self.now()
-        cleanup_authorized = safe_to_delete_source is True and isinstance(source_identity, dict)
+        runtime_identity_digest = self.environment_gate.runtime_identity_digest()
+        cleanup_authorized = (
+            safe_to_delete_source is True
+            and isinstance(source_identity, dict)
+            and bool(runtime_identity_digest)
+        )
         record = {
             "record_version": CLEANUP_RECORD_VERSION,
             "destination_scope": scope,
@@ -442,6 +610,7 @@ class GenBoxPushCleanupService:
             "size_bytes": max(0, int(size_bytes or 0)),
             "source_identity": source_identity,
             "source_identity_reason": source_identity_reason,
+            "runtime_identity_digest": runtime_identity_digest,
         }
         with self._lock:
             records = self._load_state_locked()
@@ -487,6 +656,9 @@ class GenBoxPushCleanupService:
             return "retained", "receipt-invalid", 0
         if receipt.get("safe_to_delete_source") is not True:
             return "retained", "receipt-no-cleanup-permission", 0
+        current_runtime_identity = self.environment_gate.runtime_identity_digest()
+        if not current_runtime_identity or record.get("runtime_identity_digest") != current_runtime_identity:
+            return "retained", "runtime-identity-changed", 0
         source_identity = record.get("source_identity")
         if not isinstance(source_identity, dict):
             return "retained", str(record.get("source_identity_reason") or "source-identity-missing"), 0
@@ -551,6 +723,7 @@ class GenBoxPushCleanupService:
             "size_bytes": max(0, int(size_bytes or 0)),
             "reclaimed_bytes": max(0, int(reclaimed_bytes or 0)),
             "receipt_status": str((record.get("receipt") or {}).get("status") or ""),
+            "runtime_identity_digest": str(record.get("runtime_identity_digest") or ""),
         }
 
     def _update_record_locked(self, records: dict[str, dict[str, Any]], key: str, **updates: object) -> dict[str, Any]:
@@ -663,7 +836,11 @@ class GenBoxPushCleanupService:
                 summary["items"].append(item_result)
                 continue
 
-            claim = source_claim(str(record.get("remote_path") or ""), str(record.get("source_sha256") or ""))
+            claim = source_claim(
+                str(record.get("remote_path") or ""),
+                str(record.get("source_sha256") or ""),
+                str(record.get("runtime_identity_digest") or ""),
+            )
             if not claim.acquire(timeout_secs=0):
                 reason = "source-busy"
                 summary["eligible"] = max(0, int(summary["eligible"]) - 1)

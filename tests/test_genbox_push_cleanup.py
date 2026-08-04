@@ -19,7 +19,7 @@ from starlette.requests import Request
 os.environ.setdefault("CHATGPT2API_AUTH_KEY", "local-test-admin-key")
 
 from services.config import config
-from services.genbox_push_cleanup import CleanupEnvironmentGate, GenBoxPushCleanupService
+from services.genbox_push_cleanup import CleanupEnvironmentGate, GenBoxPushCleanupService, issue_runtime_attestation
 from services.genbox_push_service import GenBoxPushService
 from services.image_storage_service import ImageStorageService, VerifiedDeleteResult
 from services.json_file import write_json_file
@@ -80,7 +80,11 @@ def _cleanup_process_worker(
         audit_file=Path(audit),
         settings_file=Path(settings),
         image_storage=storage,
-        environment_gate=CleanupEnvironmentGate(dict(environment)),
+        environment_gate=CleanupEnvironmentGate(
+            dict(environment),
+            capability=environment.get("CHATGPT2API_CLEANUP_CAPABILITY"),
+            attestation_file=Path(environment["CHATGPT2API_CLEANUP_ATTESTATION_FILE"]),
+        ),
     )
     result_queue.put(service.execute())
 
@@ -105,7 +109,11 @@ def _cleanup_crash_worker(
         audit_file=Path(audit),
         settings_file=Path(settings),
         image_storage=storage,
-        environment_gate=CleanupEnvironmentGate(dict(environment)),
+        environment_gate=CleanupEnvironmentGate(
+            dict(environment),
+            capability=environment.get("CHATGPT2API_CLEANUP_CAPABILITY"),
+            attestation_file=Path(environment["CHATGPT2API_CLEANUP_ATTESTATION_FILE"]),
+        ),
     )
     service.execute()
 
@@ -136,7 +144,11 @@ def _cleanup_crash_after_unlink_worker(
         audit_file=Path(audit),
         settings_file=Path(settings),
         image_storage=storage,
-        environment_gate=CleanupEnvironmentGate(dict(environment)),
+        environment_gate=CleanupEnvironmentGate(
+            dict(environment),
+            capability=environment.get("CHATGPT2API_CLEANUP_CAPABILITY"),
+            attestation_file=Path(environment["CHATGPT2API_CLEANUP_ATTESTATION_FILE"]),
+        ),
     )
     service.execute()
 
@@ -169,7 +181,11 @@ def _cleanup_atomic_crash_worker(
         audit_file=Path(audit),
         settings_file=Path(settings),
         image_storage=storage,
-        environment_gate=CleanupEnvironmentGate(dict(environment)),
+        environment_gate=CleanupEnvironmentGate(
+            dict(environment),
+            capability=environment.get("CHATGPT2API_CLEANUP_CAPABILITY"),
+            attestation_file=Path(environment["CHATGPT2API_CLEANUP_ATTESTATION_FILE"]),
+        ),
     )
     service.execute()
 
@@ -193,7 +209,11 @@ def _cleanup_crash_after_terminal_audit_worker(
         audit_file=Path(audit),
         settings_file=Path(settings),
         image_storage=storage,
-        environment_gate=CleanupEnvironmentGate(dict(environment)),
+        environment_gate=CleanupEnvironmentGate(
+            dict(environment),
+            capability=environment.get("CHATGPT2API_CLEANUP_CAPABILITY"),
+            attestation_file=Path(environment["CHATGPT2API_CLEANUP_ATTESTATION_FILE"]),
+        ),
     )
     original_save = service._save_state_locked
 
@@ -245,6 +265,26 @@ class GenBoxPushCleanupTests(unittest.TestCase):
             "image_digest": self.image_digest,
         }, separators=(",", ":"), sort_keys=True), encoding="utf-8")
         marker_hash = hashlib.sha256(self.instance_marker.read_bytes()).hexdigest()
+        self.capability = "synthetic-capability-32-bytes-000000000000"
+        self.attestation = self.tmp / "runtime-attestation.json"
+        destination_scope = hashlib.sha256(
+            b"https://genbox.test\nchatgpt2api-dev\nsynthetic-push-key"
+        ).hexdigest()
+        issue_runtime_attestation(
+            self.attestation,
+            identity={
+                "instance_id": self.instance_id,
+                "role": "isolated-development",
+                "storage_root": str(self.images.resolve()),
+                "compose_project": self.compose_project,
+                "container_name": self.container_name,
+                "service_port": self.service_port,
+                "image_digest": self.image_digest,
+                "marker_sha256": marker_hash,
+                "trusted_destination_scope": destination_scope,
+            },
+            capability=self.capability,
+        )
         write_json_file(self.settings, {
             "enabled": True,
             "cleanup_enabled": False,
@@ -263,7 +303,8 @@ class GenBoxPushCleanupTests(unittest.TestCase):
             "CHATGPT2API_CLEANUP_CONTAINER_NAME": self.container_name,
             "CHATGPT2API_CLEANUP_SERVICE_PORT": str(self.service_port),
             "CHATGPT2API_CLEANUP_IMAGE_DIGEST": self.image_digest,
-            "CHATGPT2API_CLEANUP_CAPABILITY": "synthetic-capability-32-bytes-000000000000",
+            "CHATGPT2API_CLEANUP_CAPABILITY": self.capability,
+            "CHATGPT2API_CLEANUP_ATTESTATION_FILE": str(self.attestation),
             "CHATGPT2API_CLEANUP_MARKER_SHA256": marker_hash,
             "CHATGPT2API_CLEANUP_TRUSTED_DESTINATION_KIND": "https",
             "CHATGPT2API_CLEANUP_TRUSTED_DESTINATION_URL": "https://genbox.test",
@@ -271,7 +312,7 @@ class GenBoxPushCleanupTests(unittest.TestCase):
             "CHATGPT2API_CLEANUP_TRUSTED_DESTINATION_SCOPE": hashlib.sha256(
                 b"https://genbox.test\nchatgpt2api-dev\nsynthetic-push-key"
             ).hexdigest(),
-        })
+        }, capability=self.capability, attestation_file=self.attestation)
         self.service = GenBoxPushCleanupService(
             state_file=self.state,
             audit_file=self.audit,
@@ -521,7 +562,7 @@ class GenBoxPushCleanupTests(unittest.TestCase):
         result = self.service.execute()
 
         self.assertTrue(target.exists())
-        self.assertEqual(result["items"][0]["decision_reason"], "destination-unverified")
+        self.assertEqual(result["blocked_reason"], "runtime-identity-unverified")
 
     def test_http_destination_is_untrusted_even_with_matching_scope(self) -> None:
         target = self._record()
@@ -676,7 +717,6 @@ class GenBoxPushCleanupTests(unittest.TestCase):
             "CHATGPT2API_CLEANUP_CONTAINER_NAME": "wrong-container",
             "CHATGPT2API_CLEANUP_SERVICE_PORT": "33018",
             "CHATGPT2API_CLEANUP_IMAGE_DIGEST": "sha256:" + "b" * 64,
-            "CHATGPT2API_CLEANUP_CAPABILITY": "too-short",
         }
 
         for field, value in mismatches.items():
@@ -692,6 +732,81 @@ class GenBoxPushCleanupTests(unittest.TestCase):
                         self.gate.environ[field] = original
                 self.assertEqual(result.get("blocked_reason"), "runtime-identity-unverified")
                 self.assertTrue(target.exists())
+
+    def test_environment_capability_spoof_is_not_authority(self) -> None:
+        target = self._record()
+        self._enable_policy()
+        spoofed = CleanupEnvironmentGate(
+            dict(self.gate.environ),
+            attestation_file=self.attestation,
+        )
+        service = GenBoxPushCleanupService(
+            state_file=self.state,
+            audit_file=self.audit,
+            settings_file=self.settings,
+            image_storage=self.storage,
+            environment_gate=spoofed,
+        )
+        result = service.execute()
+        self.assertEqual(result.get("blocked_reason"), "runtime-identity-unverified")
+        self.assertTrue(target.exists())
+
+    def test_full_cloned_state_and_attestation_cannot_inherit_cleanup_authority(self) -> None:
+        target = self._record()
+        self._enable_policy()
+        clone = self.tmp / "clone"
+        clone.mkdir()
+        clone_state = clone / "cleanup.json"
+        clone_audit = clone / "audit.json"
+        clone_settings = clone / "settings.json"
+        clone_attestation = clone / "runtime-attestation.json"
+        clone_state.write_bytes(self.state.read_bytes())
+        clone_audit.write_bytes(self.audit.read_bytes()) if self.audit.exists() else None
+        clone_settings.write_bytes(self.settings.read_bytes())
+        clone_attestation.write_bytes(self.attestation.read_bytes())
+        cloned_gate = CleanupEnvironmentGate(
+            dict(self.gate.environ),
+            capability="",
+            attestation_file=clone_attestation,
+        )
+        cloned_service = GenBoxPushCleanupService(
+            state_file=clone_state,
+            audit_file=clone_audit,
+            settings_file=clone_settings,
+            image_storage=self.storage,
+            environment_gate=cloned_gate,
+        )
+        self.assertTrue(cloned_service.initialize_runtime_capability())
+        result = cloned_service.execute()
+        self.assertNotIn("blocked_reason", result)
+        self.assertEqual(result["items"][0]["decision_reason"], "runtime-identity-changed")
+        self.assertTrue(target.exists())
+
+    def test_capability_replay_against_new_runtime_is_rejected(self) -> None:
+        target = self._record()
+        self._enable_policy()
+        replayed = CleanupEnvironmentGate(
+            dict(self.gate.environ),
+            capability="different-capability-32-bytes-000000000000",
+            attestation_file=self.attestation,
+        )
+        service = GenBoxPushCleanupService(
+            state_file=self.state,
+            audit_file=self.audit,
+            settings_file=self.settings,
+            image_storage=self.storage,
+            environment_gate=replayed,
+        )
+        result = service.execute()
+        self.assertEqual(result.get("blocked_reason"), "runtime-identity-unverified")
+        self.assertTrue(target.exists())
+
+    def test_runtime_identity_digest_is_bound_to_receipt(self) -> None:
+        self._record()
+        record = next(iter(json.loads(self.state.read_text(encoding="utf-8"))["records"].values()))
+        self.assertEqual(record["runtime_identity_digest"], self.gate.runtime_identity_digest())
+        self.gate.environ["CHATGPT2API_CLEANUP_IMAGE_DIGEST"] = "sha256:" + "b" * 64
+        self.assertEqual(self.gate.runtime_identity_digest(), "")
 
     def test_marker_with_extra_or_missing_identity_field_blocks_execute(self) -> None:
         target = self._record()
@@ -747,6 +862,20 @@ class GenBoxPushCleanupTests(unittest.TestCase):
                 "path": "outside/root.png",
                 "receipt": {"safe_to_delete_source": True},
                 "environment": "isolated-vps",
+            })
+
+    def test_cleanup_operation_rejects_browser_supplied_authority_fields(self) -> None:
+        from pydantic import ValidationError
+
+        from api.genbox_push import GenBoxPushCleanupOperationRequest
+
+        with self.assertRaises(ValidationError):
+            GenBoxPushCleanupOperationRequest.model_validate({
+                "environment": "isolated-vps",
+                "path": "2026/08/01/image.png",
+                "receipt": {"safe_to_delete_source": True},
+                "marker": "forged",
+                "capability": "forged",
             })
 
     def test_automatic_retention_protects_unresolved_push_source(self) -> None:
@@ -1228,7 +1357,7 @@ class GenBoxPushCleanupTests(unittest.TestCase):
         target = self._record()
         self._enable_policy()
         digest = hashlib.sha256(b"synthetic-image").hexdigest()
-        claim = source_claim("2026/08/01/image.png", digest)
+        claim = source_claim("2026/08/01/image.png", digest, self.gate.runtime_identity_digest())
         self.assertTrue(claim.acquire(timeout_secs=0))
         try:
             result = self.service.execute()

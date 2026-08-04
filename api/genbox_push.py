@@ -51,6 +51,12 @@ class GenBoxPushCleanupSettingsRequest(BaseModel):
     enabled: bool = False
 
 
+class GenBoxPushCleanupOperationRequest(BaseModel):
+    """Intent-only cleanup request; all destructive inputs stay server-side."""
+
+    model_config = ConfigDict(extra="forbid")
+
+
 def _raise_push_error(exc: Exception) -> None:
     message = str(exc) or "GenBox 推送失败"
     raise HTTPException(status_code=400, detail={"error": message}) from exc
@@ -104,12 +110,22 @@ def create_router() -> APIRouter:
         return {"settings": await run_in_threadpool(genbox_push_cleanup_service.settings)}
 
     @router.post("/api/genbox-push/cleanup/preview")
-    async def preview_cleanup(request: Request, authorization: str | None = Header(default=None)):
+    async def preview_cleanup(
+        request: Request,
+        body: GenBoxPushCleanupOperationRequest | None = None,
+        authorization: str | None = Header(default=None),
+    ):
+        del body
         require_cleanup_admin(request, authorization)
         return {"result": await run_in_threadpool(genbox_push_cleanup_service.preview)}
 
     @router.post("/api/genbox-push/cleanup/run")
-    async def run_cleanup(request: Request, authorization: str | None = Header(default=None)):
+    async def run_cleanup(
+        request: Request,
+        body: GenBoxPushCleanupOperationRequest | None = None,
+        authorization: str | None = Header(default=None),
+    ):
+        del body
         require_cleanup_admin(request, authorization)
         return {"result": await run_in_threadpool(genbox_push_cleanup_service.execute)}
 

@@ -59,6 +59,7 @@ def create_app() -> FastAPI:
         _configure_threadpool()
         genbox_push_outbox.resume()
         genbox_push_batch_service.resume()
+        genbox_push_cleanup_service.initialize_runtime_capability()
         # Recovery only reconciles durable ``deleting`` intents. It never
         # starts a cleanup operation or removes a source during startup.
         genbox_push_cleanup_service.recover_inflight()
