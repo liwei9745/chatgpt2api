@@ -17,7 +17,11 @@ from pathlib import Path
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
-from services.cleanup_attestation import canonical_attestation_bytes
+
+def canonical_attestation_bytes(payload: dict[str, object]) -> bytes:
+    """Keep the host-only issuer independent from the application package."""
+    unsigned = {key: value for key, value in payload.items() if key != "signature"}
+    return json.dumps(unsigned, separators=(",", ":"), sort_keys=True).encode("utf-8")
 
 
 def main() -> int:

@@ -968,6 +968,8 @@ class GenBoxPushCleanupTests(unittest.TestCase):
             serialization.NoEncryption(),
         ))
         issuer = Path(__file__).resolve().parents[1] / "scripts" / "issue_cleanup_attestation.py"
+        issuer_environment = dict(os.environ)
+        issuer_environment.pop("PYTHONPATH", None)
         subprocess.run([
             sys.executable, str(issuer),
             "--identity-file", str(identity_file),
@@ -976,7 +978,7 @@ class GenBoxPushCleanupTests(unittest.TestCase):
             "--private-key-file", str(private_key_file),
             "--output", str(issued_attestation),
             "--container-runtime-id", self.runtime_binding,
-        ], cwd=issuer.parents[1], check=True, capture_output=True, text=True)
+        ], cwd=self.tmp, env=issuer_environment, check=True, capture_output=True, text=True)
 
         environment = dict(self.gate.environ)
         environment["CHATGPT2API_CLEANUP_CAPABILITY_FILE"] = str(issued_capability)
