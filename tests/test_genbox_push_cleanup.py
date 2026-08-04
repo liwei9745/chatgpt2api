@@ -638,6 +638,23 @@ class GenBoxPushCleanupTests(unittest.TestCase):
         records = json.loads(self.state.read_text(encoding="utf-8"))["records"]
         self.assertEqual(next(iter(records.values()))["cleanup_status"], "deleting")
 
+    def test_recovery_audit_failure_persists_terminal_unknown(self) -> None:
+        target = self._record()
+        records = json.loads(self.state.read_text(encoding="utf-8"))["records"]
+        key, record = next(iter(records.items()))
+        record.update({"cleanup_status": "deleting", "decision_reason": "deletion-intent"})
+        records[key] = record
+        write_json_file(self.state, {"record_version": 1, "records": records})
+
+        with patch.object(self.service, "_append_audit_locked", side_effect=OSError("synthetic recovery audit failure")):
+            result = self.service.recover_inflight()
+
+        self.assertEqual(result, {"retained": 0, "unknown": 1})
+        self.assertTrue(target.exists())
+        recovered = json.loads(self.state.read_text(encoding="utf-8"))["records"][key]
+        self.assertEqual(recovered["cleanup_status"], "delete_unknown")
+        self.assertEqual(recovered["decision_reason"], "recovery-audit-write-failed")
+
     def test_missing_isolated_marker_blocks_execute(self) -> None:
         target = self._record()
         self._enable_policy()
@@ -982,6 +999,46 @@ class GenBoxPushCleanupTests(unittest.TestCase):
         self.assertEqual(recovered["cleanup_status"], "retained")
         self.assertEqual(recovered["decision_reason"], "interrupted-before-delete")
         self.assertTrue(target.exists())
+
+    def test_application_lifespan_recovery_audit_failure_persists_terminal_unknown(self) -> None:
+        target = self._record()
+        records = json.loads(self.state.read_text(encoding="utf-8"))["records"]
+        key, record = next(iter(records.items()))
+        record.update({"cleanup_status": "deleting", "decision_reason": "deletion-intent"})
+        records[key] = record
+        write_json_file(self.state, {"record_version": 1, "records": records})
+
+        with ExitStack() as stack:
+            for target_name in (
+                "genbox_push_outbox.resume",
+                "genbox_push_batch_service.resume",
+                "genbox_push_schedule_service.resume",
+                "account_service.cleanup_auto_remove_accounts",
+                "backup_service.start",
+                "backup_service.stop",
+                "config.cleanup_old_images",
+                "cleanup_old_logs",
+                "dashboard_metrics_service.flush",
+                "genbox_push_schedule_service.stop",
+            ):
+                stack.enter_context(patch(f"api.app.{target_name}"))
+            for target_name in (
+                "start_limited_account_watcher",
+                "start_image_cleanup_scheduler",
+                "start_log_cleanup_scheduler",
+            ):
+                stack.enter_context(patch(f"api.app.{target_name}", return_value=_NoopThread()))
+            stack.enter_context(patch("api.app.genbox_push_cleanup_service", self.service))
+            stack.enter_context(patch.object(self.service, "_append_audit_locked", side_effect=OSError("synthetic recovery audit failure")))
+            from api.app import create_app
+
+            with TestClient(create_app()):
+                pass
+
+        self.assertTrue(target.exists())
+        recovered = json.loads(self.state.read_text(encoding="utf-8"))["records"][key]
+        self.assertEqual(recovered["cleanup_status"], "delete_unknown")
+        self.assertEqual(recovered["decision_reason"], "recovery-audit-write-failed")
 
     def test_restart_after_unlink_before_terminal_audit_is_unknown(self) -> None:
         relative_path = "2026/08/01/crash-after-unlink.png"

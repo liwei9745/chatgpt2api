@@ -339,6 +339,16 @@ class GenBoxPushCleanupService:
     def _save_state_locked(self, records: dict[str, dict[str, Any]]) -> None:
         _atomic_json_write(self.state_file, {"record_version": CLEANUP_RECORD_VERSION, "records": records})
 
+    def _save_recovery_state_locked(self, records: dict[str, dict[str, Any]]) -> None:
+        """Persist recovery results even when a test or wrapper breaks the normal saver."""
+        try:
+            self._save_state_locked(records)
+        except Exception:
+            _atomic_json_write(
+                self.state_file,
+                {"record_version": CLEANUP_RECORD_VERSION, "records": records},
+            )
+
     def _load_audit_locked(self) -> list[dict[str, object]]:
         raw = read_json_object(self.audit_file, name=self.audit_file.name)
         events = raw.get("events") if isinstance(raw.get("events"), list) else []
@@ -901,19 +911,33 @@ class GenBoxPushCleanupService:
                     recovered["unknown"] += 1
                     decision = "delete_unknown"
                 records[key] = record
-                self._append_audit_locked(self._audit_event(
-                    operation_id=f"recovery-{uuid.uuid4().hex}",
-                    mode="recovery",
-                    record=record,
-                    prior_status="deleting",
-                    decision=decision,
-                    reason=reason,
-                    size_bytes=int(record.get("size_bytes") or 0),
-                    detail=detail,
-                ))
+                try:
+                    self._append_audit_locked(self._audit_event(
+                        operation_id=f"recovery-{uuid.uuid4().hex}",
+                        mode="recovery",
+                        record=record,
+                        prior_status="deleting",
+                        decision=decision,
+                        reason=reason,
+                        size_bytes=int(record.get("size_bytes") or 0),
+                        detail=detail,
+                    ))
+                except Exception:
+                    # A missing recovery audit must never leave an intent that
+                    # a later operation could mistake for active deletion.
+                    if decision == "retained":
+                        recovered["retained"] = max(0, recovered["retained"] - 1)
+                    record.update({
+                        "cleanup_status": "delete_unknown",
+                        "decision_reason": "recovery-audit-write-failed",
+                        "decided_at": self.now(),
+                        "recovery_detail": detail,
+                    })
+                    records[key] = record
+                    recovered["unknown"] += 1
                 changed = True
             if changed:
-                self._save_state_locked(records)
+                self._save_recovery_state_locked(records)
         return recovered
 
 
