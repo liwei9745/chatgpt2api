@@ -4,6 +4,12 @@
 
 ### Phase 6 experimental cleanup candidate
 
+- Cleanup authority is now issued only by a host-side signing launcher. The
+  application only verifies a short-lived Ed25519 attestation and never writes
+  or regenerates its capability, attestation, or signing key.
+- Added a Windows/Linux/macOS security-test workflow. The host-only issuer is
+  excluded from the application image, and browser cleanup requests remain
+  intent-only.
 - Added receipt-gated, opt-in source cleanup records with SHA-256 binding,
   isolated-runtime identity checks, path-alias protection, restart recovery,
   bounded receipt parsing, and conservative `delete_unknown` handling.

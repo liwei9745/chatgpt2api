@@ -31,6 +31,8 @@ test
 tests
 docs/*.md
 scripts/test_*.py
+# The host-only cleanup issuer must never be packaged with the application.
+scripts/issue_cleanup_attestation.py
 
 web
 web-vue/dist

@@ -6,14 +6,16 @@ import hmac
 import ipaddress
 import os
 import re
-import secrets
+import socket
 import threading
+import time
 import uuid
 from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import urlparse
 
 from services.config import DATA_DIR
+from services.cleanup_attestation import verify_attestation_signature
 from services.image_storage_service import ImageStorageService, _is_filesystem_alias, image_storage_service
 from services.json_file import read_json_object
 from services.process_file_lock import ProcessFileLock, ProcessReentrantLock
@@ -38,7 +40,7 @@ ISOLATED_MARKER_FIELDS = {
     "service_port",
     "image_digest",
 }
-RUNTIME_ATTESTATION_VERSION = 1
+RUNTIME_ATTESTATION_VERSION = 2
 RUNTIME_ATTESTATION_FIELDS = {
     "version",
     "instance_id",
@@ -51,7 +53,10 @@ RUNTIME_ATTESTATION_FIELDS = {
     "marker_sha256",
     "trusted_destination_scope",
     "capability_sha256",
-    "attestation_id",
+    "runtime_binding",
+    "not_before",
+    "expires_at",
+    "signature",
 }
 
 
@@ -112,41 +117,33 @@ def settings_coordination_lock_path(settings_file: Path) -> Path:
     return settings_file.with_name(f".{settings_file.name}.coord.lock")
 
 
-def issue_runtime_attestation(
-    path: Path,
-    *,
-    identity: dict[str, object],
-    capability: str,
-) -> str:
-    """Write a launcher-owned runtime proof and return its identity digest.
-
-    Production startup calls this with a freshly generated capability held in
-    process memory. The durable file contains only its hash, so copying clone
-    state or environment cannot recreate execution authority.
-    """
-    if len(capability) < 32:
-        raise ValueError("cleanup capability is too short")
-    required = {
-        "instance_id", "role", "storage_root", "compose_project",
-        "container_name", "service_port", "image_digest", "marker_sha256",
-        "trusted_destination_scope",
-    }
-    if set(identity) != required:
-        raise ValueError("runtime identity fields are invalid")
-    canonical = {key: identity[key] for key in sorted(required)}
-    canonical["attestation_id"] = secrets.token_hex(32)
-    identity_digest = hashlib.sha256(
-        json.dumps(canonical, separators=(",", ":"), sort_keys=True).encode("utf-8")
-    ).hexdigest()
-    payload = {
-        **canonical,
-        "version": RUNTIME_ATTESTATION_VERSION,
-        "capability_sha256": hashlib.sha256(capability.encode("utf-8")).hexdigest(),
-        "identity_digest": identity_digest,
-    }
-    path.parent.mkdir(parents=True, exist_ok=True)
-    _atomic_json_write(path, payload)
-    return identity_digest
+def _read_external_regular_file(path: Path, *, maximum_bytes: int) -> bytes:
+    """Read a launcher-owned file without following aliases or stale paths."""
+    stat_result = path.lstat()
+    if (
+        not path.is_file()
+        or _is_filesystem_alias(stat_result)
+        or int(getattr(stat_result, "st_nlink", 1) or 1) != 1
+        or stat_result.st_size < 1
+        or stat_result.st_size > maximum_bytes
+    ):
+        raise ValueError("external cleanup file is invalid")
+    descriptor = os.open(path, os.O_RDONLY | int(getattr(os, "O_NOFOLLOW", 0) or 0))
+    try:
+        opened_stat = os.fstat(descriptor)
+        if (
+            opened_stat.st_dev != stat_result.st_dev
+            or opened_stat.st_ino != stat_result.st_ino
+            or opened_stat.st_size != stat_result.st_size
+        ):
+            raise ValueError("external cleanup file changed while opening")
+        with os.fdopen(os.dup(descriptor), "rb", closefd=True) as handle:
+            content = handle.read(maximum_bytes + 1)
+    finally:
+        os.close(descriptor)
+    if len(content) != stat_result.st_size or len(content) > maximum_bytes:
+        raise ValueError("external cleanup file changed while reading")
+    return content
 
 
 class CleanupEnvironmentGate:
@@ -163,6 +160,8 @@ class CleanupEnvironmentGate:
         *,
         capability: str | None = None,
         attestation_file: Path | None = None,
+        public_key_file: Path | None = None,
+        runtime_binding_provider: Callable[[], str] | None = None,
     ) -> None:
         self.environ = environ if environ is not None else os.environ
         # The capability is injected by the service launcher and is never
@@ -176,6 +175,9 @@ class CleanupEnvironmentGate:
             if configured_attestation
             else None
         )
+        configured_public_key = _clean(self.environ.get("CHATGPT2API_CLEANUP_ATTESTATION_PUBLIC_KEY_FILE"))
+        self._public_key_file = public_key_file or (Path(configured_public_key) if configured_public_key else None)
+        self._runtime_binding_provider = runtime_binding_provider or (lambda: _clean(socket.gethostname()))
         self._storage_root_provider: Callable[[], Path] | None = None
 
     def bind_storage_root(self, provider: Callable[[], Path]) -> None:
@@ -250,16 +252,11 @@ class CleanupEnvironmentGate:
                 "service_port": service_port,
                 "image_digest": image_digest,
             }
-            if not marker_matches or self._attestation_file is None or not self._capability:
+            if not marker_matches or self._attestation_file is None or self._public_key_file is None or not self._capability:
                 return False
-            attestation_stat = self._attestation_file.lstat()
-            if (
-                not self._attestation_file.is_file()
-                or _is_filesystem_alias(attestation_stat)
-                or int(getattr(attestation_stat, "st_nlink", 1) or 1) != 1
-            ):
-                return False
-            attestation = json.loads(self._attestation_file.read_text(encoding="utf-8"))
+            attestation = json.loads(_read_external_regular_file(
+                self._attestation_file, maximum_bytes=16 * 1024,
+            ).decode("utf-8"))
             if not isinstance(attestation, dict):
                 return False
             identity = {
@@ -273,31 +270,30 @@ class CleanupEnvironmentGate:
                 "marker_sha256": expected_marker_hash,
                 "trusted_destination_scope": _clean(self.environ.get("CHATGPT2API_CLEANUP_TRUSTED_DESTINATION_SCOPE")),
             }
-            attestation_id = str(attestation.get("attestation_id") or "")
-            if len(attestation_id) != 64 or any(char not in "0123456789abcdef" for char in attestation_id):
+            runtime_binding = _clean(self._runtime_binding_provider())
+            if not runtime_binding or attestation.get("runtime_binding") != runtime_binding:
                 return False
-            identity_digest = hashlib.sha256(
-                json.dumps(
-                    {**identity, "attestation_id": attestation_id},
-                    separators=(",", ":"),
-                    sort_keys=True,
-                ).encode("utf-8")
-            ).hexdigest()
+            now = int(time.time())
+            if (
+                not isinstance(attestation.get("not_before"), int)
+                or not isinstance(attestation.get("expires_at"), int)
+                or attestation["not_before"] > now
+                or attestation["expires_at"] <= now
+                or attestation["expires_at"] - attestation["not_before"] > 3600
+                or set(attestation) != RUNTIME_ATTESTATION_FIELDS
+            ):
+                return False
+            public_key = _read_external_regular_file(self._public_key_file, maximum_bytes=16 * 1024)
             attestation_matches = (
                 attestation.get("version") == RUNTIME_ATTESTATION_VERSION
-                and attestation.get("identity_digest") == identity_digest
-                if "identity_digest" in attestation
-                else False
-            )
-            # Keep the on-disk schema strict while accepting the digest as a
-            # derived field rather than an authority supplied by the browser.
-            if set(attestation) != RUNTIME_ATTESTATION_FIELDS | {"identity_digest"}:
-                return False
-            attestation_matches = attestation_matches and all(
-                attestation.get(key) == value for key, value in identity.items()
-            ) and hmac.compare_digest(
-                str(attestation.get("capability_sha256") or ""),
-                hashlib.sha256(self._capability.encode("utf-8")).hexdigest(),
+                and all(
+                    attestation.get(key) == value for key, value in identity.items()
+                )
+                and hmac.compare_digest(
+                    str(attestation.get("capability_sha256") or ""),
+                    hashlib.sha256(self._capability.encode("utf-8")).hexdigest(),
+                )
+                and verify_attestation_signature(attestation, public_key)
             )
         except (OSError, RuntimeError, TypeError, UnicodeError, ValueError):
             roots_match = False
@@ -319,8 +315,12 @@ class CleanupEnvironmentGate:
         if not self._runtime_identity_matches():
             return ""
         try:
-            attestation = json.loads(self._attestation_file.read_text(encoding="utf-8")) if self._attestation_file else {}
-            digest = str(attestation.get("identity_digest") or "")
+            attestation = json.loads(
+                _read_external_regular_file(self._attestation_file, maximum_bytes=16 * 1024).decode("utf-8")
+            ) if self._attestation_file else {}
+            digest = hashlib.sha256(
+                json.dumps(attestation, separators=(",", ":"), sort_keys=True).encode("utf-8")
+            ).hexdigest()
         except (OSError, TypeError, ValueError, UnicodeError):
             return ""
         return digest if len(digest) == 64 and all(char in "0123456789abcdef" for char in digest) else ""
@@ -451,38 +451,25 @@ class GenBoxPushCleanupService:
         self.environment_gate.bind_storage_root(lambda: self.image_storage_root())
 
     def initialize_runtime_capability(self) -> bool:
-        """Issue a fresh process-held capability during service startup.
-
-        The environment describes the deployment, but never supplies the
-        capability. A cloned data directory therefore receives a new runtime
-        identity digest and cannot reuse old cleanup records.
-        """
+        """Load an externally issued capability; application code never issues it."""
         gate = self.environment_gate
         if gate.environment_class() != "isolated-vps" or not _bool_env(gate.environ.get("CHATGPT2API_CLEANUP_EXECUTE")):
             return False
-        root = _clean(gate.environ.get("CHATGPT2API_CLEANUP_STORAGE_ROOT"))
-        marker_hash = _clean(gate.environ.get("CHATGPT2API_CLEANUP_MARKER_SHA256")).lower()
-        identity = {
-            "instance_id": _clean(gate.environ.get("CHATGPT2API_CLEANUP_INSTANCE_ID")),
-            "role": _clean(gate.environ.get("CHATGPT2API_CLEANUP_INSTANCE_ROLE")),
-            "storage_root": str(Path(root).resolve()) if root else "",
-            "compose_project": _valid_runtime_name(gate.environ.get("CHATGPT2API_CLEANUP_COMPOSE_PROJECT")),
-            "container_name": _valid_runtime_name(gate.environ.get("CHATGPT2API_CLEANUP_CONTAINER_NAME")),
-            "service_port": _valid_service_port(gate.environ.get("CHATGPT2API_CLEANUP_SERVICE_PORT")),
-            "image_digest": _valid_image_digest(gate.environ.get("CHATGPT2API_CLEANUP_IMAGE_DIGEST")),
-            "marker_sha256": marker_hash,
-            "trusted_destination_scope": _clean(gate.environ.get("CHATGPT2API_CLEANUP_TRUSTED_DESTINATION_SCOPE")),
-        }
-        attestation_file = gate._attestation_file or (DATA_DIR / ".genbox-runtime-attestation.json")
-        capability = secrets.token_urlsafe(48)
         try:
-            issue_runtime_attestation(attestation_file, identity=identity, capability=capability)
-        except (OSError, ValueError, TypeError):
+            capability_file_value = _clean(gate.environ.get("CHATGPT2API_CLEANUP_CAPABILITY_FILE"))
+            if not capability_file_value or gate._attestation_file is None or gate._public_key_file is None:
+                return False
+            capability = _read_external_regular_file(Path(capability_file_value), maximum_bytes=1024).decode("ascii").strip()
+            if len(capability) < 32:
+                return False
+        except (OSError, ValueError, UnicodeError):
             return False
         self.environment_gate = CleanupEnvironmentGate(
             gate.environ,
             capability=capability,
-            attestation_file=attestation_file,
+            attestation_file=gate._attestation_file,
+            public_key_file=gate._public_key_file,
+            runtime_binding_provider=gate._runtime_binding_provider,
         )
         self.environment_gate.bind_storage_root(lambda: self.image_storage_root())
         return self.environment_gate.can_execute()
