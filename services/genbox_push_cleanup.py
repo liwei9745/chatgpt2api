@@ -6,7 +6,7 @@ import hmac
 import ipaddress
 import os
 import re
-import socket
+import sys
 import threading
 import time
 import uuid
@@ -41,7 +41,7 @@ ISOLATED_MARKER_FIELDS = {
     "service_port",
     "image_digest",
 }
-RUNTIME_ATTESTATION_VERSION = 2
+RUNTIME_ATTESTATION_VERSION = 3
 RUNTIME_ATTESTATION_FIELDS = {
     "version",
     "instance_id",
@@ -55,6 +55,7 @@ RUNTIME_ATTESTATION_FIELDS = {
     "trusted_destination_scope",
     "capability_sha256",
     "runtime_binding",
+    "deployment_nonce_sha256",
     "not_before",
     "expires_at",
     "signature",
@@ -113,6 +114,18 @@ def _valid_image_digest(value: object) -> str:
     return digest
 
 
+def _container_runtime_identity() -> str:
+    """Return a Linux container ID from kernel cgroup metadata, or fail closed."""
+    if sys.platform != "linux":
+        return ""
+    try:
+        cgroup_data = Path("/proc/self/cgroup").read_text(encoding="utf-8", errors="strict")
+    except OSError:
+        return ""
+    matches = re.findall(r"(?<![0-9a-f])[0-9a-f]{64}(?![0-9a-f])", cgroup_data.lower())
+    return matches[0] if len(matches) == 1 else ""
+
+
 def settings_coordination_lock_path(settings_file: Path) -> Path:
     """Return the process-shared lock used by settings writers and cleanup."""
     return settings_file.with_name(f".{settings_file.name}.coord.lock")
@@ -163,6 +176,7 @@ class CleanupEnvironmentGate:
         attestation_file: Path | None = None,
         public_key_file: Path | None = None,
         trusted_public_key_sha256: str | None = None,
+        deployment_nonce_file: Path | None = None,
         runtime_binding_provider: Callable[[], str] | None = None,
     ) -> None:
         self.environ = environ if environ is not None else os.environ
@@ -183,7 +197,15 @@ class CleanupEnvironmentGate:
             trusted_public_key_sha256 if trusted_public_key_sha256 is not None
             else CLEANUP_ATTESTATION_PUBLIC_KEY_SHA256
         ).lower()
-        self._runtime_binding_provider = runtime_binding_provider or (lambda: _clean(socket.gethostname()))
+        configured_nonce = _clean(self.environ.get("CHATGPT2API_CLEANUP_DEPLOYMENT_NONCE_FILE"))
+        self._deployment_nonce_file = (
+            deployment_nonce_file
+            if deployment_nonce_file is not None
+            else Path(configured_nonce)
+            if configured_nonce
+            else None
+        )
+        self._runtime_binding_provider = runtime_binding_provider or _container_runtime_identity
         self._storage_root_provider: Callable[[], Path] | None = None
 
     def bind_storage_root(self, provider: Callable[[], Path]) -> None:
@@ -258,7 +280,13 @@ class CleanupEnvironmentGate:
                 "service_port": service_port,
                 "image_digest": image_digest,
             }
-            if not marker_matches or self._attestation_file is None or self._public_key_file is None or not self._capability:
+            if (
+                not marker_matches
+                or self._attestation_file is None
+                or self._public_key_file is None
+                or self._deployment_nonce_file is None
+                or not self._capability
+            ):
                 return False
             attestation = json.loads(_read_external_regular_file(
                 self._attestation_file, maximum_bytes=16 * 1024,
@@ -277,7 +305,17 @@ class CleanupEnvironmentGate:
                 "trusted_destination_scope": _clean(self.environ.get("CHATGPT2API_CLEANUP_TRUSTED_DESTINATION_SCOPE")),
             }
             runtime_binding = _clean(self._runtime_binding_provider())
-            if not runtime_binding or attestation.get("runtime_binding") != runtime_binding:
+            if (
+                len(runtime_binding) != 64
+                or any(char not in "0123456789abcdef" for char in runtime_binding)
+                or attestation.get("runtime_binding") != runtime_binding
+            ):
+                return False
+            deployment_nonce = _read_external_regular_file(self._deployment_nonce_file, maximum_bytes=1024)
+            if len(deployment_nonce) < 32 or not hmac.compare_digest(
+                str(attestation.get("deployment_nonce_sha256") or ""),
+                hashlib.sha256(deployment_nonce).hexdigest(),
+            ):
                 return False
             now = int(time.time())
             if (
@@ -482,6 +520,7 @@ class GenBoxPushCleanupService:
             attestation_file=gate._attestation_file,
             public_key_file=gate._public_key_file,
             trusted_public_key_sha256=gate._trusted_public_key_sha256,
+            deployment_nonce_file=gate._deployment_nonce_file,
             runtime_binding_provider=gate._runtime_binding_provider,
         )
         self.environment_gate.bind_storage_root(lambda: self.image_storage_root())

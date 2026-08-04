@@ -24,9 +24,10 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--identity-file", required=True, type=Path)
     parser.add_argument("--capability-file", required=True, type=Path)
+    parser.add_argument("--deployment-nonce-file", required=True, type=Path)
     parser.add_argument("--private-key-file", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
-    parser.add_argument("--runtime-binding", required=True)
+    parser.add_argument("--container-runtime-id", required=True)
     parser.add_argument("--ttl-seconds", type=int, default=300)
     args = parser.parse_args()
     if args.ttl_seconds < 30 or args.ttl_seconds > 3600:
@@ -36,6 +37,11 @@ def main() -> int:
         raise SystemExit("identity file must contain an object")
     if args.capability_file.exists():
         raise SystemExit("capability file already exists; start a new isolated runtime instead")
+    if args.deployment_nonce_file.exists():
+        raise SystemExit("deployment nonce file already exists; start a new isolated runtime instead")
+    runtime_identity = args.container_runtime_id.strip().lower()
+    if len(runtime_identity) != 64 or any(char not in "0123456789abcdef" for char in runtime_identity):
+        raise SystemExit("container runtime ID must be a 64-character lowercase SHA-256 value")
     args.capability_file.parent.mkdir(parents=True, exist_ok=True)
     capability = secrets.token_urlsafe(48)
     descriptor = os.open(args.capability_file, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
@@ -56,11 +62,30 @@ def main() -> int:
         pass
     if len(capability) < 32:
         raise SystemExit("capability is too short")
+    args.deployment_nonce_file.parent.mkdir(parents=True, exist_ok=True)
+    nonce_descriptor = os.open(args.deployment_nonce_file, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        deployment_nonce = secrets.token_bytes(32)
+        with os.fdopen(nonce_descriptor, "wb", closefd=True) as handle:
+            handle.write(deployment_nonce)
+            handle.flush()
+            os.fsync(handle.fileno())
+    except Exception:
+        try:
+            args.deployment_nonce_file.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+    try:
+        args.deployment_nonce_file.chmod(0o600)
+    except OSError:
+        pass
     now = int(time.time())
     payload = {
         **identity,
-        "version": 2,
-        "runtime_binding": args.runtime_binding,
+        "version": 3,
+        "runtime_binding": runtime_identity,
+        "deployment_nonce_sha256": hashlib.sha256(deployment_nonce).hexdigest(),
         "capability_sha256": hashlib.sha256(capability.encode("utf-8")).hexdigest(),
         "not_before": now,
         "expires_at": now + args.ttl_seconds,

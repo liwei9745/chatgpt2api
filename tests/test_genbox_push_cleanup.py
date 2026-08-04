@@ -289,7 +289,10 @@ class GenBoxPushCleanupTests(unittest.TestCase):
         self.capability = "synthetic-capability-32-bytes-000000000000"
         self.capability_file = self.tmp / "cleanup-capability"
         self.capability_file.write_text(self.capability, encoding="ascii")
-        self.runtime_binding = "synthetic-runtime-binding"
+        self.deployment_nonce = os.urandom(32)
+        self.deployment_nonce_file = self.tmp / "cleanup-deployment-nonce"
+        self.deployment_nonce_file.write_bytes(self.deployment_nonce)
+        self.runtime_binding = "b" * 64
         self.private_key = Ed25519PrivateKey.generate()
         self.public_key = self.tmp / "cleanup-attestation-public.pem"
         self.public_key.write_bytes(self.private_key.public_key().public_bytes(
@@ -315,8 +318,9 @@ class GenBoxPushCleanupTests(unittest.TestCase):
                 "image_digest": self.image_digest,
                 "marker_sha256": marker_hash,
                 "trusted_destination_scope": destination_scope,
-            "version": 2,
+            "version": 3,
             "runtime_binding": self.runtime_binding,
+            "deployment_nonce_sha256": hashlib.sha256(self.deployment_nonce).hexdigest(),
             "capability_sha256": hashlib.sha256(self.capability.encode("utf-8")).hexdigest(),
             "not_before": int(time.time()) - 5,
             "expires_at": int(time.time()) + 300,
@@ -344,6 +348,7 @@ class GenBoxPushCleanupTests(unittest.TestCase):
             "CHATGPT2API_CLEANUP_SERVICE_PORT": str(self.service_port),
             "CHATGPT2API_CLEANUP_IMAGE_DIGEST": self.image_digest,
             "CHATGPT2API_CLEANUP_CAPABILITY_FILE": str(self.capability_file),
+            "CHATGPT2API_CLEANUP_DEPLOYMENT_NONCE_FILE": str(self.deployment_nonce_file),
             "CHATGPT2API_CLEANUP_ATTESTATION_FILE": str(self.attestation),
             "CHATGPT2API_CLEANUP_ATTESTATION_PUBLIC_KEY_FILE": str(self.public_key),
             "TEST_RUNTIME_BINDING": self.runtime_binding,
@@ -403,8 +408,9 @@ class GenBoxPushCleanupTests(unittest.TestCase):
             "image_digest": self.image_digest,
             "marker_sha256": self.gate.environ["CHATGPT2API_CLEANUP_MARKER_SHA256"],
             "trusted_destination_scope": self._scope(),
-            "version": 2,
+            "version": 3,
             "runtime_binding": self.runtime_binding,
+            "deployment_nonce_sha256": hashlib.sha256(self.deployment_nonce).hexdigest(),
             "capability_sha256": hashlib.sha256(capability.encode("utf-8")).hexdigest(),
             "not_before": int(time.time()) - 5,
             "expires_at": int(time.time()) + 300,
@@ -875,6 +881,45 @@ class GenBoxPushCleanupTests(unittest.TestCase):
         self.assertEqual(result.get("blocked_reason"), "runtime-identity-unverified")
         self.assertTrue(target.exists())
 
+    def test_same_hostname_full_authority_clone_is_rejected_by_container_runtime_identity(self) -> None:
+        target = self._record()
+        self._enable_policy()
+        clone = self.tmp / "same-hostname-clone"
+        clone.mkdir()
+        clone_attestation = clone / "runtime-attestation.json"
+        clone_capability = clone / "cleanup-capability"
+        clone_nonce = clone / "cleanup-deployment-nonce"
+        clone_public_key = clone / "cleanup-attestation-public.pem"
+        clone_attestation.write_bytes(self.attestation.read_bytes())
+        clone_capability.write_bytes(self.capability_file.read_bytes())
+        clone_nonce.write_bytes(self.deployment_nonce_file.read_bytes())
+        clone_public_key.write_bytes(self.public_key.read_bytes())
+        clone_environment = dict(self.gate.environ)
+        clone_environment.update({
+            "HOSTNAME": "copied-hostname",
+            "CHATGPT2API_CLEANUP_ATTESTATION_FILE": str(clone_attestation),
+            "CHATGPT2API_CLEANUP_CAPABILITY_FILE": str(clone_capability),
+            "CHATGPT2API_CLEANUP_DEPLOYMENT_NONCE_FILE": str(clone_nonce),
+            "CHATGPT2API_CLEANUP_ATTESTATION_PUBLIC_KEY_FILE": str(clone_public_key),
+        })
+        clone_service = GenBoxPushCleanupService(
+            state_file=clone / "cleanup.json",
+            audit_file=clone / "audit.json",
+            settings_file=self.settings,
+            image_storage=self.storage,
+            environment_gate=CleanupEnvironmentGate(
+                clone_environment,
+                attestation_file=clone_attestation,
+                public_key_file=clone_public_key,
+                deployment_nonce_file=clone_nonce,
+                runtime_binding_provider=lambda: "c" * 64,
+            ),
+        )
+
+        self.assertFalse(clone_service.initialize_runtime_capability())
+        self.assertEqual(clone_service.execute().get("blocked_reason"), "runtime-identity-unverified")
+        self.assertTrue(target.exists())
+
     def test_startup_requires_external_files_and_never_creates_them(self) -> None:
         target = self._record()
         self._enable_policy()
@@ -904,6 +949,7 @@ class GenBoxPushCleanupTests(unittest.TestCase):
         identity_file = self.tmp / "issuer-identity.json"
         private_key_file = self.tmp / "issuer-private.pem"
         issued_capability = self.tmp / "issued-capability"
+        issued_nonce = self.tmp / "issued-deployment-nonce"
         issued_attestation = self.tmp / "issued-attestation.json"
         identity_file.write_text(json.dumps({
             "instance_id": self.instance_id,
@@ -926,13 +972,15 @@ class GenBoxPushCleanupTests(unittest.TestCase):
             sys.executable, str(issuer),
             "--identity-file", str(identity_file),
             "--capability-file", str(issued_capability),
+            "--deployment-nonce-file", str(issued_nonce),
             "--private-key-file", str(private_key_file),
             "--output", str(issued_attestation),
-            "--runtime-binding", self.runtime_binding,
+            "--container-runtime-id", self.runtime_binding,
         ], cwd=issuer.parents[1], check=True, capture_output=True, text=True)
 
         environment = dict(self.gate.environ)
         environment["CHATGPT2API_CLEANUP_CAPABILITY_FILE"] = str(issued_capability)
+        environment["CHATGPT2API_CLEANUP_DEPLOYMENT_NONCE_FILE"] = str(issued_nonce)
         environment["CHATGPT2API_CLEANUP_ATTESTATION_FILE"] = str(issued_attestation)
         service = GenBoxPushCleanupService(
             state_file=self.state,
