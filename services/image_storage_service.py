@@ -629,6 +629,20 @@ class ImageStorageService:
         except (ImportError, OSError, ValueError, AttributeError):
             return False
 
+    @classmethod
+    def _posix_write_guard_is_stable(cls, descriptor: int) -> bool:
+        """Observe in-flight lease-break notifications before exact deletion."""
+        if os.name == "nt":
+            return False
+        # A conflicting opener can start immediately before the first
+        # F_GETLEASE observation. Let the kernel report that break while the
+        # source remains named and digest-check it again before the exchange.
+        for _ in range(5):
+            if not cls._posix_write_guard_active(descriptor):
+                return False
+            time.sleep(0.01)
+        return cls._posix_write_guard_active(descriptor)
+
     @staticmethod
     def _close_cleanup_target(target: _OpenedCleanupTarget) -> None:
         try:
@@ -1149,7 +1163,7 @@ class ImageStorageService:
                 return VerifiedDeleteResult(
                     "retained", "path-alias", target.size_bytes, detail="restored-original-entry",
                 )
-            if digest_opened() != target.digest or not self._posix_write_guard_active(target.descriptor):
+            if digest_opened() != target.digest or not self._posix_write_guard_is_stable(target.descriptor):
                 drop_owned_temp()
                 return VerifiedDeleteResult("retained", "source-changed", target.size_bytes)
             step = "exchange"
