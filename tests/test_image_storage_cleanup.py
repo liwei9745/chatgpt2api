@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import subprocess
 import tempfile
+import threading
 import unittest
 from unittest.mock import patch
 
@@ -274,7 +275,7 @@ class ImageStorageCleanupTests(unittest.TestCase):
 
     def test_hard_link_added_after_final_identity_check_is_retained(self) -> None:
         if os.name == "nt":
-            self.skipTest("POSIX hard-link race requires a Linux filesystem")
+            self.skipTest("covered by the Windows real-filesystem race test")
         rel, target, digest = self._source()
         source_identity = self._identity(rel, digest)
         alias = target.with_name("alias-after-final-check.png")
@@ -289,6 +290,40 @@ class ImageStorageCleanupTests(unittest.TestCase):
         self.assertEqual(result.reason, "path-alias")
         self.assertTrue(target.exists())
         self.assertTrue(alias.exists())
+
+    def test_windows_hard_link_race_after_final_identity_check_retains_source(self) -> None:
+        if os.name != "nt":
+            self.skipTest("requires Windows handle and hard-link semantics")
+        rel, target, digest = self._source()
+        source_identity = self._identity(rel, digest)
+        alias = target.with_name("windows-alias-after-final-check.png")
+        linked = threading.Event()
+        failure: list[BaseException] = []
+
+        def add_alias() -> None:
+            try:
+                os.link(target, alias)
+            except BaseException as exc:
+                failure.append(exc)
+            finally:
+                linked.set()
+
+        def race_after_final_check(_opened: object) -> None:
+            worker = threading.Thread(target=add_alias)
+            worker.start()
+            self.assertTrue(linked.wait(timeout=5))
+            worker.join(timeout=5)
+
+        with patch.object(self.storage, "_after_final_identity_check", side_effect=race_after_final_check):
+            result = self.storage.delete_verified_local(rel, digest, expected_identity=source_identity)
+
+        self.assertEqual(failure, [])
+        self.assertEqual(result.status, "retained")
+        self.assertEqual(result.reason, "path-alias")
+        self.assertTrue(target.exists())
+        self.assertTrue(alias.exists())
+        self.assertEqual(target.read_bytes(), b"source-bytes")
+        self.assertEqual(alias.read_bytes(), b"source-bytes")
 
     def test_same_inode_same_size_rewrite_after_final_identity_check_is_retained(self) -> None:
         if os.name == "nt":

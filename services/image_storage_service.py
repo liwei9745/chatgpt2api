@@ -1340,6 +1340,31 @@ class ImageStorageService:
         if final_digest != target.digest or not _same_cleanup_identity(final_stat, target.file_stat):
             return VerifiedDeleteResult("retained", "source-changed", target.size_bytes)
         self._after_final_identity_check(target)
+        # The test seam above represents a real watcher racing after the
+        # earlier observation. Re-establish the final proof immediately before
+        # the platform delete: the opened object, current directory entry, and
+        # content must still be the single verified source.
+        try:
+            os.lseek(target.descriptor, 0, os.SEEK_SET)
+            delete_digest = self._read_open_digest(target.descriptor)
+            os.lseek(target.descriptor, 0, os.SEEK_SET)
+            delete_handle_stat = os.fstat(target.descriptor)
+            delete_path_stat = self._cleanup_stat(target)
+        except FileNotFoundError:
+            return VerifiedDeleteResult("retained", "source-missing", target.size_bytes)
+        except OSError:
+            return VerifiedDeleteResult("retained", "source-changed", target.size_bytes)
+        if (
+            int(getattr(delete_handle_stat, "st_nlink", 1) or 1) != 1
+            or int(getattr(delete_path_stat, "st_nlink", 1) or 1) != 1
+        ):
+            return VerifiedDeleteResult("retained", "path-alias", target.size_bytes)
+        if (
+            delete_digest != target.digest
+            or not _same_cleanup_identity(delete_handle_stat, target.file_stat)
+            or not _same_cleanup_identity(delete_path_stat, target.file_stat)
+        ):
+            return VerifiedDeleteResult("retained", "source-changed", target.size_bytes)
         try:
             if os.name == "nt":
                 # Delete the exact opened file handle rather than resolving the
