@@ -78,3 +78,42 @@ as `latest`, and an unverified registry address are not deployment inputs.
 
 Publishing an image is a separate owner action. Building or testing an image
 locally does not create a registry artifact or authorize deployment.
+
+## Isolated Cleanup Attestation Launch
+
+Source deletion remains disabled unless an isolated Docker host explicitly
+starts a new runtime using `scripts/start_isolated_cleanup_runtime.py`. Run the
+launcher from the host, never from the application image or container. It
+creates the Docker container first, reads Docker's actual container ID, calls
+the sibling host-only issuer, then starts the container with the generated
+capability, deployment nonce, signed attestation, and public key mounted at
+`/run/genbox-cleanup` as read-only files.
+
+The host supplies a new identity JSON and private Ed25519 key through files it
+controls. The launcher checks the Docker image ID and marker hash before it
+creates artifacts. The private key is passed only to the host Python issuer;
+it is never part of a Docker argument, bind mount, image layer, application
+environment, repository, or normal output. Use a new storage parent and a new
+artifact directory for each isolated runtime. A reused marker or artifact
+directory is rejected. The image argument must be a `repository@sha256:...`
+reference; mutable tags are rejected. Keep the private key outside both the
+artifact and storage directories because both directories are mounted into the
+application container.
+
+```text
+python scripts/start_isolated_cleanup_runtime.py \
+  --image registry.example/chatgpt2api@sha256:<immutable-image-id> \
+  --identity-file /secure/identity.json \
+  --private-key-file /secure/issuer-private.pem \
+  --artifact-dir /secure/runtime-artifacts \
+  --storage-parent-host /srv/genbox-isolated/data \
+  --trusted-destination-kind https \
+  --trusted-destination-url https://genbox.example \
+  --trusted-private-host genbox.example
+```
+
+This command is a host-side provisioning step, not a browser/API action. It
+does not contact GenBox, execute cleanup, or verify a VPS. On Windows run it
+with the host Python and Docker Desktop; on macOS and Linux run it with the
+host Python and Docker Engine/Desktop. The same identity and private-key files
+must be protected by the host operator and must never be committed.

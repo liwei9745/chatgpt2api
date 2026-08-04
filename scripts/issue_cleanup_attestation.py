@@ -30,6 +30,7 @@ def main() -> int:
     parser.add_argument("--capability-file", required=True, type=Path)
     parser.add_argument("--deployment-nonce-file", required=True, type=Path)
     parser.add_argument("--private-key-file", required=True, type=Path)
+    parser.add_argument("--public-key-file", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--container-runtime-id", required=True)
     parser.add_argument("--ttl-seconds", type=int, default=300)
@@ -43,6 +44,8 @@ def main() -> int:
         raise SystemExit("capability file already exists; start a new isolated runtime instead")
     if args.deployment_nonce_file.exists():
         raise SystemExit("deployment nonce file already exists; start a new isolated runtime instead")
+    if args.public_key_file.exists():
+        raise SystemExit("public key file already exists; start a new isolated runtime instead")
     runtime_identity = args.container_runtime_id.strip().lower()
     if len(runtime_identity) != 64 or any(char not in "0123456789abcdef" for char in runtime_identity):
         raise SystemExit("container runtime ID must be a 64-character lowercase SHA-256 value")
@@ -97,6 +100,26 @@ def main() -> int:
     private_key = serialization.load_pem_private_key(args.private_key_file.read_bytes(), password=None)
     if not isinstance(private_key, Ed25519PrivateKey):
         raise SystemExit("private key must be Ed25519")
+    public_key = private_key.public_key().public_bytes(
+        serialization.Encoding.PEM,
+        serialization.PublicFormat.SubjectPublicKeyInfo,
+    )
+    public_descriptor = os.open(args.public_key_file, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(public_descriptor, "wb", closefd=True) as handle:
+            handle.write(public_key)
+            handle.flush()
+            os.fsync(handle.fileno())
+    except Exception:
+        try:
+            args.public_key_file.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+    try:
+        args.public_key_file.chmod(0o600)
+    except OSError:
+        pass
     payload["signature"] = base64.b64encode(private_key.sign(canonical_attestation_bytes(payload))).decode("ascii")
     args.output.parent.mkdir(parents=True, exist_ok=True)
     temp = args.output.with_name(f".{args.output.name}.{os.getpid()}.tmp")

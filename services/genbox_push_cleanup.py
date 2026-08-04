@@ -114,6 +114,12 @@ def _valid_image_digest(value: object) -> str:
     return digest
 
 
+def _container_runtime_identity_from_cgroup(cgroup_data: str) -> str:
+    """Accept one distinct Docker ID; repeated cgroup-v1 controller rows are normal."""
+    matches = set(re.findall(r"(?<![0-9a-f])[0-9a-f]{64}(?![0-9a-f])", cgroup_data.lower()))
+    return next(iter(matches)) if len(matches) == 1 else ""
+
+
 def _container_runtime_identity() -> str:
     """Return a Linux container ID from kernel cgroup metadata, or fail closed."""
     if sys.platform != "linux":
@@ -122,8 +128,7 @@ def _container_runtime_identity() -> str:
         cgroup_data = Path("/proc/self/cgroup").read_text(encoding="utf-8", errors="strict")
     except OSError:
         return ""
-    matches = re.findall(r"(?<![0-9a-f])[0-9a-f]{64}(?![0-9a-f])", cgroup_data.lower())
-    return matches[0] if len(matches) == 1 else ""
+    return _container_runtime_identity_from_cgroup(cgroup_data)
 
 
 def settings_coordination_lock_path(settings_file: Path) -> Path:

@@ -16,6 +16,8 @@ jobs:
             --build-arg CHATGPT2API_CLEANUP_ATTESTATION_TRUST_ANCHOR_SHA256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
             --tag cleanup-anchor-contract .
           test "$(docker run --rm --entrypoint /bin/cat cleanup-anchor-contract /app/services/cleanup_attestation_anchor.py)" = "CLEANUP_ATTESTATION_PUBLIC_KEY_SHA256 = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'"
+          ! docker run --rm --entrypoint /usr/bin/test cleanup-anchor-contract -e /app/scripts/issue_cleanup_attestation.py
+          ! docker run --rm --entrypoint /usr/bin/test cleanup-anchor-contract -e /app/scripts/start_isolated_cleanup_runtime.py
 
   cleanup-security:
     strategy:

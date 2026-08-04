@@ -25,7 +25,11 @@ os.environ.setdefault("CHATGPT2API_AUTH_KEY", "local-test-admin-key")
 
 from services.config import config
 from services.cleanup_attestation import canonical_attestation_bytes
-from services.genbox_push_cleanup import CleanupEnvironmentGate, GenBoxPushCleanupService
+from services.genbox_push_cleanup import (
+    CleanupEnvironmentGate,
+    GenBoxPushCleanupService,
+    _container_runtime_identity_from_cgroup,
+)
 from services.genbox_push_service import GenBoxPushService
 from services.image_storage_service import ImageStorageService, VerifiedDeleteResult
 from services.json_file import write_json_file
@@ -396,6 +400,20 @@ class GenBoxPushCleanupTests(unittest.TestCase):
         import hashlib
 
         return hashlib.sha256(b"https://genbox.test\nchatgpt2api-dev\nsynthetic-push-key").hexdigest()
+
+    def test_cgroup_v1_repeated_container_id_is_one_runtime_identity(self) -> None:
+        container_id = "a" * 64
+        cgroup_data = f"2:cpu:/docker/{container_id}\n1:memory:/docker/{container_id}\n"
+
+        self.assertEqual(_container_runtime_identity_from_cgroup(cgroup_data), container_id)
+
+    def test_cgroup_multiple_distinct_container_ids_fail_closed(self) -> None:
+        cgroup_data = f"2:cpu:/docker/{'a' * 64}\n1:memory:/docker/{'b' * 64}\n"
+
+        self.assertEqual(_container_runtime_identity_from_cgroup(cgroup_data), "")
+
+    def test_cgroup_missing_or_malformed_container_id_fails_closed(self) -> None:
+        self.assertEqual(_container_runtime_identity_from_cgroup("0::/docker/not-a-container-id\n"), "")
 
     def _write_signed_attestation(self, private_key: Ed25519PrivateKey, capability: str) -> None:
         payload = {
@@ -950,6 +968,7 @@ class GenBoxPushCleanupTests(unittest.TestCase):
         private_key_file = self.tmp / "issuer-private.pem"
         issued_capability = self.tmp / "issued-capability"
         issued_nonce = self.tmp / "issued-deployment-nonce"
+        issued_public_key = self.tmp / "issued-public-key.pem"
         issued_attestation = self.tmp / "issued-attestation.json"
         identity_file.write_text(json.dumps({
             "instance_id": self.instance_id,
@@ -976,6 +995,7 @@ class GenBoxPushCleanupTests(unittest.TestCase):
             "--capability-file", str(issued_capability),
             "--deployment-nonce-file", str(issued_nonce),
             "--private-key-file", str(private_key_file),
+            "--public-key-file", str(issued_public_key),
             "--output", str(issued_attestation),
             "--container-runtime-id", self.runtime_binding,
         ], cwd=self.tmp, env=issuer_environment, check=True, capture_output=True, text=True)
@@ -992,13 +1012,203 @@ class GenBoxPushCleanupTests(unittest.TestCase):
             environment_gate=CleanupEnvironmentGate(
                 environment,
                 attestation_file=issued_attestation,
-                public_key_file=self.public_key,
+                public_key_file=issued_public_key,
+                trusted_public_key_sha256=hashlib.sha256(issued_public_key.read_bytes()).hexdigest(),
                 runtime_binding_provider=lambda: self.runtime_binding,
             ),
         )
         self.assertTrue(service.initialize_runtime_capability())
         self.assertGreaterEqual(len(issued_capability.read_text(encoding="ascii").strip()), 32)
+        self.assertEqual(issued_public_key.read_bytes(), self.public_key.read_bytes())
         self.assertTrue(service.environment_gate.can_execute())
+
+    def test_host_launcher_uses_actual_docker_identity_and_read_only_artifacts(self) -> None:
+        launcher = Path(__file__).resolve().parents[1] / "scripts" / "start_isolated_cleanup_runtime.py"
+        fake_docker = self.tmp / "docker.py"
+        docker_log = self.tmp / "docker-commands.jsonl"
+        container_id = "c" * 64
+        container_storage = "/app/data/images"
+        marker_payload = {
+            "version": 1,
+            "instance_id": self.instance_id,
+            "role": "isolated-development",
+            "storage_root": container_storage,
+            "compose_project": self.compose_project,
+            "container_name": self.container_name,
+            "service_port": self.service_port,
+            "image_digest": self.image_digest,
+        }
+        identity = {
+            **{key: value for key, value in marker_payload.items() if key != "version"},
+            "marker_sha256": hashlib.sha256(
+                json.dumps(marker_payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
+            ).hexdigest(),
+            "trusted_destination_scope": self._scope(),
+        }
+        identity_file = self.tmp / "launcher-identity.json"
+        private_key_file = self.tmp / "launcher-private.pem"
+        artifacts = self.tmp / "launcher-artifacts"
+        storage_parent = self.tmp / "launcher-data"
+        identity_file.write_text(json.dumps(identity), encoding="utf-8")
+        private_key_file.write_bytes(self.private_key.private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.PKCS8,
+            serialization.NoEncryption(),
+        ))
+        fake_docker.write_text(
+            "import json, os, sys\n"
+            "args = sys.argv[1:]\n"
+            "with open(os.environ['FAKE_DOCKER_LOG'], 'a', encoding='utf-8') as out: out.write(json.dumps(args) + '\\n')\n"
+            "if args[:2] == ['image', 'inspect']: print(os.environ.get('FAKE_DOCKER_REPO_DIGESTS', '[\\\"registry.test/chatgpt2api@sha256:' + 'a' * 64 + '\\\"]'))\n"
+            "elif args[:1] == ['create']: print('c' * 64)\n"
+            "elif args[:1] == ['inspect']: print('c' * 64)\n"
+            "elif args[:1] == ['start']: print('c' * 64)\n"
+            "elif args[:1] == ['rm']: pass\n"
+            "else: raise SystemExit(9)\n",
+            encoding="utf-8",
+        )
+        launcher_environment = dict(os.environ)
+        launcher_environment.pop("PYTHONPATH", None)
+        launcher_environment["FAKE_DOCKER_LOG"] = str(docker_log)
+        launcher_environment["FAKE_DOCKER_REPO_DIGESTS"] = json.dumps([
+            "registry.test/other@sha256:" + "a" * 64,
+            "registry.test/chatgpt2api@sha256:" + "a" * 64,
+        ])
+        result = subprocess.run([
+            sys.executable, str(launcher), "--image", "registry.test/chatgpt2api@sha256:" + "a" * 64,
+            "--identity-file", str(identity_file),
+            "--private-key-file", str(private_key_file), "--artifact-dir", str(artifacts),
+            "--storage-parent-host", str(storage_parent), "--trusted-destination-kind", "https",
+            "--trusted-destination-url", "https://genbox.test", "--trusted-private-host", "genbox.test",
+            "--docker-command", sys.executable, str(fake_docker),
+        ], cwd=self.tmp, env=launcher_environment, capture_output=True, text=True)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), container_id)
+        self.assertTrue((artifacts / "capability").is_file())
+        self.assertTrue((artifacts / "deployment-nonce").is_file())
+        self.assertTrue((artifacts / "attestation.json").is_file())
+        self.assertTrue((artifacts / "public-key.pem").is_file())
+        self.assertTrue((storage_parent / ".genbox-isolated-cleanup").is_file())
+        commands = [json.loads(line) for line in docker_log.read_text(encoding="utf-8").splitlines()]
+        self.assertEqual([command[0] for command in commands], ["image", "create", "inspect", "start"])
+        create_command = commands[1]
+        self.assertIn(f"type=bind,src={artifacts.resolve()},dst=/run/genbox-cleanup,readonly", create_command)
+        self.assertNotIn(str(private_key_file), create_command)
+        self.assertIn("33010:80", create_command)
+        self.assertIn("CHATGPT2API_CLEANUP_TRUSTED_DESTINATION_URL=https://genbox.test", create_command)
+
+    def test_host_launcher_rejects_other_repository_digest_with_same_hash(self) -> None:
+        launcher = Path(__file__).resolve().parents[1] / "scripts" / "start_isolated_cleanup_runtime.py"
+        fake_docker = self.tmp / "digest-docker.py"
+        marker_payload = {
+            "version": 1, "instance_id": self.instance_id, "role": "isolated-development",
+            "storage_root": "/app/data/images", "compose_project": self.compose_project,
+            "container_name": self.container_name, "service_port": self.service_port,
+            "image_digest": self.image_digest,
+        }
+        identity = {
+            **{key: value for key, value in marker_payload.items() if key != "version"},
+            "marker_sha256": hashlib.sha256(
+                json.dumps(marker_payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
+            ).hexdigest(),
+            "trusted_destination_scope": self._scope(),
+        }
+        identity_file = self.tmp / "digest-identity.json"
+        private_key_file = self.tmp / "digest-private.pem"
+        identity_file.write_text(json.dumps(identity), encoding="utf-8")
+        private_key_file.write_bytes(self.private_key.private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.PKCS8,
+            serialization.NoEncryption(),
+        ))
+        fake_docker.write_text(
+            "import json, sys\n"
+            "if sys.argv[1:3] == ['image', 'inspect']: print(json.dumps(['registry.test/other@sha256:' + 'a' * 64]))\n"
+            "else: raise SystemExit(9)\n",
+            encoding="utf-8",
+        )
+        result = subprocess.run([
+            sys.executable, str(launcher), "--image", "registry.test/chatgpt2api@sha256:" + "a" * 64,
+            "--identity-file", str(identity_file), "--private-key-file", str(private_key_file),
+            "--artifact-dir", str(self.tmp / "digest-artifacts"), "--storage-parent-host", str(self.tmp / "digest-data"),
+            "--trusted-destination-kind", "https", "--trusted-destination-url", "https://genbox.test",
+            "--trusted-private-host", "genbox.test", "--docker-command", sys.executable, str(fake_docker),
+        ], cwd=self.tmp, env={key: value for key, value in os.environ.items() if key != "PYTHONPATH"}, capture_output=True, text=True)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Docker image identity does not match", result.stderr)
+
+    def test_host_launcher_rejects_private_key_under_storage_mount(self) -> None:
+        launcher = Path(__file__).resolve().parents[1] / "scripts" / "start_isolated_cleanup_runtime.py"
+        storage_parent = self.tmp / "unsafe-storage-parent"
+        storage_parent.mkdir()
+        private_key_file = storage_parent / "issuer-private.pem"
+        private_key_file.write_bytes(self.private_key.private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.PKCS8,
+            serialization.NoEncryption(),
+        ))
+        marker_payload = {
+            "version": 1, "instance_id": self.instance_id, "role": "isolated-development",
+            "storage_root": "/app/data/images", "compose_project": self.compose_project,
+            "container_name": self.container_name, "service_port": self.service_port,
+            "image_digest": self.image_digest,
+        }
+        identity = {
+            **{key: value for key, value in marker_payload.items() if key != "version"},
+            "marker_sha256": hashlib.sha256(
+                json.dumps(marker_payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
+            ).hexdigest(),
+            "trusted_destination_scope": self._scope(),
+        }
+        identity_file = self.tmp / "unsafe-launcher-identity.json"
+        identity_file.write_text(json.dumps(identity), encoding="utf-8")
+        result = subprocess.run([
+            sys.executable, str(launcher), "--image", "registry.test/chatgpt2api@sha256:" + "a" * 64,
+            "--identity-file", str(identity_file), "--private-key-file", str(private_key_file),
+            "--artifact-dir", str(self.tmp / "unsafe-artifacts"), "--storage-parent-host", str(storage_parent),
+            "--trusted-destination-kind", "https", "--trusted-destination-url", "https://genbox.test",
+            "--trusted-private-host", "genbox.test",
+        ], cwd=self.tmp, env={key: value for key, value in os.environ.items() if key != "PYTHONPATH"}, capture_output=True, text=True)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("private key must not be inside", result.stderr)
+
+    def test_host_launcher_rejects_mutable_image_tag_before_docker_is_called(self) -> None:
+        launcher = Path(__file__).resolve().parents[1] / "scripts" / "start_isolated_cleanup_runtime.py"
+        marker_payload = {
+            "version": 1, "instance_id": self.instance_id, "role": "isolated-development",
+            "storage_root": "/app/data/images", "compose_project": self.compose_project,
+            "container_name": self.container_name, "service_port": self.service_port,
+            "image_digest": self.image_digest,
+        }
+        identity = {
+            **{key: value for key, value in marker_payload.items() if key != "version"},
+            "marker_sha256": hashlib.sha256(
+                json.dumps(marker_payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
+            ).hexdigest(),
+            "trusted_destination_scope": self._scope(),
+        }
+        identity_file = self.tmp / "mutable-image-identity.json"
+        private_key_file = self.tmp / "mutable-image-private.pem"
+        identity_file.write_text(json.dumps(identity), encoding="utf-8")
+        private_key_file.write_bytes(self.private_key.private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.PKCS8,
+            serialization.NoEncryption(),
+        ))
+        result = subprocess.run([
+            sys.executable, str(launcher), "--image", "registry.test/chatgpt2api:latest",
+            "--identity-file", str(identity_file), "--private-key-file", str(private_key_file),
+            "--artifact-dir", str(self.tmp / "mutable-image-artifacts"),
+            "--storage-parent-host", str(self.tmp / "mutable-image-data"),
+            "--trusted-destination-kind", "https", "--trusted-destination-url", "https://genbox.test",
+            "--trusted-private-host", "genbox.test",
+        ], cwd=self.tmp, env={key: value for key, value in os.environ.items() if key != "PYTHONPATH"}, capture_output=True, text=True)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("image must be an immutable", result.stderr)
 
     def test_signed_attestation_tamper_expiry_and_public_key_replacement_fail_closed(self) -> None:
         target = self._record()
