@@ -16,6 +16,7 @@ from urllib.parse import urlparse
 
 from services.config import DATA_DIR
 from services.cleanup_attestation import verify_attestation_signature
+from services.cleanup_attestation_anchor import CLEANUP_ATTESTATION_PUBLIC_KEY_SHA256
 from services.image_storage_service import ImageStorageService, _is_filesystem_alias, image_storage_service
 from services.json_file import read_json_object
 from services.process_file_lock import ProcessFileLock, ProcessReentrantLock
@@ -161,6 +162,7 @@ class CleanupEnvironmentGate:
         capability: str | None = None,
         attestation_file: Path | None = None,
         public_key_file: Path | None = None,
+        trusted_public_key_sha256: str | None = None,
         runtime_binding_provider: Callable[[], str] | None = None,
     ) -> None:
         self.environ = environ if environ is not None else os.environ
@@ -177,6 +179,10 @@ class CleanupEnvironmentGate:
         )
         configured_public_key = _clean(self.environ.get("CHATGPT2API_CLEANUP_ATTESTATION_PUBLIC_KEY_FILE"))
         self._public_key_file = public_key_file or (Path(configured_public_key) if configured_public_key else None)
+        self._trusted_public_key_sha256 = _clean(
+            trusted_public_key_sha256 if trusted_public_key_sha256 is not None
+            else CLEANUP_ATTESTATION_PUBLIC_KEY_SHA256
+        ).lower()
         self._runtime_binding_provider = runtime_binding_provider or (lambda: _clean(socket.gethostname()))
         self._storage_root_provider: Callable[[], Path] | None = None
 
@@ -286,6 +292,12 @@ class CleanupEnvironmentGate:
             public_key = _read_external_regular_file(self._public_key_file, maximum_bytes=16 * 1024)
             attestation_matches = (
                 attestation.get("version") == RUNTIME_ATTESTATION_VERSION
+                and len(self._trusted_public_key_sha256) == 64
+                and all(char in "0123456789abcdef" for char in self._trusted_public_key_sha256)
+                and hmac.compare_digest(
+                    hashlib.sha256(public_key).hexdigest(),
+                    self._trusted_public_key_sha256,
+                )
                 and all(
                     attestation.get(key) == value for key, value in identity.items()
                 )
@@ -469,6 +481,7 @@ class GenBoxPushCleanupService:
             capability=capability,
             attestation_file=gate._attestation_file,
             public_key_file=gate._public_key_file,
+            trusted_public_key_sha256=gate._trusted_public_key_sha256,
             runtime_binding_provider=gate._runtime_binding_provider,
         )
         self.environment_gate.bind_storage_root(lambda: self.image_storage_root())

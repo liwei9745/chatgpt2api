@@ -6,6 +6,17 @@ on:
   workflow_dispatch:
 
 jobs:
+  anchor-image-contract:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build an image with a test-only immutable anchor
+        run: |
+          docker build --target app \
+            --build-arg CHATGPT2API_CLEANUP_ATTESTATION_TRUST_ANCHOR_SHA256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+            --tag cleanup-anchor-contract .
+          test "$(docker run --rm --entrypoint /bin/cat cleanup-anchor-contract /app/services/cleanup_attestation_anchor.py)" = "CLEANUP_ATTESTATION_PUBLIC_KEY_SHA256 = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'"
+
   cleanup-security:
     strategy:
       fail-fast: false

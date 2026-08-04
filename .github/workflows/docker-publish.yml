@@ -49,6 +49,15 @@ jobs:
           tags: |
             type=sha
 
+      - name: Validate cleanup trust anchor
+        env:
+          ANCHOR: ${{ vars.CHATGPT2API_CLEANUP_ATTESTATION_TRUST_ANCHOR_SHA256 }}
+        run: |
+          if [[ ! "$ANCHOR" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "A 64-character lowercase cleanup attestation trust-anchor SHA-256 repository variable is required."
+            exit 1
+          fi
+
       - name: Build and push image
         id: build
         uses: docker/build-push-action@v6
@@ -60,6 +69,8 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            CHATGPT2API_CLEANUP_ATTESTATION_TRUST_ANCHOR_SHA256=${{ vars.CHATGPT2API_CLEANUP_ATTESTATION_TRUST_ANCHOR_SHA256 }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 

@@ -1,4 +1,5 @@
 ARG TARGETARCH
+ARG CHATGPT2API_CLEANUP_ATTESTATION_TRUST_ANCHOR_SHA256=""
 
 FROM node:22-alpine AS web-build
 
@@ -16,6 +17,7 @@ RUN npm run build
 FROM python:3.13-slim AS app
 
 ARG TARGETARCH
+ARG CHATGPT2API_CLEANUP_ATTESTATION_TRUST_ANCHOR_SHA256=""
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
@@ -53,6 +55,9 @@ COPY config.example.yaml ./
 COPY VERSION ./
 COPY api ./api
 COPY services ./services
+# The public-key fingerprint becomes part of the immutable application image.
+# The private signing key is never copied into this image.
+RUN python -c "import re, sys; from pathlib import Path; value = sys.argv[1].strip().lower(); assert not value or re.fullmatch(r'[0-9a-f]{64}', value), 'trust anchor must be an empty value or SHA-256'; Path('services/cleanup_attestation_anchor.py').write_text(f'CLEANUP_ATTESTATION_PUBLIC_KEY_SHA256 = {value!r}\\n', encoding='ascii')" "$CHATGPT2API_CLEANUP_ATTESTATION_TRUST_ANCHOR_SHA256"
 COPY utils ./utils
 COPY scripts ./scripts
 COPY --from=web-build /app/web-vue/dist ./web_dist

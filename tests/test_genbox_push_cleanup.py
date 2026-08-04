@@ -91,6 +91,7 @@ def _cleanup_process_worker(
             capability=Path(environment["CHATGPT2API_CLEANUP_CAPABILITY_FILE"]).read_text(encoding="ascii").strip(),
             attestation_file=Path(environment["CHATGPT2API_CLEANUP_ATTESTATION_FILE"]),
             public_key_file=Path(environment["CHATGPT2API_CLEANUP_ATTESTATION_PUBLIC_KEY_FILE"]),
+            trusted_public_key_sha256=environment["TEST_TRUST_ANCHOR_SHA256"],
             runtime_binding_provider=lambda: environment["TEST_RUNTIME_BINDING"],
         ),
     )
@@ -122,6 +123,7 @@ def _cleanup_crash_worker(
             capability=Path(environment["CHATGPT2API_CLEANUP_CAPABILITY_FILE"]).read_text(encoding="ascii").strip(),
             attestation_file=Path(environment["CHATGPT2API_CLEANUP_ATTESTATION_FILE"]),
             public_key_file=Path(environment["CHATGPT2API_CLEANUP_ATTESTATION_PUBLIC_KEY_FILE"]),
+            trusted_public_key_sha256=environment["TEST_TRUST_ANCHOR_SHA256"],
             runtime_binding_provider=lambda: environment["TEST_RUNTIME_BINDING"],
         ),
     )
@@ -159,6 +161,7 @@ def _cleanup_crash_after_unlink_worker(
             capability=Path(environment["CHATGPT2API_CLEANUP_CAPABILITY_FILE"]).read_text(encoding="ascii").strip(),
             attestation_file=Path(environment["CHATGPT2API_CLEANUP_ATTESTATION_FILE"]),
             public_key_file=Path(environment["CHATGPT2API_CLEANUP_ATTESTATION_PUBLIC_KEY_FILE"]),
+            trusted_public_key_sha256=environment["TEST_TRUST_ANCHOR_SHA256"],
             runtime_binding_provider=lambda: environment["TEST_RUNTIME_BINDING"],
         ),
     )
@@ -198,6 +201,7 @@ def _cleanup_atomic_crash_worker(
             capability=Path(environment["CHATGPT2API_CLEANUP_CAPABILITY_FILE"]).read_text(encoding="ascii").strip(),
             attestation_file=Path(environment["CHATGPT2API_CLEANUP_ATTESTATION_FILE"]),
             public_key_file=Path(environment["CHATGPT2API_CLEANUP_ATTESTATION_PUBLIC_KEY_FILE"]),
+            trusted_public_key_sha256=environment["TEST_TRUST_ANCHOR_SHA256"],
             runtime_binding_provider=lambda: environment["TEST_RUNTIME_BINDING"],
         ),
     )
@@ -228,6 +232,7 @@ def _cleanup_crash_after_terminal_audit_worker(
             capability=Path(environment["CHATGPT2API_CLEANUP_CAPABILITY_FILE"]).read_text(encoding="ascii").strip(),
             attestation_file=Path(environment["CHATGPT2API_CLEANUP_ATTESTATION_FILE"]),
             public_key_file=Path(environment["CHATGPT2API_CLEANUP_ATTESTATION_PUBLIC_KEY_FILE"]),
+            trusted_public_key_sha256=environment["TEST_TRUST_ANCHOR_SHA256"],
             runtime_binding_provider=lambda: environment["TEST_RUNTIME_BINDING"],
         ),
     )
@@ -290,6 +295,12 @@ class GenBoxPushCleanupTests(unittest.TestCase):
         self.public_key.write_bytes(self.private_key.public_key().public_bytes(
             serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo,
         ))
+        self.trusted_public_key_sha256 = hashlib.sha256(self.public_key.read_bytes()).hexdigest()
+        self.anchor_patch = patch(
+            "services.genbox_push_cleanup.CLEANUP_ATTESTATION_PUBLIC_KEY_SHA256",
+            self.trusted_public_key_sha256,
+        )
+        self.anchor_patch.start()
         self.attestation = self.tmp / "runtime-attestation.json"
         destination_scope = hashlib.sha256(
             b"https://genbox.test\nchatgpt2api-dev\nsynthetic-push-key"
@@ -336,6 +347,7 @@ class GenBoxPushCleanupTests(unittest.TestCase):
             "CHATGPT2API_CLEANUP_ATTESTATION_FILE": str(self.attestation),
             "CHATGPT2API_CLEANUP_ATTESTATION_PUBLIC_KEY_FILE": str(self.public_key),
             "TEST_RUNTIME_BINDING": self.runtime_binding,
+            "TEST_TRUST_ANCHOR_SHA256": self.trusted_public_key_sha256,
             "CHATGPT2API_CLEANUP_MARKER_SHA256": marker_hash,
             "CHATGPT2API_CLEANUP_TRUSTED_DESTINATION_KIND": "https",
             "CHATGPT2API_CLEANUP_TRUSTED_DESTINATION_URL": "https://genbox.test",
@@ -367,6 +379,7 @@ class GenBoxPushCleanupTests(unittest.TestCase):
             self.config_patch.stop()
         if self.claim_path_patch is not None:
             self.claim_path_patch.stop()
+        self.anchor_patch.stop()
         for path in sorted(self.tmp.rglob("*"), key=lambda item: len(item.parts), reverse=True):
             if path.is_file() or path.is_symlink():
                 path.unlink()
@@ -378,6 +391,28 @@ class GenBoxPushCleanupTests(unittest.TestCase):
         import hashlib
 
         return hashlib.sha256(b"https://genbox.test\nchatgpt2api-dev\nsynthetic-push-key").hexdigest()
+
+    def _write_signed_attestation(self, private_key: Ed25519PrivateKey, capability: str) -> None:
+        payload = {
+            "instance_id": self.instance_id,
+            "role": "isolated-development",
+            "storage_root": str(self.images.resolve()),
+            "compose_project": self.compose_project,
+            "container_name": self.container_name,
+            "service_port": self.service_port,
+            "image_digest": self.image_digest,
+            "marker_sha256": self.gate.environ["CHATGPT2API_CLEANUP_MARKER_SHA256"],
+            "trusted_destination_scope": self._scope(),
+            "version": 2,
+            "runtime_binding": self.runtime_binding,
+            "capability_sha256": hashlib.sha256(capability.encode("utf-8")).hexdigest(),
+            "not_before": int(time.time()) - 5,
+            "expires_at": int(time.time()) + 300,
+        }
+        payload["signature"] = base64.b64encode(
+            private_key.sign(canonical_attestation_bytes(payload))
+        ).decode("ascii")
+        self.attestation.write_text(json.dumps(payload, separators=(",", ":"), sort_keys=True), encoding="utf-8")
 
     def _record(self, path: str = "2026/08/01/image.png", payload: bytes = b"synthetic-image") -> Path:
         target = self.images / path
@@ -937,6 +972,40 @@ class GenBoxPushCleanupTests(unittest.TestCase):
         )
         self.public_key.write_bytes(other)
         self.assertEqual(self.service.execute().get("blocked_reason"), "runtime-identity-unverified")
+
+    def test_combined_authority_artifact_substitution_cannot_replace_image_trust_anchor(self) -> None:
+        target = self._record()
+        self._enable_policy()
+        attacker_private_key = Ed25519PrivateKey.generate()
+        attacker_capability = "attacker-capability-32-bytes-0000000000000"
+        attacker_public_key = attacker_private_key.public_key().public_bytes(
+            serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo,
+        )
+        self.capability_file.write_text(attacker_capability, encoding="ascii")
+        self.public_key.write_bytes(attacker_public_key)
+        self._write_signed_attestation(attacker_private_key, attacker_capability)
+        environment = dict(self.gate.environ)
+        # This is intentionally ignored: an application environment cannot
+        # replace the immutable image's public-key fingerprint.
+        environment["CHATGPT2API_CLEANUP_ATTESTATION_TRUST_ANCHOR_SHA256"] = hashlib.sha256(
+            attacker_public_key
+        ).hexdigest()
+        replacement_service = GenBoxPushCleanupService(
+            state_file=self.state,
+            audit_file=self.audit,
+            settings_file=self.settings,
+            image_storage=self.storage,
+            environment_gate=CleanupEnvironmentGate(
+                environment,
+                attestation_file=self.attestation,
+                public_key_file=self.public_key,
+                runtime_binding_provider=lambda: self.runtime_binding,
+            ),
+        )
+
+        self.assertFalse(replacement_service.initialize_runtime_capability())
+        self.assertEqual(replacement_service.execute().get("blocked_reason"), "runtime-identity-unverified")
+        self.assertTrue(target.exists())
 
     def test_capability_replay_against_new_runtime_is_rejected(self) -> None:
         target = self._record()
