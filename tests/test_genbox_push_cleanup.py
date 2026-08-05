@@ -265,7 +265,7 @@ class GenBoxPushCleanupTests(unittest.TestCase):
         self.images = self.tmp / "images"
         self.protected_staging = self.tmp / "protected-staging"
         self.protected_staging.mkdir()
-        if os.name != "nt":
+        if sys.platform == "linux":
             try:
                 os.chown(self.protected_staging, 65534, 65534)
             except (AttributeError, PermissionError, OSError):

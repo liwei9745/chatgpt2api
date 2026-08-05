@@ -5,6 +5,7 @@ import multiprocessing
 import os
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import threading
 import unittest
@@ -51,7 +52,7 @@ class ImageStorageCleanupTests(unittest.TestCase):
         self.images = self.tmp / "images"
         self.protected_staging = self.tmp / "protected-staging"
         self.protected_staging.mkdir()
-        if os.name != "nt":
+        if sys.platform == "linux":
             try:
                 os.chown(self.protected_staging, 65534, 65534)
             except (AttributeError, PermissionError, OSError):
@@ -99,6 +100,8 @@ class ImageStorageCleanupTests(unittest.TestCase):
         return dict(identity["source_identity"])
 
     def test_replacement_after_verification_is_retained(self) -> None:
+        if os.name != "nt" and sys.platform != "linux":
+            self.skipTest("POSIX write-lease delete primitive requires Linux")
         rel, target, digest = self._source()
         source_identity = self._identity(rel, digest)
         replacement = target.with_name("replacement.png")

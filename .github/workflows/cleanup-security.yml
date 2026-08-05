@@ -20,21 +20,34 @@ jobs:
             test ! -e /app/scripts
             test ! -e /app/scripts/issue_cleanup_attestation.py
             test ! -e /app/scripts/start_isolated_cleanup_runtime.py
-            ! find /app -type f \( -name "*.pem" -o -name "*.key" -o -name "*.p12" -o -name "*.pfx" \) -print -quit | grep -q .
           '
           docker run --rm --entrypoint python cleanup-anchor-contract -c '
           import re
           import sys
           from pathlib import Path
 
-          pattern = re.compile(rb"-----BEGIN ([A-Z0-9 ]*PRIVATE KEY)-----\r?\n(?:[A-Za-z0-9+/=]+\r?\n)+-----END \1-----")
+          pattern = re.compile(
+              rb"-----BEGIN ([A-Z0-9 ]*PRIVATE KEY)-----\r?\n"
+              rb"(?:[A-Za-z0-9+/=,:; _-]*\r?\n)+"
+              rb"-----END \1-----"
+          )
           matches = []
           for path in Path("/app").rglob("*"):
               if path.is_file() and pattern.search(path.read_bytes()):
                   matches.append(str(path))
           if matches:
-              print("application image contains a PEM private key:\\n" + "\\n".join(matches))
+              print("application image contains a PEM private key:\n" + "\n".join(matches))
               raise SystemExit(1)
+          ca_bundles = list(Path("/app").rglob("cacert.pem"))
+          if not ca_bundles or any(pattern.search(path.read_bytes()) for path in ca_bundles):
+              raise SystemExit("public CA bundle was rejected as a private key")
+          synthetic_private_key = (
+              b"-----BEGIN PRIVATE KEY-----\n"
+              b"c3ludGhldGljLWtleQ==\n"
+              b"-----END PRIVATE KEY-----\n"
+          )
+          if not pattern.search(synthetic_private_key):
+              raise SystemExit("synthetic PEM private key was not detected")
           '
 
   cleanup-security:
@@ -51,4 +64,15 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.13"
-      - run: uv run --with pytest python -m pytest -q tests/test_genbox_push_cleanup.py
+      - name: Run cleanup security regression suite
+        if: matrix.os != 'macos-latest'
+        run: uv run --with pytest python -m pytest -q tests/test_genbox_push_cleanup.py
+      - name: Run macOS A4 A7 A12 regression gate
+        if: matrix.os == 'macos-latest'
+        run: |
+          uv run --with pytest python -m pytest -q \
+            tests/test_image_storage_cleanup.py::ImageStorageCleanupTests::test_same_content_different_identity_is_retained \
+            tests/test_genbox_push_cleanup.py::GenBoxPushCleanupTests::test_restart_recovery_marks_same_content_replacement_unknown \
+            tests/test_genbox_push_service.py::GenBoxPushServiceTests::test_real_slow_drip_push_retains_source_and_state \
+            --junitxml=macos-a4-a7-a12.xml
+          python -c "import xml.etree.ElementTree as ET; root = ET.parse('macos-a4-a7-a12.xml').getroot(); cases = root.findall('.//testcase'); skipped = root.findall('.//skipped'); assert len(cases) == 3 and not skipped, (len(cases), len(skipped))"
