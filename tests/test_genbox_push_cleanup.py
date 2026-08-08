@@ -637,7 +637,7 @@ class GenBoxPushCleanupTests(unittest.TestCase):
         self.assertFalse(self.state.exists())
 
     def test_public_and_audit_projections_redact_source_path_and_receipt(self) -> None:
-        source_path = "2026/08/01/private-user-image.png"
+        source_path = "2026/08/01/synthetic-projection-image.png"
         self._record(source_path)
         self._enable_policy()
 
