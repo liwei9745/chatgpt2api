@@ -23,7 +23,7 @@ Scope: local synthetic sender verification plus hosted cross-platform CI review.
 | A5 | COVERED on Windows synthetic paths | Strict path validation and alias checks cover traversal, symlink, hard-link, and junction paths. Added traversal, absolute, backslash, and empty path tests. Linux-only descriptor and exchange races remain EXTERNAL. |
 | A6 | COVERED | Process-shared source claims plus concurrent thread/spawn-process tests permit one terminal deletion only. |
 | A10 | COVERED | Mixed result reconciliation, busy-source, recovery, and audit-failure tests cover accounting. |
-| A11 | PARTIAL pending redaction follow-up | Public projections use a stable opaque item ID, but the independent review found that storage artifact names could still reach persisted audit/recovery detail. The follow-up now redacts arbitrary storage detail and records only fixed reason/count values; it requires a fresh review and CI run before A11 can be COVERED. |
+| A11 | COVERED locally; platform/external evidence remains separate | Public projections use a stable opaque item ID. Audit and recovery projections retain only fixed reason/count values; synthetic filename, path, SHA, receipt, token, and Push-key scans pass. Hosted platform and runtime-log evidence remain external. |
 
 ## Local Verification
 
@@ -34,7 +34,9 @@ Scope: local synthetic sender verification plus hosted cross-platform CI review.
 - Focused total: 116 passed, 18 skipped. Docker/POSIX/Linux skips are not counted as PASS.
 - `uv run python -m compileall -q api services scripts tests`: passed.
 - `uv run python -m unittest discover -s tests -v`: 185 passed, 18 skipped.
-- `git diff --check`: passed before the implementation commit.
+- `python -m unittest discover -s tests -v`: `185 passed, 18 skipped` after the final redaction/workflow revision.
+- `python -m compileall -q api services scripts tests`: passed after the final revision.
+- `git diff --check`: passed after the final revision.
 
 ## Independent Review and Leakage Check
 
@@ -50,10 +52,13 @@ The tracked-source scan found only intended Push-header handling and documented 
 - `.github/workflows/cleanup-security.yml` now runs the Ubuntu cleanup suite through passwordless local runner elevation and writes JUnit evidence. A post-run assertion rejects an empty or entirely skipped Linux gate. Windows and macOS commands remain platform-specific.
 - Post-fix GitHub Actions run `31256410855` at commit `1e4edfa` passed all four jobs. Ubuntu reported `74 passed`, `3` explicitly gated Docker-integration skips, and `20` subtests; Windows reported `70 passed`, `7` platform/integration skips, and `20` subtests; macOS reported `3 passed` with no skips; the immutable-anchor image contract passed.
 - The final workflow revision runs the sender service, cleanup, and storage suites on Windows and Ubuntu, plus an eight-case A1/A2/A3/A5/A11/core-recovery matrix on macOS. macOS A6 multi-process claim and A10 mixed-result cleanup remain explicitly `EXTERNAL`: both fail their Linux/Windows filesystem assumptions on the hosted macOS runner and are not treated as passes.
+- Final hosted run `31256853882` passed: Windows full service/cleanup/storage suites, Ubuntu full service/cleanup/storage suites, macOS eight-case core matrix, and anchor-image contract.
 
 ## Commits and Push
 
 - `18c4779 security: redact phase6 cleanup projections`
+- `cc7dc33 security: redact cleanup artifact diagnostics`
+- `c5b405e ci: classify macos cleanup semantics explicitly`
 - Push status: branch `codex/phase6-local-gates-20260808` is pushed non-force to `experimental/codex/phase6-local-gates-20260808` on the owner's fork. A previous attempt to push `origin` was rejected with HTTP 403; no force push or alternate history rewrite was used.
 - No PR, tag, release, rc branch, marker, or deployment was created.
 
