@@ -64,9 +64,16 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.13"
-      - name: Run cleanup security regression suite
-        if: matrix.os != 'macos-latest'
+      - name: Run Windows cleanup security regression suite
+        if: matrix.os == 'windows-latest'
         run: uv run --with pytest python -m pytest -q tests/test_genbox_push_cleanup.py
+      - name: Run Linux cleanup security regression suite
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo -n env "PATH=$PATH" PYTHONPATH=. GIT_PYTHON_REFRESH=quiet \
+            uv run --with pytest python -m pytest -q tests/test_genbox_push_cleanup.py \
+              --junitxml=linux-cleanup.xml
+          python -c "import xml.etree.ElementTree as ET; root = ET.parse('linux-cleanup.xml').getroot(); cases = root.findall('.//testcase'); skipped = root.findall('.//skipped'); assert cases and len(skipped) < len(cases), (len(cases), len(skipped))"
       - name: Run macOS A4 A7 A12 regression gate
         if: matrix.os == 'macos-latest'
         run: |

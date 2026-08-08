@@ -2,7 +2,7 @@
 
 Date: 2026-08-08
 
-Scope: local synthetic sender verification only. This record does not claim VPS, cross-project, macOS, user-authorization, Phase 6 completion, Phase 7, or release completion. No runtime cleanup endpoint, execute marker, ports 33010 or 33018, receiver worktree, credentials, user media, or production logs were used.
+Scope: local synthetic sender verification plus hosted cross-platform CI review. This record does not claim VPS, cross-project, user-authorization, Phase 6 completion, Phase 7, or release completion. No runtime cleanup endpoint, execute marker, ports 33010 or 33018, receiver worktree, credentials, user media, or production logs were used.
 
 ## Baseline and Result
 
@@ -41,6 +41,13 @@ Read-only review verdict: PASS. It found no cleanup authority expansion, confirm
 
 The tracked-source scan found only intended Push-header handling and documented placeholder labels. The implementation diff and generated test artifacts contained only synthetic fixture values; no actual credentials, user media, user paths, raw receipts, prompts, or runtime logs were added.
 
+## Platform and CI Follow-up
+
+- GitHub Actions run `31255390109` at commit `57ddfe0` concluded success, but its Ubuntu job executed zero tests: pytest reported `77 skipped`. The test fixture's Linux ownership-boundary setup requires `chown`, which the unprivileged hosted runner cannot perform.
+- The same run's Windows job passed `70` tests with `7` expected platform/integration skips and `20` subtests. Its macOS gate passed all `3` selected A4/A7/A12 cases, and the immutable-anchor image contract passed.
+- A disposable root-run Linux application container exercised the workflow's cleanup suite: `74 passed`, `3 skipped`, and `20` subtests passed. Adding `tests/test_image_storage_cleanup.py` produced `91 passed` and `5 skipped`; the skips were the three explicitly opt-in Docker integration tests plus the Windows-only junction and handle cases.
+- `.github/workflows/cleanup-security.yml` now runs the Ubuntu cleanup suite through passwordless local runner elevation and writes JUnit evidence. A post-run assertion rejects an empty or entirely skipped Linux gate. Windows and macOS commands remain platform-specific.
+
 ## Commits and Push
 
 - `18c4779 security: redact phase6 cleanup projections`
@@ -49,4 +56,4 @@ The tracked-source scan found only intended Push-header handling and documented 
 
 ## External Follow-up and Resume
 
-Windows cannot prove Linux-only POSIX descriptor, atomic-exchange, mount, and Docker integration gates. macOS, isolated-VPS acceptance, real host authority, and human authorization remain external evidence. Resume after re-running the full suite and reviewing Linux/macOS evidence; do not reinterpret this LOCAL record as deployment or release evidence.
+The local Linux POSIX matrix and hosted macOS cases are now covered. The three explicitly opt-in Docker integration tests, isolated-VPS acceptance, real host authority, and human authorization remain external evidence. Resume by reviewing the post-fix GitHub Actions run and arranging the separately authorized Docker/VPS evidence; do not reinterpret this LOCAL/CI record as deployment or release evidence.
