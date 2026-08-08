@@ -707,8 +707,7 @@ class GenBoxPushCleanupService:
     def _public_record(self, record: dict[str, Any]) -> dict[str, object]:
         return {
             "source_id": str(record.get("source_id") or ""),
-            "remote_path": str(record.get("remote_path") or ""),
-            "source_sha256": str(record.get("source_sha256") or ""),
+            "item_identifier": self._opaque_item_identifier(record),
             "receipt_status": str((record.get("receipt") or {}).get("status") or ""),
             "safe_to_delete_source": (record.get("receipt") or {}).get("safe_to_delete_source") is True,
             "cleanup_status": str(record.get("cleanup_status") or ""),
@@ -716,6 +715,17 @@ class GenBoxPushCleanupService:
             "size_bytes": max(0, int(record.get("size_bytes") or 0)),
             "source_retained": str(record.get("cleanup_status") or "") != "deleted",
         }
+
+    @staticmethod
+    def _opaque_item_identifier(record: dict[str, Any]) -> str:
+        """Return a stable audit identifier without projecting a user path."""
+        identity = "\n".join((
+            str(record.get("destination_scope") or ""),
+            str(record.get("source_id") or ""),
+            str(record.get("remote_path") or ""),
+            str(record.get("source_sha256") or ""),
+        )).encode("utf-8")
+        return hashlib.sha256(identity).hexdigest()[:24]
 
     def _inspect(self, record: dict[str, Any]) -> tuple[str, str, int]:
         receipt = record.get("receipt") if isinstance(record.get("receipt"), dict) else {}
@@ -797,8 +807,7 @@ class GenBoxPushCleanupService:
             "mode": mode,
             "timestamp": self.now(),
             "source_id": str(record.get("source_id") or ""),
-            "item_identifier": str(record.get("remote_path") or ""),
-            "source_sha256": str(record.get("source_sha256") or ""),
+            "item_identifier": self._opaque_item_identifier(record),
             "prior_cleanup_status": prior_status,
             "decision": decision,
             "decision_reason": reason,

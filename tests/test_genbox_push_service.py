@@ -264,6 +264,27 @@ class GenBoxPushServiceTests(unittest.TestCase):
         call = self.factory.sessions[0].calls[0]
         self.assertFalse(call["allow_redirects"])
 
+    def test_push_redirect_is_not_followed_or_recorded(self) -> None:
+        self.configure()
+        self.factory.responses.extend([
+            FakeResponse(200, {
+                "ok": True,
+                "contract_version": "v1",
+                "source_id": "chatgpt2api-dev",
+                "max_image_bytes": 4096,
+            }),
+            FakeResponse(307, {}),
+        ])
+
+        with self.assertRaisesRegex(GenBoxPushError, "重定向"):
+            self.service.push_image("2026/07/28/image.png")
+
+        calls = [call for session in self.factory.sessions for call in session.calls]
+        self.assertEqual([call["method"] for call in calls], ["GET", "POST"])
+        self.assertFalse(calls[1]["allow_redirects"])
+        self.assertFalse((self.tmp / "state.json").exists())
+        self.assertFalse((self.tmp / "genbox_push_cleanup.json").exists())
+
     def test_safe_to_delete_source_requires_json_boolean_true(self) -> None:
         self.configure()
         digest = hashlib.sha256(self.image).hexdigest()

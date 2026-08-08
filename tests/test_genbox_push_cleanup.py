@@ -618,6 +618,43 @@ class GenBoxPushCleanupTests(unittest.TestCase):
         self.assertEqual(result["retained"], 1)
         self.assertEqual(result["candidates"], 1)
 
+    def test_receipt_rejects_traversal_and_ambiguous_paths(self) -> None:
+        digest = hashlib.sha256(b"synthetic-image").hexdigest()
+        rejected = ("../outside.png", "/absolute.png", "2026/08/../image.png", "2026\\08\\image.png", "")
+
+        for path in rejected:
+            with self.subTest(path=path), self.assertRaisesRegex(ValueError, "normalized relative path"):
+                self.service.record_receipt(
+                    destination_scope=self._scope(),
+                    source_id="chatgpt2api-dev",
+                    remote_path=path,
+                    source_sha256=digest,
+                    receipt_status="imported",
+                    safe_to_delete_source=True,
+                    size_bytes=len(b"synthetic-image"),
+                )
+
+        self.assertFalse(self.state.exists())
+
+    def test_public_and_audit_projections_redact_source_path_and_receipt(self) -> None:
+        source_path = "2026/08/01/private-user-image.png"
+        self._record(source_path)
+        self._enable_policy()
+
+        result = self.service.execute()
+        item = result["items"][0]
+        audit = json.loads(self.audit.read_text(encoding="utf-8"))["events"][-1]
+        rendered = json.dumps({"item": item, "audit": audit}, sort_keys=True)
+
+        self.assertIn("item_identifier", item)
+        self.assertRegex(str(item["item_identifier"]), r"^[0-9a-f]{24}$")
+        self.assertEqual(item["reclaimed_bytes"], len(b"synthetic-image"))
+        self.assertNotIn(source_path, rendered)
+        self.assertNotIn("remote_path", rendered)
+        self.assertNotIn("source_sha256", rendered)
+        self.assertNotIn("safe_to_delete_source", audit)
+        self.assertNotIn('"receipt":', rendered)
+
     def test_symlink_and_hardlink_aliases_are_retained(self) -> None:
         self._enable_policy()
         source = self.images / "2026/08/01/source.png"
