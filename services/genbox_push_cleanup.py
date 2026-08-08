@@ -811,12 +811,24 @@ class GenBoxPushCleanupService:
             "prior_cleanup_status": prior_status,
             "decision": decision,
             "decision_reason": reason,
-            "decision_detail": str(detail or ""),
+            "decision_detail": self._safe_audit_detail(detail),
             "size_bytes": max(0, int(size_bytes or 0)),
             "reclaimed_bytes": max(0, int(reclaimed_bytes or 0)),
             "receipt_status": str((record.get("receipt") or {}).get("status") or ""),
             "runtime_identity_digest": str(record.get("runtime_identity_digest") or ""),
         }
+
+    @staticmethod
+    def _safe_audit_detail(detail: object) -> str:
+        """Keep audit diagnostics useful without persisting artifact names."""
+        value = str(detail or "").strip()
+        if not value:
+            return ""
+        if value == "restored-original-entry":
+            return value
+        if re.fullmatch(r"artifacts-present:\d+;matching:\d+", value):
+            return value
+        return "storage-detail-redacted"
 
     def _update_record_locked(self, records: dict[str, dict[str, Any]], key: str, **updates: object) -> dict[str, Any]:
         record = dict(records[key])
@@ -1148,7 +1160,11 @@ class GenBoxPushCleanupService:
                 ) if cleanup_token else {"artifacts": [], "matching_artifacts": []}
                 artifact_names = [str(name) for name in artifact_evidence.get("artifacts") or []]
                 matching_artifacts = [str(name) for name in artifact_evidence.get("matching_artifacts") or []]
-                detail = f"artifacts:{';'.join(artifact_names)}" if artifact_names else ""
+                detail = (
+                    f"artifacts-present:{len(artifact_names)};matching:{len(matching_artifacts)}"
+                    if artifact_names
+                    else ""
+                )
                 identity = self.image_storage.verify_local_identity(
                     path,
                     digest,

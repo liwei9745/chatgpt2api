@@ -533,16 +533,23 @@ class GenBoxPushCleanupTests(unittest.TestCase):
         audit = json.loads(self.audit.read_text(encoding="utf-8"))
         self.assertTrue(any(event.get("decision") == "deleted" for event in audit["events"]))
 
-    def test_quarantine_names_are_disclosed_in_audit_detail(self) -> None:
+    def test_quarantine_names_are_redacted_from_audit_detail(self) -> None:
         target = self._record()
         self._enable_policy()
+
+        sensitive_detail = (
+            "quarantined:C:/Users/example/private-image.png;"
+            ".genbox-retained-synthetic;"
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef;"
+            "synthetic-push-key"
+        )
 
         def quarantined_retain(*_args: object, **_kwargs: object) -> VerifiedDeleteResult:
             return VerifiedDeleteResult(
                 "retained",
                 "source-changed",
                 int(target.stat().st_size),
-                detail="quarantined:.genbox-retained-synthetic",
+                detail=sensitive_detail,
             )
 
         with patch.object(self.storage, "delete_verified_local", side_effect=quarantined_retain):
@@ -553,9 +560,23 @@ class GenBoxPushCleanupTests(unittest.TestCase):
         audit = json.loads(self.audit.read_text(encoding="utf-8"))
         retained = [event for event in audit["events"] if event.get("decision") == "retained"]
         self.assertTrue(retained)
+        self.assertEqual(retained[-1].get("decision_detail"), "storage-detail-redacted")
+        serialized = json.dumps(audit, ensure_ascii=False)
+        for value in (
+            "private-image.png",
+            ".genbox-retained-synthetic",
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            "synthetic-push-key",
+        ):
+            self.assertNotIn(value, serialized)
+
         self.assertEqual(
-            retained[-1].get("decision_detail"),
-            "quarantined:.genbox-retained-synthetic",
+            self.service._safe_audit_detail("artifacts-present:1;matching:1;private-image.png"),
+            "storage-detail-redacted",
+        )
+        self.assertEqual(
+            self.service._safe_audit_detail("artifacts-present:2;matching:1"),
+            "artifacts-present:2;matching:1",
         )
 
     def test_changed_source_is_retained(self) -> None:
@@ -2021,7 +2042,8 @@ class GenBoxPushCleanupTests(unittest.TestCase):
         self.assertEqual(recovered, {"retained": 0, "unknown": 1})
         record = next(iter(json.loads(self.state.read_text(encoding="utf-8"))["records"].values()))
         self.assertEqual(record["cleanup_status"], "delete_unknown")
-        self.assertIn(f".genbox-cleanup-{token}.", record.get("recovery_detail") or "")
+        self.assertRegex(record.get("recovery_detail") or "", r"^artifacts-present:\d+;matching:\d+$")
+        self.assertNotIn(token, record.get("recovery_detail") or "")
         self.assertTrue(target.exists())
 
     def test_restart_after_atomic_tombstone_preserves_locatable_artifacts(self) -> None:
@@ -2072,7 +2094,8 @@ class GenBoxPushCleanupTests(unittest.TestCase):
         record = next(iter(json.loads(self.state.read_text(encoding="utf-8"))["records"].values()))
         self.assertEqual(record["cleanup_status"], "delete_unknown")
         self.assertEqual(record["decision_reason"], "interrupted-artifact-retained")
-        self.assertIn(f".genbox-cleanup-{token}.", record.get("recovery_detail") or "")
+        self.assertRegex(record.get("recovery_detail") or "", r"^artifacts-present:\d+;matching:\d+$")
+        self.assertNotIn(token, record.get("recovery_detail") or "")
 
     def test_restart_after_terminal_audit_before_state_commit_is_unknown(self) -> None:
         if os.name == "nt":

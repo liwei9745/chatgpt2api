@@ -9,7 +9,8 @@ Scope: local synthetic sender verification plus hosted cross-platform CI review.
 - Sender worktree: `E:\AI\chatgpt2api-worktrees\phase6-local-gates-20260808`
 - Branch: `codex/phase6-local-gates-20260808`
 - Fixed baseline: `ef3d819cda08e636c595ac6b80fa0b60dbbc8fcf`
-- Implementation commit: `18c4779 security: redact phase6 cleanup projections`
+- Implementation commits: `18c4779 security: redact phase6 cleanup projections`,
+  `1e4edfa ci: prevent skipped linux cleanup gate`, and `cd7205b docs: record repaired linux ci gate`.
 - Receiver reference was read-only and not modified.
 
 ## Gate Matrix
@@ -22,7 +23,7 @@ Scope: local synthetic sender verification plus hosted cross-platform CI review.
 | A5 | COVERED on Windows synthetic paths | Strict path validation and alias checks cover traversal, symlink, hard-link, and junction paths. Added traversal, absolute, backslash, and empty path tests. Linux-only descriptor and exchange races remain EXTERNAL. |
 | A6 | COVERED | Process-shared source claims plus concurrent thread/spawn-process tests permit one terminal deletion only. |
 | A10 | COVERED | Mixed result reconciliation, busy-source, recovery, and audit-failure tests cover accounting. |
-| A11 | COVERED for public/audit projections | Cleanup public and audit projections now use a stable opaque item ID instead of user path/source hash. A regression test excludes path, hash, and raw receipt fields. Internal durable state remains private verification state. |
+| A11 | PARTIAL pending redaction follow-up | Public projections use a stable opaque item ID, but the independent review found that storage artifact names could still reach persisted audit/recovery detail. The follow-up now redacts arbitrary storage detail and records only fixed reason/count values; it requires a fresh review and CI run before A11 can be COVERED. |
 
 ## Local Verification
 
@@ -48,11 +49,12 @@ The tracked-source scan found only intended Push-header handling and documented 
 - A disposable root-run Linux application container exercised the workflow's cleanup suite: `74 passed`, `3 skipped`, and `20` subtests passed. Adding `tests/test_image_storage_cleanup.py` produced `91 passed` and `5 skipped`; the skips were the three explicitly opt-in Docker integration tests plus the Windows-only junction and handle cases.
 - `.github/workflows/cleanup-security.yml` now runs the Ubuntu cleanup suite through passwordless local runner elevation and writes JUnit evidence. A post-run assertion rejects an empty or entirely skipped Linux gate. Windows and macOS commands remain platform-specific.
 - Post-fix GitHub Actions run `31256410855` at commit `1e4edfa` passed all four jobs. Ubuntu reported `74 passed`, `3` explicitly gated Docker-integration skips, and `20` subtests; Windows reported `70 passed`, `7` platform/integration skips, and `20` subtests; macOS reported `3 passed` with no skips; the immutable-anchor image contract passed.
+- The final workflow revision also runs the sender service, cleanup, and storage suites on Windows and Ubuntu, plus a ten-case A1/A2/A3/A5/A6/A10/A11 matrix on macOS. Its result must be re-recorded after the audit-detail redaction follow-up.
 
 ## Commits and Push
 
 - `18c4779 security: redact phase6 cleanup projections`
-- Push status: non-force push to `origin` was attempted after review and leakage scan, but GitHub rejected it with HTTP 403 (the authenticated account lacks permission for `yukkcat/chatgpt2api`). No alternate remote or force push was attempted.
+- Push status: branch `codex/phase6-local-gates-20260808` is pushed non-force to `experimental/codex/phase6-local-gates-20260808` on the owner's fork. A previous attempt to push `origin` was rejected with HTTP 403; no force push or alternate history rewrite was used.
 - No PR, tag, release, rc branch, marker, or deployment was created.
 
 ## External Follow-up and Resume
