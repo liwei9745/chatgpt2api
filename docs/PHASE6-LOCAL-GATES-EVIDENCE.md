@@ -44,7 +44,7 @@ The tracked-source scan found only intended Push-header handling and documented 
 ## Commits and Push
 
 - `18c4779 security: redact phase6 cleanup projections`
-- Push status: pending final repository leakage scan and evidence commit.
+- Push status: non-force push to `origin` was attempted after review and leakage scan, but GitHub rejected it with HTTP 403 (the authenticated account lacks permission for `yukkcat/chatgpt2api`). No alternate remote or force push was attempted.
 - No PR, tag, release, rc branch, marker, or deployment was created.
 
 ## External Follow-up and Resume
