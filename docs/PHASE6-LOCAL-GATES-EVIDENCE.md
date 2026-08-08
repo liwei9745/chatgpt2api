@@ -47,6 +47,7 @@ The tracked-source scan found only intended Push-header handling and documented 
 - The same run's Windows job passed `70` tests with `7` expected platform/integration skips and `20` subtests. Its macOS gate passed all `3` selected A4/A7/A12 cases, and the immutable-anchor image contract passed.
 - A disposable root-run Linux application container exercised the workflow's cleanup suite: `74 passed`, `3 skipped`, and `20` subtests passed. Adding `tests/test_image_storage_cleanup.py` produced `91 passed` and `5 skipped`; the skips were the three explicitly opt-in Docker integration tests plus the Windows-only junction and handle cases.
 - `.github/workflows/cleanup-security.yml` now runs the Ubuntu cleanup suite through passwordless local runner elevation and writes JUnit evidence. A post-run assertion rejects an empty or entirely skipped Linux gate. Windows and macOS commands remain platform-specific.
+- Post-fix GitHub Actions run `31256410855` at commit `1e4edfa` passed all four jobs. Ubuntu reported `74 passed`, `3` explicitly gated Docker-integration skips, and `20` subtests; Windows reported `70 passed`, `7` platform/integration skips, and `20` subtests; macOS reported `3 passed` with no skips; the immutable-anchor image contract passed.
 
 ## Commits and Push
 
@@ -56,4 +57,4 @@ The tracked-source scan found only intended Push-header handling and documented 
 
 ## External Follow-up and Resume
 
-The local Linux POSIX matrix and hosted macOS cases are now covered. The three explicitly opt-in Docker integration tests, isolated-VPS acceptance, real host authority, and human authorization remain external evidence. Resume by reviewing the post-fix GitHub Actions run and arranging the separately authorized Docker/VPS evidence; do not reinterpret this LOCAL/CI record as deployment or release evidence.
+The local Linux POSIX matrix and hosted macOS cases are now covered. The three explicitly opt-in Docker integration tests, isolated-VPS acceptance, real host authority, and human authorization remain external evidence. Resume by arranging the separately authorized Docker/VPS evidence; do not reinterpret this LOCAL/CI record as deployment or release evidence.
