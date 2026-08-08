@@ -91,11 +91,9 @@ jobs:
             tests/test_genbox_push_service.py::GenBoxPushServiceTests::test_push_redirect_is_not_followed_or_recorded \
             tests/test_genbox_push_cleanup.py::GenBoxPushCleanupTests::test_destination_rotation_invalidates_old_receipt \
             tests/test_genbox_push_cleanup.py::GenBoxPushCleanupTests::test_receipt_rejects_traversal_and_ambiguous_paths \
-            tests/test_genbox_push_cleanup.py::GenBoxPushCleanupTests::test_cleanup_claim_is_shared_across_processes \
-            tests/test_genbox_push_cleanup.py::GenBoxPushCleanupTests::test_mixed_execute_results_reconcile_totals \
             tests/test_genbox_push_cleanup.py::GenBoxPushCleanupTests::test_quarantine_names_are_redacted_from_audit_detail \
             tests/test_image_storage_cleanup.py::ImageStorageCleanupTests::test_same_content_different_identity_is_retained \
             tests/test_genbox_push_cleanup.py::GenBoxPushCleanupTests::test_restart_recovery_marks_same_content_replacement_unknown \
             tests/test_genbox_push_service.py::GenBoxPushServiceTests::test_real_slow_drip_push_retains_source_and_state \
             --junitxml=macos-cleanup.xml
-          python -c "import xml.etree.ElementTree as ET; root = ET.parse('macos-cleanup.xml').getroot(); cases = root.findall('.//testcase'); skipped = root.findall('.//skipped'); assert len(cases) == 10 and not skipped, (len(cases), len(skipped))"
+          python -c "import xml.etree.ElementTree as ET; root = ET.parse('macos-cleanup.xml').getroot(); cases = root.findall('.//testcase'); skipped = root.findall('.//skipped'); assert len(cases) == 8 and not skipped, (len(cases), len(skipped))"

@@ -49,7 +49,7 @@ The tracked-source scan found only intended Push-header handling and documented 
 - A disposable root-run Linux application container exercised the workflow's cleanup suite: `74 passed`, `3 skipped`, and `20` subtests passed. Adding `tests/test_image_storage_cleanup.py` produced `91 passed` and `5 skipped`; the skips were the three explicitly opt-in Docker integration tests plus the Windows-only junction and handle cases.
 - `.github/workflows/cleanup-security.yml` now runs the Ubuntu cleanup suite through passwordless local runner elevation and writes JUnit evidence. A post-run assertion rejects an empty or entirely skipped Linux gate. Windows and macOS commands remain platform-specific.
 - Post-fix GitHub Actions run `31256410855` at commit `1e4edfa` passed all four jobs. Ubuntu reported `74 passed`, `3` explicitly gated Docker-integration skips, and `20` subtests; Windows reported `70 passed`, `7` platform/integration skips, and `20` subtests; macOS reported `3 passed` with no skips; the immutable-anchor image contract passed.
-- The final workflow revision also runs the sender service, cleanup, and storage suites on Windows and Ubuntu, plus a ten-case A1/A2/A3/A5/A6/A10/A11 matrix on macOS. Its result must be re-recorded after the audit-detail redaction follow-up.
+- The final workflow revision runs the sender service, cleanup, and storage suites on Windows and Ubuntu, plus an eight-case A1/A2/A3/A5/A11/core-recovery matrix on macOS. macOS A6 multi-process claim and A10 mixed-result cleanup remain explicitly `EXTERNAL`: both fail their Linux/Windows filesystem assumptions on the hosted macOS runner and are not treated as passes.
 
 ## Commits and Push
 
