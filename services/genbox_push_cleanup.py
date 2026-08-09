@@ -706,7 +706,6 @@ class GenBoxPushCleanupService:
 
     def _public_record(self, record: dict[str, Any]) -> dict[str, object]:
         return {
-            "source_id": str(record.get("source_id") or ""),
             "item_identifier": self._opaque_item_identifier(record),
             "receipt_status": str((record.get("receipt") or {}).get("status") or ""),
             "safe_to_delete_source": (record.get("receipt") or {}).get("safe_to_delete_source") is True,
@@ -806,7 +805,6 @@ class GenBoxPushCleanupService:
             "operation_id": operation_id,
             "mode": mode,
             "timestamp": self.now(),
-            "source_id": str(record.get("source_id") or ""),
             "item_identifier": self._opaque_item_identifier(record),
             "prior_cleanup_status": prior_status,
             "decision": decision,
@@ -815,7 +813,6 @@ class GenBoxPushCleanupService:
             "size_bytes": max(0, int(size_bytes or 0)),
             "reclaimed_bytes": max(0, int(reclaimed_bytes or 0)),
             "receipt_status": str((record.get("receipt") or {}).get("status") or ""),
-            "runtime_identity_digest": str(record.get("runtime_identity_digest") or ""),
         }
 
     @staticmethod

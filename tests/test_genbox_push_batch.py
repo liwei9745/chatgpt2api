@@ -306,8 +306,13 @@ class GenBoxPushBatchServiceTests(unittest.TestCase):
         self.assertFalse(first.is_alive())
         self.assertFalse(second.is_alive())
         self.assertEqual(sum(item is not None for item in claimed), 1)
-        state = self.batches.get(str(batch["id"]))
-        self.assertEqual(state["sending"], 1)
+        claimed_item = next(item for item in claimed if item is not None)
+        assert claimed_item is not None
+        try:
+            state = self.batches.get(str(batch["id"]))
+            self.assertEqual(state["sending"], 1)
+        finally:
+            claimed_item[3].release()
 
     def test_separate_processes_cannot_claim_the_same_item(self) -> None:
         batch = self.batches.create(["2026/07/28/one.png"], start_worker=False)

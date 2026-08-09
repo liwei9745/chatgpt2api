@@ -38,6 +38,32 @@ Scope: local synthetic sender verification plus hosted cross-platform CI review.
 - `python -m compileall -q api services scripts tests`: passed after the final revision.
 - `git diff --check`: passed after the final revision.
 
+## 2026-08-09 Convergence Recheck
+
+This recheck used the separate Sender worktree
+`E:\AI\chatgpt2api-worktrees\phase6-convergence-20260809` at fixed commit
+`3beb17012e108e468843d3adf540a4e196bfd701`. It is local evidence only; it
+does not authorize cleanup, deployment, a Phase 6 completion claim, Phase 7,
+or release work.
+
+- An independent review found that cleanup public and audit projections still
+  emitted raw `source_id`; audit events also emitted `runtime_identity_digest`.
+  Those fields have been removed from the projections. Durable internal state
+  still retains them for receipt and runtime-identity validation. The A11
+  projection regression now asserts that neither field nor its synthetic value
+  appears in a rendered public item or audit event.
+- Windows synthetic verification after the fix: the focused A11 test passed;
+  `test_genbox_push_cleanup.py` passed `77` tests with `7` explicit
+  platform/Docker-integration skips. `git diff --check` passed.
+- The local Docker sender/receiver smoke used only prebuilt local images, an
+  internal Docker network, generated temporary credentials, and synthetic PNG
+  data. It did not pull images or publish host ports; it passed initial import,
+  idempotent retry, interrupted batch recovery, scheduled late-item discovery,
+  and source retention. All labelled smoke resources were absent after exit.
+- The existing GitHub workflow continues to require nonempty, non-all-skipped
+  JUnit suites on Windows and Ubuntu. No new hosted CI run was created by this
+  local recheck.
+
 ## Independent Review and Leakage Check
 
 Read-only review verdict: PASS. It found no cleanup authority expansion, confirmation bypass, path-boundary regression, false success result, newly skipped test, or live credential in the implementation diff. All new tests executed rather than skipped.

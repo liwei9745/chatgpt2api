@@ -673,6 +673,10 @@ class GenBoxPushCleanupTests(unittest.TestCase):
         self.assertNotIn(source_path, rendered)
         self.assertNotIn("remote_path", rendered)
         self.assertNotIn("source_sha256", rendered)
+        self.assertNotIn("source_id", audit)
+        self.assertNotIn("runtime_identity_digest", audit)
+        self.assertNotIn("chatgpt2api-dev", rendered)
+        self.assertNotIn(self.gate.runtime_identity_digest(), rendered)
         self.assertNotIn("safe_to_delete_source", audit)
         self.assertNotIn('"receipt":', rendered)
 
