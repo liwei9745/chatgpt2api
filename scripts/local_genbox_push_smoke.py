@@ -215,7 +215,7 @@ import threading
 
 from PIL import Image
 
-from services.genbox_push_service import GenBoxPushService
+from services.genbox_push_service import GenBoxPushError, GenBoxPushService
 from services.genbox_push_batch import GenBoxPushBatchService
 from services.genbox_push_schedule import GenBoxPushScheduleService
 from services.genbox_push_transfer import GenBoxPushTransferCoordinator
@@ -294,6 +294,20 @@ assert gated.calls == 1, gated.calls
 first = coordinated_results[0]
 second = service.push_image(relative_path, prompt="local synthetic smoke image", model="local-smoke")
 
+# A rejected receiver authentication must leave an unacknowledged synthetic
+# source untouched. Restore the generated key before the recovery checks.
+failure_path = image_path.with_name("failure-retained.png")
+Image.new("RGB", (2, 2), (127, 18, 68)).save(failure_path, format="PNG")
+service.update_settings({"push_key": "local-smoke-invalid-key"})
+try:
+    service.push_image("local-smoke/failure-retained.png", prompt="local synthetic failed delivery", model="local-smoke")
+except GenBoxPushError:
+    pass
+else:
+    raise AssertionError("receiver accepted the intentionally invalid synthetic Push key")
+assert failure_path.is_file(), "failed delivery removed the synthetic source image"
+service.update_settings({"push_key": os.environ["LOCAL_SMOKE_PUSH_KEY"]})
+
 # Simulate a process stop after the receiver has accepted the image but before
 # the batch worker persisted its terminal status. Restart recovery must retry
 # the durable item safely; the receiver then returns its idempotent outcome.
@@ -367,6 +381,18 @@ for path in (
 ):
     path.unlink(missing_ok=True)
 
+# Cleanup remains fail-closed for this ordinary local sender runtime. Preview
+# may report the durable receipts, but it cannot delete any synthetic source.
+cleanup_settings = service.cleanup_service.settings()
+cleanup_preview = service.cleanup_service.preview()
+assert cleanup_settings["enabled"] is False, cleanup_settings
+assert cleanup_settings["execute_available"] is False, cleanup_settings
+assert cleanup_preview["mode"] == "dry-run", cleanup_preview
+assert cleanup_preview["candidates"] >= 3, cleanup_preview
+assert cleanup_preview["deleted"] == 0, cleanup_preview
+assert cleanup_preview["retained"] == cleanup_preview["candidates"], cleanup_preview
+assert all(item["source_retained"] is True for item in cleanup_preview["items"]), cleanup_preview
+
 assert image_path.is_file(), "sender source image was deleted"
 assert first["status"] == "imported", first
 assert second["status"] == "already-imported", second
@@ -380,9 +406,14 @@ print("LOCAL_SMOKE_RESULT=" + json.dumps({
     "first_status": first["status"],
     "second_status": second["status"],
     "coordinated_physical_calls": gated.calls,
+    "failed_delivery_retained": failure_path.is_file(),
     "resumed_batch_status": resumed["status"],
     "resumed_batch_item_status": resumed["items"][0]["status"],
     "scheduled_late_item_count": second_schedule["succeeded"],
+    "cleanup_preview_mode": cleanup_preview["mode"],
+    "cleanup_preview_candidates": cleanup_preview["candidates"],
+    "cleanup_preview_deleted": cleanup_preview["deleted"],
+    "cleanup_execute_available": cleanup_settings["execute_available"],
     "source_sha256": first["sha256"],
     "source_retained": first["source_retained"] and second["source_retained"],
 }, sort_keys=True))
@@ -501,6 +532,12 @@ def run_smoke(sender_image: str, receiver_image: str) -> dict[str, object]:
             raise SmokeError("Sender result did not prove scheduled late-image discovery.")
         if result.get("source_retained") is not True:
             raise SmokeError("Sender result did not prove source retention.")
+        if result.get("failed_delivery_retained") is not True:
+            raise SmokeError("Sender result did not prove that a failed delivery retains its synthetic source.")
+        if result.get("cleanup_preview_mode") != "dry-run" or result.get("cleanup_preview_deleted") != 0:
+            raise SmokeError("Sender result did not prove a non-destructive cleanup preview.")
+        if result.get("cleanup_execute_available") is not False:
+            raise SmokeError("Ordinary local sender runtime unexpectedly exposed cleanup execution.")
         probe = result.get("probe")
         if not isinstance(probe, dict) or probe.get("contract_version") != "v1":
             raise SmokeError("Sender result did not prove the GenBox Push v1 probe contract.")

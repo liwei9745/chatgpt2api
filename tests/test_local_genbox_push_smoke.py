@@ -38,6 +38,12 @@ class LocalGenBoxPushSmokeTests(unittest.TestCase):
         self.assertIn('assert second["status"] == "already-imported"', job)
         self.assertIn('assert first["sha256"] == hashlib.sha256(payload).hexdigest()', job)
         self.assertIn('assert image_path.is_file()', job)
+        self.assertIn('failure_path = image_path.with_name("failure-retained.png")', job)
+        self.assertIn('service.update_settings({"push_key": "local-smoke-invalid-key"})', job)
+        self.assertIn('assert failure_path.is_file()', job)
+        self.assertIn('cleanup_preview = service.cleanup_service.preview()', job)
+        self.assertIn('assert cleanup_preview["mode"] == "dry-run"', job)
+        self.assertIn('assert cleanup_preview["deleted"] == 0', job)
         self.assertNotIn("image_path.unlink(", job)
 
     def test_runtime_uses_inspected_image_ids_without_pulling(self) -> None:

@@ -64,6 +64,54 @@ or release work.
   JUnit suites on Windows and Ubuntu. No new hosted CI run was created by this
   local recheck.
 
+## 2026-08-10 Local Release-Gate Recheck
+
+This is a local, synthetic recheck at sender commit
+`1d67d06db888604183f8933012fe06a99c897c7b`. It does not authorize a VPS
+operation, protected-port access, user-data access, cleanup outside a temporary
+test root, Phase 6 completion, Phase 7, a tag, or a release.
+
+- A fresh local sender image was built without pulling:
+  `chatgpt2api-phase6-release-gates:1d67d06`
+  (`sha256:08be92509e7a40c08475ea1b383995c9ba2a5e51af145dc0484c5d4bc1c788ce`).
+  The receiver was the prebuilt local-only image
+  `genbox-phase6-final-gate:20260809`
+  (`sha256:cc1948a9df928075a53cb1829c116d418761749e9aaf097dd43d67f466a546b2`).
+- The disposable sender-to-receiver Docker smoke used generated credentials,
+  synthetic 2x2 PNGs, a newly named internal network, and no published host
+  ports, host mounts, volumes, image pulls, or registry operations. It passed
+  initial import, idempotent retry, one physical transfer for concurrent
+  matching requests, interrupted batch recovery, and scheduled discovery of a
+  later synthetic file. Receiver verification found exactly the three expected
+  successful synthetic imports; the intentionally failed delivery was not
+  imported and its sender-side source remained present.
+- The smoke now verifies its own fail-closed cleanup preview after successful
+  transfers: ordinary local settings report cleanup disabled and execution
+  unavailable; the dry run reports only retained candidates and zero deletions.
+  It never calls the cleanup execute API or service method.
+- `uv run python -m unittest discover -s tests -p 'test_local_genbox_push_smoke.py' -v`:
+  8 passed.
+- `uv run python scripts/local_genbox_push_smoke.py --sender-image
+  chatgpt2api-phase6-release-gates:1d67d06 --receiver-image
+  genbox-phase6-final-gate:20260809`: passed.
+- `uv run python -m unittest discover -s tests -p 'test_genbox_push_cleanup.py' -v`:
+  77 passed, 7 explicit platform/Docker-integration skips. This includes the
+  temporary-root dry-run/execute test, retention checks, and crash-recovery
+  checks; its sole synthetic deletion is confined to the test's fresh temporary
+  image root.
+- With `GENBOX_A9_DOCKER_INTEGRATION=1`, the real local Docker Compose
+  launcher test passed. It used fresh temporary artifacts and storage roots,
+  a random loopback port, a stopped disposable container, read-only cleanup
+  artifacts, and verified runtime cgroup binding before startup.
+- `uv run python -m unittest discover -s tests -v`: 185 passed, 18 explicit
+  platform/integration skips. `uv run python -m compileall -q api services
+  scripts tests` and `git diff --check` also passed.
+
+Residual release blockers are unchanged: independent owner-fork clean-clone
+acceptance, separately authorized isolated-VPS evidence, platform cases that
+remain external to this Windows run, runtime/host-owned authorization, and
+human approval for any cleanup execution, remote operation, or release action.
+
 ## Independent Review and Leakage Check
 
 Read-only review verdict: PASS. It found no cleanup authority expansion, confirmation bypass, path-boundary regression, false success result, newly skipped test, or live credential in the implementation diff. All new tests executed rather than skipped.
