@@ -8,14 +8,14 @@ This handoff is a sender-only, local evidence record for the checked-out
 chatgpt2api candidate. It does not modify GenBox, contact a VPS, use a real
 credential, inspect a user image or prompt, bind ports 33010, 33018, or 33019,
 or invoke a cleanup endpoint. Every source file used by the exercised cleanup
-tests was created in a fresh test temporary directory. The Docker daemon was
-not available to this task, so no Docker, Linux-container, or remote execution
-claim is made.
+tests was created in a fresh test temporary directory. Docker was available
+locally and used only with synthetic data, `--network none`, a read-only
+container/filesystem boundary, and no published ports.
 
 ## Candidate Lineage
 
 - Task branch: `codex/phase6-security-gates-20260812`.
-- Task-head commit: `079a29f3f6cc6b46f0f0466a921530992cc5d8c9`.
+- Evidence-verified code commit: `0dce8ee55453590e30be298b072a77b7d97afd81`.
 - Candidate base: `9ad657011b07e3859edee684a009c87dcbdffeab`.
 - Base relationship: `3beb170` is an ancestor of both the CI-convergence line
   (`19c2fdb`) and this release-gates candidate. `9ad6570` and `19c2fdb` are
@@ -25,24 +25,44 @@ claim is made.
 
 ## Reproducible Local Evidence
 
-Windows local synthetic execution through `079a29f`:
+Windows local synthetic execution through `0dce8ee`:
 
-- Focused adversarial matrix: 16 passed. It covers forged/mismatched receipt,
-  forged source identity, POST redirect refusal, destination and Push-key rotation, traversal,
-  symlink/hard-link/junction aliases, Windows hard-link race, concurrent and
-  cross-process deletion claims, mixed-result accounting, busy-source
-  accounting, public/audit redaction, and smoke-output redaction.
-- Sender service, transfer, batch, and cleanup suite: 124 passed, 7 explicit
-  platform/Docker-integration skips.
-- Full sender suite: 186 passed, 18 explicit platform/integration skips.
+- Focused A1-A3 transport/rotation matrix: `33 passed, 0 skipped` (unittest).
+- Sender service, transfer, batch, and cleanup/storage pytest suite:
+  `104 passed, 18 skipped, 24 subtests passed`; JUnit contained 122 cases,
+  with 104 executed and 18 explicit skips.
+- Full sender pytest suite: `170 passed, 18 skipped, 253 subtests passed`;
+  JUnit contained 188 cases, with 170 executed and 18 explicit skips.
+- Full sender unittest discovery: `187 passed, 18 skipped`.
 - Syntax compilation and `git diff --check`: passed.
-- The 18 skips were not counted as a pass. They cover POSIX-specific race
-  mechanics and opt-in local Docker tests unavailable to this Windows task.
+- The 18 Windows skips were not counted as a pass. They cover POSIX-specific
+  race mechanics, Windows-only distinctions, and opt-in Docker integrations.
 
-A secret-pattern source scan, untracked-file scan, generated-artifact scan, and
-200-commit increment-history scan did not find a high-confidence real secret.
-The three tracked PEM matches are intentional synthetic/private-key test
-fixtures only; no match content is reproduced here.
+### Sealed Linux POSIX Evidence
+
+At the same exact commit, a disposable `python:3.13-slim` container ran with
+`--network none`, `--read-only`, the repository mounted read-only, dependencies
+mounted read-only, and only `/tmp` writable. No host ports, remote endpoints,
+VPS, or protected ports were reachable.
+
+- `tests.test_image_storage_cleanup`: `18 passed, 2 skipped` (20 tests).
+- `tests.test_genbox_push_cleanup`: `74 passed, 3 skipped` (77 tests).
+- Combined: `Ran 97 tests`, `92 executed and passed`, `5 explicit skips`, exit 0.
+- Linux-only exchange/tombstone, parent-directory ABA/move, descriptor rewrite,
+  staging replacement, hard-link race, cross-process writer/claim, and crash
+  recovery paths all executed. Skips were limited to Windows-only junction/
+  handle cases and three opt-in Docker/FastAPI launcher tests.
+
+The sealed image was `python:3.13-slim` resolved to repository digest
+`sha256:6771159cd4fa5d9bba1258caf0b82e6b73458c694d178ad97c5e925c2d0e1a91`.
+
+The final A11 scan covered tracked source, the `9ad6570..0dce8ee` incremental
+diff and history, JUnit/log evidence, and generated temporary evidence. The
+incremental diff/history and JUnit/log/generated-evidence scopes had zero
+high-confidence hits. Tracked-source pattern hits were reviewed by filename
+only: one documented placeholder and one intentional synthetic PEM detector;
+no match content is reproduced here. Temporary evidence remains untracked and
+outside the commit.
 
 ## Gate Matrix
 
@@ -51,21 +71,28 @@ fixtures only; no match content is reproduced here.
 | A1 receipt forgery | PASS (local) | Receipt contract, source, digest, status and durable result validation; mismatch test passed. |
 | A2 redirect/downgrade | PASS (local) | GET/POST disable redirects, require TLS verification, and reject 3xx before state/receipt persistence. |
 | A3 rotation/replay | PASS (local) | Transfer scope binds destination, source ID, and Push key; captured context and cleanup rechecks reject rotation. |
-| A5 alias/path traversal | PASS (Windows local) | Traversal, separator, symlink, hard-link, and real junction cases retain the source. POSIX descriptor races remain non-applicable to this platform run. |
-| A6 single delete ownership | PASS (Windows local) | Thread and spawned-process source claims allow one terminal deletion; busy sources remain retained. |
+| A4 identity/TOCTOU | PASS (local + sealed Linux; historical hosted matrix also recorded) | Replacement, same-inode rewrite, hard-link, parent ABA/move, exchange/tombstone, and final-identity checks retain ambiguous sources. |
+| A5 alias/path traversal | PASS (Windows + sealed Linux scope) | Traversal, separator, symlink, hard-link, junction, staging, and descriptor/path-boundary cases retain the source; unsupported platform cases remain explicit skips. |
+| A6 single delete ownership | PASS (Windows + sealed Linux scope) | Thread, spawned-process, write-lease, and cross-process source claims allow one terminal deletion; busy sources remain retained. |
+| A7 crash/restart recovery | PASS (local + sealed Linux; historical CI also recorded) | Exchange/tombstone/index-write/restart recovery resolves ambiguity to retained or delete-unknown without automatic cleanup. |
+| A8 browser authority | PASS (historical local review) | Browser/query/header authority fields are rejected; server-owned cleanup state remains authoritative. |
+| A9 runtime/host attestation | PASS (design/tests; historical local Docker/CI evidence) | Marker, issuer, runtime binding, image-anchor, and launcher contracts are fail-closed; no isolated execute claim is made. |
 | A10 mixed results | PASS (local) | Mixed retained/deleted outcomes and busy-source accounting reconcile totals. |
 | A11 privacy | PASS (local) | Public/audit projection, smoke output, tracked source, artifacts, diff, and 200-commit history scans are redacted/clean under the stated synthetic test scope. |
-| A4/A7/A8/A9/A12 | Not re-opened | Existing evidence only; this task did not reinterpret prior gates as a new completion claim. |
+| A12 bounded/slow receipts | PASS (local + sealed Linux scope; historical CI also recorded) | Slow-drip, bounded streaming, malformed receipt, timeout, and redirect paths retain sources. |
 
 ## Design And Merge Gate
 
-- Design Gate: BLOCKED for full Phase 6 completion. The local implementation
-  evidence is consistent with the sender/GenBox contracts, but the required
-  isolated-execution and clean-owner-redeployment evidence is absent.
-- Merge Gate: PASS for this sender-only candidate's local quality gate: the
-  task branch contains only the reviewed regression/evidence commits;
-  adversarial and full suites passed; syntax, whitespace, and secret scans
-  passed. This is not a release or Phase 6 completion approval.
+- Design Gate: PASS for the sender's local design/contract boundary. A1-A12
+  controls are represented by tests or dated historical CI evidence, with
+  platform scope and skips explicit. This does not change GenBox's separate
+  Phase 6 roadmap state: isolated acceptance, owner-clone redeployment, and
+  production non-mutation remain external completion criteria.
+- Merge Gate: PASS for this sender-only candidate at exact `0dce8ee`: the
+  branch contains only reviewed regression/evidence commits; Windows and
+  sealed Linux suites have nonzero executed counts; syntax, whitespace, and
+  scoped redaction scans passed. Hosted CI for this exact SHA was not awaited,
+  so this is a local merge-quality result, not release approval.
 
 ## Isolated Execute Authorization Package (Prepared Only)
 
@@ -96,10 +123,11 @@ approves the exact isolated target, and an independent reviewer records PASS.
 This file is intentionally standalone and may be summarized by the parallel
 candidate-release task without changing GenBox source-of-truth documents.
 
-- Sender candidate: `079a29f` on `codex/phase6-security-gates-20260812`.
+- Sender candidate: `0dce8ee` on `codex/phase6-security-gates-20260812`.
 - This task adds regression/evidence-only changes atop verified candidate
   `9ad6570`; no production implementation behavior changed.
-- Local quality evidence is PASS for A1/A2/A3/A5/A6/A10/A11; Docker/Linux and
-  isolated execution remain external and are not represented as successful.
+- Local quality evidence is PASS for A1-A12 within the stated local,
+  historical-CI, and sealed-Linux boundaries; isolated execution remains
+  unexecuted and is not represented as successful.
 - Do not label Phase 6, Phase 7, deployment, cleanup execution, or release as
   complete based on this handoff.
