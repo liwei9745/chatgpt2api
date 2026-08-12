@@ -90,14 +90,14 @@ published. The final checkout is clean and contains no tracked evidence copy.
   platform scope and skips explicit. This does not change GenBox's separate
   Phase 6 roadmap state: isolated acceptance, owner-clone redeployment, and
   production non-mutation remain external completion criteria.
-- Merge Gate: PASS for this sender-only candidate at exact `0dce8ee`: the
-  branch contains only reviewed regression/evidence commits; Windows and
-  sealed Linux suites have nonzero executed counts; syntax, whitespace, and
-  scoped redaction scans passed. The follow-up handoff commit was published
-  non-force as `2d5711022fdd1c596df06bbe3e706560e13b5e17`; hosted `Cleanup
-  Security Tests` run `31576063590` passed all four jobs (Windows, Ubuntu,
-  macOS, and anchor-image contract). This remains merge-quality evidence, not
-  release approval.
+- Merge Gate: PASS for this sender-only candidate. The branch contains only
+  reviewed regression/evidence commits; Windows and sealed Linux suites have
+  nonzero executed counts; syntax, whitespace, and scoped redaction scans
+  passed. Hosted `Cleanup Security Tests` passed all four jobs (Windows,
+  Ubuntu, macOS, and anchor-image contract) for both the evidence commit
+  `2d5711022fdd1c596df06bbe3e706560e13b5e17` (run `31576063590`) and final
+  handoff tip `2dc7f636f2a953737e55f304a63e1b34536501c1` (run `31576854639`).
+  This remains merge-quality evidence, not release approval.
 
 ## Isolated Execute Authorization Package (Prepared Only)
 
@@ -128,9 +128,9 @@ approves the exact isolated target, and an independent reviewer records PASS.
 This file is intentionally standalone and may be summarized by the parallel
 candidate-release task without changing GenBox source-of-truth documents.
 
-- Sender candidate: `2d57110` on `codex/phase6-security-gates-20260812`;
-  code/test evidence is bound to `0dce8ee` and the exact-SHA hosted run to
-  `2d571102`.
+- Sender candidate: `2dc7f63` on `codex/phase6-security-gates-20260812`;
+  code/test evidence is bound to `0dce8ee`, and exact-SHA hosted checks pass
+  for both the evidence commit `2d571102` and final handoff tip `2dc7f63`.
 - This task adds regression/evidence-only changes atop verified candidate
   `9ad6570`; no production implementation behavior changed.
 - Local quality evidence is PASS for A1-A12 within the stated local,
