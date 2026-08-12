@@ -15,7 +15,7 @@ container/filesystem boundary, and no published ports.
 ## Candidate Lineage
 
 - Task branch: `codex/phase6-security-gates-20260812`.
-- Evidence-verified code commit: `0dce8ee55453590e30be298b072a77b7d97afd81`.
+- Evidence-verified commit before this handoff update: `0dce8ee55453590e30be298b072a77b7d97afd81`.
 - Candidate base: `9ad657011b07e3859edee684a009c87dcbdffeab`.
 - Base relationship: `3beb170` is an ancestor of both the CI-convergence line
   (`19c2fdb`) and this release-gates candidate. `9ad6570` and `19c2fdb` are
@@ -91,8 +91,11 @@ outside the commit.
 - Merge Gate: PASS for this sender-only candidate at exact `0dce8ee`: the
   branch contains only reviewed regression/evidence commits; Windows and
   sealed Linux suites have nonzero executed counts; syntax, whitespace, and
-  scoped redaction scans passed. Hosted CI for this exact SHA was not awaited,
-  so this is a local merge-quality result, not release approval.
+  scoped redaction scans passed. The follow-up handoff commit was published
+  non-force as `2d5711022fdd1c596df06bbe3e706560e13b5e17`; hosted `Cleanup
+  Security Tests` run `31576063590` passed all four jobs (Windows, Ubuntu,
+  macOS, and anchor-image contract). This remains merge-quality evidence, not
+  release approval.
 
 ## Isolated Execute Authorization Package (Prepared Only)
 
@@ -123,7 +126,9 @@ approves the exact isolated target, and an independent reviewer records PASS.
 This file is intentionally standalone and may be summarized by the parallel
 candidate-release task without changing GenBox source-of-truth documents.
 
-- Sender candidate: `0dce8ee` on `codex/phase6-security-gates-20260812`.
+- Sender candidate: `2d57110` on `codex/phase6-security-gates-20260812`;
+  code/test evidence is bound to `0dce8ee` and the exact-SHA hosted run to
+  `2d571102`.
 - This task adds regression/evidence-only changes atop verified candidate
   `9ad6570`; no production implementation behavior changed.
 - Local quality evidence is PASS for A1-A12 within the stated local,
