@@ -62,7 +62,9 @@ incremental diff/history and JUnit/log/generated-evidence scopes had zero
 high-confidence hits. Tracked-source pattern hits were reviewed by filename
 only: one documented placeholder and one intentional synthetic PEM detector;
 no match content is reproduced here. Temporary evidence remains untracked and
-outside the commit.
+outside the commit and release artifacts. `.phase6-linux-tmp/` was a
+task-workspace-only evidence directory; it was never staged, committed, or
+published. The final checkout is clean and contains no tracked evidence copy.
 
 ## Gate Matrix
 
