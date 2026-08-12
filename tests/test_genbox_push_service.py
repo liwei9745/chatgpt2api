@@ -254,6 +254,32 @@ class GenBoxPushServiceTests(unittest.TestCase):
 
         self.assertFalse((self.tmp / "state.json").exists())
 
+    def test_forged_receipt_source_identity_is_not_recorded(self) -> None:
+        self.configure()
+        digest = hashlib.sha256(self.image).hexdigest()
+        self.factory.responses.extend([
+            FakeResponse(200, {
+                "ok": True,
+                "contract_version": "v1",
+                "source_id": "chatgpt2api-dev",
+                "max_image_bytes": 4096,
+            }),
+            FakeResponse(200, {
+                "ok": True,
+                "contract_version": "v1",
+                "source_id": "forged-source",
+                "sha256": digest,
+                "status": "imported",
+                "safe_to_delete_source": True,
+            }),
+        ])
+
+        with self.assertRaisesRegex(GenBoxPushError, "回执校验失败"):
+            self.service.push_image("2026/07/28/image.png")
+
+        self.assertFalse((self.tmp / "state.json").exists())
+        self.assertFalse((self.tmp / "genbox_push_cleanup.json").exists())
+
     def test_redirects_are_not_followed(self) -> None:
         self.configure()
         self.factory.responses.append(FakeResponse(302, {}))
