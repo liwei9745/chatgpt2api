@@ -579,6 +579,29 @@ class ImageStorageCleanupTests(unittest.TestCase):
         finally:
             os.rmdir(alias_dir)
 
+    def test_cleanup_rejects_traversal_absolute_and_alternate_separator_paths(self) -> None:
+        outside = self.tmp / "outside.png"
+        outside.write_bytes(b"outside-bytes")
+        digest = hashlib.sha256(b"outside-bytes").hexdigest()
+        outside_stat = outside.stat()
+        source_identity = {
+            "device": int(outside_stat.st_dev),
+            "inode": int(outside_stat.st_ino),
+            "size_bytes": int(outside_stat.st_size),
+        }
+
+        for invalid_path in ("../outside.png", "/outside.png", "2026\\08\\outside.png", "2026//08/outside.png"):
+            with self.subTest(path=invalid_path):
+                result = self.storage.delete_verified_local(
+                    invalid_path,
+                    digest,
+                    expected_identity=source_identity,
+                )
+                self.assertEqual(result.status, "retained")
+                self.assertEqual(result.reason, "path-invalid")
+                self.assertTrue(outside.exists())
+                self.assertEqual(outside.read_bytes(), b"outside-bytes")
+
     def test_index_write_failure_is_delete_unknown(self) -> None:
         rel, target, digest = self._source()
         source_identity = self._identity(rel, digest)
