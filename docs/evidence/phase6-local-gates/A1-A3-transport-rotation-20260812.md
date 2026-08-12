@@ -2,8 +2,7 @@
 
 Date: 2026-08-12
 
-Scope: Windows local verification in this sender worktree at the commit named
-at the verified candidate commit `9ad6570`. Inputs were synthetic test bytes, synthetic identifiers,
+Scope: Windows local verification at task commit `738c8f8` (candidate base `9ad6570`). Inputs were synthetic test bytes, synthetic identifiers,
 and one randomly assigned loopback HTTP test server. No remote receiver,
 credentials, user media, cleanup execution, deletion outside test temporary
 directories, or protected ports were used.

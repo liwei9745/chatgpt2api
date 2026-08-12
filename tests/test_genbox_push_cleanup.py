@@ -1821,6 +1821,13 @@ class GenBoxPushCleanupTests(unittest.TestCase):
 
         self.assertFalse(target.exists())
         self.assertEqual(sum(int(result["deleted"]) for result in results), 1)
+        self.assertEqual(sum(int(result["reclaimed_bytes"]) for result in results), len(b"synthetic-image"))
+        state = json.loads(self.state.read_text(encoding="utf-8"))["records"]
+        self.assertEqual(len(state), 1)
+        self.assertEqual(next(iter(state.values()))["cleanup_status"], "deleted")
+        audit = json.loads(self.audit.read_text(encoding="utf-8"))["events"]
+        self.assertEqual(sum(event.get("decision") == "deleting" for event in audit), 1)
+        self.assertEqual(sum(event.get("decision") == "deleted" for event in audit), 1)
 
     def test_application_lifespan_recovery_after_crash_before_unlink(self) -> None:
         target = self._record()
