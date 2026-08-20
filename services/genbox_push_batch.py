@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from services.config import DATA_DIR
+from services.genbox_push_cleanup import genbox_push_cleanup_service as _default_cleanup_service
 from services.genbox_push_service import GenBoxPushService, genbox_push_service
 from services.genbox_push_transfer import GenBoxPushTransferCoordinator, genbox_push_transfer_coordinator
 from services.image_storage_service import image_storage_service
@@ -43,6 +44,7 @@ class GenBoxPushBatchService:
         worker_factory: Callable[..., threading.Thread] = threading.Thread,
         retry_delay_seconds: Callable[[int], float] | None = None,
         sending_recovery_grace_seconds: float = SENDING_RECOVERY_GRACE_SECONDS,
+        cleanup_service: Any = None,
     ) -> None:
         self.state_file = state_file
         self.push_service = push_service
@@ -53,6 +55,7 @@ class GenBoxPushBatchService:
         self.worker_factory = worker_factory
         self.retry_delay_seconds = retry_delay_seconds or self._default_retry_delay_seconds
         self.sending_recovery_grace_seconds = max(0.0, float(sending_recovery_grace_seconds))
+        self.cleanup_service: Any = cleanup_service or _default_cleanup_service
         self._lock = ProcessReentrantLock(state_file.with_suffix(state_file.suffix + ".state.lock"))
         self._worker: threading.Thread | None = None
         self._retry_wakeup = threading.Event()
@@ -205,7 +208,7 @@ class GenBoxPushBatchService:
             "source_retained": True,
         }
 
-    def create(self, paths: Iterable[str], *, start_worker: bool = True) -> dict[str, object]:
+    def create(self, paths: Iterable[str], *, start_worker: bool = True, delete_source_after_push: bool = False) -> dict[str, object]:
         normalized: list[str] = []
         for value in paths:
             path = self._clean_path(value)
@@ -238,7 +241,12 @@ class GenBoxPushBatchService:
         batch_id = uuid.uuid4().hex
         with self._lock:
             batches = self._load_locked()
-            batches[batch_id] = {"created_at": now, "updated_at": now, "items": items}
+            batches[batch_id] = {
+                "created_at": now,
+                "updated_at": now,
+                "items": items,
+                "delete_source_after_push": bool(delete_source_after_push),
+            }
             self._save_locked(batches)
             if start_worker:
                 self._ensure_worker_locked()
@@ -397,6 +405,7 @@ class GenBoxPushBatchService:
         error: str = "",
         receipt_status: str = "",
         retryable: bool = False,
+        record_key: str = "",
     ) -> None:
         with self._lock:
             batches = self._load_locked()
@@ -411,12 +420,41 @@ class GenBoxPushBatchService:
                 "status": status,
                 "error": error,
                 "receipt_status": receipt_status,
+                "record_key": record_key,
                 "retryable": retry_later,
                 "next_retry_at": self._retry_at(attempts) if retry_later else "",
                 "updated_at": beijing_now_str(),
             })
             batch["updated_at"] = beijing_now_str()
-            self._save_locked(batches)
+            settled = all(
+                item.get("status") in ("succeeded", "already-imported", "failed", "cancelled")
+                for item in batch["items"].values()
+            )
+            if settled and not batch.get("cleanup_triggered"):
+                batch["cleanup_triggered"] = True
+                self._save_locked(batches)
+                if bool(batch.get("delete_source_after_push")):
+                    self._trigger_batch_cleanup_unlocked(batch_id, batch)
+            else:
+                self._save_locked(batches)
+
+    def _trigger_batch_cleanup_unlocked(self, batch_id: str, batch: dict[str, Any]) -> None:
+        """Fire per-batch user-selected cleanup exactly once when the batch
+        settles, using only the record keys of succeeded items."""
+        keys = {
+            str(item.get("record_key") or "")
+            for item in batch["items"].values()
+            if item.get("status") in ("succeeded", "already-imported") and item.get("record_key")
+        }
+        if not keys:
+            return
+        try:
+            self.cleanup_service.delete_selected(keys)
+        except Exception:
+            # A cleanup failure must never mark the batch failed: the transfer
+            # itself already succeeded and the source remains retained by the
+            # failed-closed cleanup logic.
+            pass
 
     def _drain(self) -> None:
         while True:
@@ -472,7 +510,12 @@ class GenBoxPushBatchService:
                     retryable=bool(getattr(exc, "retryable", False)),
                 )
             else:
-                self._finish(batch_id, item_id, receipt_status=str(receipt.get("status") or ""))
+                self._finish(
+                    batch_id,
+                    item_id,
+                    receipt_status=str(receipt.get("status") or ""),
+                    record_key=str((receipt or {}).get("record_key") or ""),
+                )
             finally:
                 item_lock.release()
 

@@ -523,8 +523,9 @@ class GenBoxPushService:
                     "source_retained": True,
                 }
                 self._save_result(relative_path, result)
+                record_key = ""
                 try:
-                    self.cleanup_service.record_receipt(
+                    recorded = self.cleanup_service.record_receipt(
                         destination_scope=self._transfer_scope_for(settings),
                         source_id=settings.source_id,
                         remote_path=relative_path,
@@ -533,10 +534,14 @@ class GenBoxPushService:
                         safe_to_delete_source=receipt.get("safe_to_delete_source") is True,
                         size_bytes=len(payload),
                     )
+                    if isinstance(recorded, dict):
+                        record_key = str(recorded.get("record_key") or "")
                 except Exception as exc:
                     raise GenBoxPushError(
                         "The receipt was accepted but could not be durably recorded; the source was retained."
                     ) from exc
+                if record_key:
+                    result["record_key"] = record_key
                 return result
             finally:
                 multipart.close()

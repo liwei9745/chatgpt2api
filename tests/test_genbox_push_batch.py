@@ -388,13 +388,15 @@ class GenBoxPushBatchServiceTests(unittest.TestCase):
 class StubBatchService:
     def __init__(self) -> None:
         self.paths: list[str] | None = None
+        self.last_delete_source_after_push: bool = False
 
     @staticmethod
     def _batch() -> dict[str, object]:
         return {"id": "batch", "status": "queued", "total": 1, "source_retained": True, "items": []}
 
-    def create(self, paths: list[str]) -> dict[str, object]:
+    def create(self, paths: list[str], *, delete_source_after_push: bool = False) -> dict[str, object]:
         self.paths = paths
+        self.last_delete_source_after_push = bool(delete_source_after_push)
         return self._batch()
 
     def get(self, batch_id: str) -> dict[str, object] | None:
@@ -457,6 +459,80 @@ class GenBoxPushBatchApiTests(unittest.TestCase):
         self.assertEqual(self.client.post("/api/genbox-push/batches/preview-date-range", headers=self.headers, json={
             "start_date": "2026-07-01", "end_date": "2026-07-31",
         }).status_code, 200)
+
+
+class RecorderCleanupService:
+    def __init__(self) -> None:
+        self.deleted_keys: set[str] | None = None
+        self.calls: int = 0
+
+    def delete_selected(self, keys: set[str]) -> dict[str, object]:
+        self.calls += 1
+        self.deleted_keys = set(keys)
+        return {"eligible": len(keys)}
+
+
+class PerRunCleanupTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp())
+        self.sender = FakePushService()
+        self.cleanup = RecorderCleanupService()
+        self.batches = GenBoxPushBatchService(
+            state_file=self.tmp / "batches.json",
+            push_service=self.sender,
+            image_reader={"2026/07/28/one.png": b"one"}.__getitem__,
+            image_exists=lambda path: path == "2026/07/28/one.png",
+            cleanup_service=self.cleanup,
+        )
+
+    def test_batch_with_delete_selection_triggers_cleanup_on_success(self) -> None:
+        created = self.batches.create(
+            ["2026/07/28/one.png"],
+            start_worker=False,
+            delete_source_after_push=True,
+        )
+        batch_id = str(created["id"])
+        # Mark the single item succeeded with a durable record key, as the real
+        # transfer path does after a grant-confirmed receipt.
+        item_id = next(iter(self.batches._load_locked()[batch_id]["items"]))
+        self.batches._finish(
+            batch_id, item_id,
+            receipt_status="imported",
+            record_key="scope:src:2026/07/28/one.png:digest",
+        )
+        self.assertEqual(self.cleanup.calls, 1)
+        self.assertIn("scope:src:2026/07/28/one.png:digest", self.cleanup.deleted_keys)
+
+    def test_batch_without_delete_selection_never_triggers_cleanup(self) -> None:
+        created = self.batches.create(
+            ["2026/07/28/one.png"],
+            start_worker=False,
+            delete_source_after_push=False,
+        )
+        batch_id = str(created["id"])
+        item_id = next(iter(self.batches._load_locked()[batch_id]["items"]))
+        self.batches._finish(
+            batch_id, item_id,
+            receipt_status="imported",
+            record_key="scope:src:2026/07/28/one.png:digest",
+        )
+        self.assertEqual(self.cleanup.calls, 0)
+
+    def test_failed_item_never_collected_for_cleanup(self) -> None:
+        created = self.batches.create(
+            ["2026/07/28/one.png"],
+            start_worker=False,
+            delete_source_after_push=True,
+        )
+        batch_id = str(created["id"])
+        item_id = next(iter(self.batches._load_locked()[batch_id]["items"]))
+        self.batches._finish(
+            batch_id, item_id,
+            error="boom",
+            receipt_status="",
+            record_key="",
+        )
+        self.assertEqual(self.cleanup.calls, 0)
 
 
 if __name__ == "__main__":

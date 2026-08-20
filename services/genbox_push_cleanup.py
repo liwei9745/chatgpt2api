@@ -666,6 +666,7 @@ class GenBoxPushCleanupService:
             and bool(runtime_identity_digest)
         )
         record = {
+            "record_key": key,
             "record_version": CLEANUP_RECORD_VERSION,
             "destination_scope": scope,
             "source_id": sid,
@@ -834,7 +835,7 @@ class GenBoxPushCleanupService:
         self._save_state_locked(records)
         return record
 
-    def run(self, *, dry_run: bool = True) -> dict[str, object]:
+    def run(self, *, dry_run: bool = True, candidate_keys: set[str] | None = None) -> dict[str, object]:
         operation_id = uuid.uuid4().hex
         mode = "dry-run" if dry_run else "execute"
         summary = self._operation_summary(operation_id, mode)
@@ -846,6 +847,8 @@ class GenBoxPushCleanupService:
             summary["blocked_reason"] = self.environment_gate.reason()
 
         for key, original in records.items():
+            if candidate_keys is not None and key not in candidate_keys:
+                continue
             record = dict(original)
             summary["candidates"] = int(summary["candidates"]) + 1
             current_status = str(record.get("cleanup_status") or "")
@@ -1131,11 +1134,25 @@ class GenBoxPushCleanupService:
                 claim.release()
         return summary
 
-    def preview(self) -> dict[str, object]:
-        return self.run(dry_run=True)
+    def preview(self, candidate_keys: set[str] | None = None) -> dict[str, object]:
+        return self.run(dry_run=True, candidate_keys=candidate_keys)
 
-    def execute(self) -> dict[str, object]:
-        return self.run(dry_run=False)
+    def execute(self, candidate_keys: set[str] | None = None) -> dict[str, object]:
+        return self.run(dry_run=False, candidate_keys=candidate_keys)
+
+    def delete_selected(self, record_keys: set[str]) -> dict[str, object]:
+        """Per-action deletion for one user-selected manual/scheduled run.
+
+        Accepts only the exact durable record keys this operation's successful,
+        grant-confirmed pushes produced. A dry-run preview is always returned
+        first; execution is refused unless the preview found eligible records.
+        """
+        if not record_keys:
+            raise GenBoxPushError("No confirmed GenBox Push receipts were selected for cleanup.")
+        preview_result = self.run(dry_run=True, candidate_keys=record_keys)
+        if int(preview_result.get("eligible") or 0) == 0:
+            raise GenBoxPushError("The selected Push had no eligible source image to delete.")
+        return self.run(dry_run=False, candidate_keys=record_keys)
 
     def recover_inflight(self) -> dict[str, int]:
         """Resolve only durable deleting intents; never deletes on startup."""

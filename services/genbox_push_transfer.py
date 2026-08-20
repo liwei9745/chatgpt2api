@@ -140,6 +140,7 @@ class GenBoxPushTransferCoordinator:
                 "status": str(result.get("status") or ""),
                 "sha256": digest,
                 "safe_to_delete_source": result.get("safe_to_delete_source") is True,
+                "record_key": str(result.get("record_key") or ""),
                 "source_retained": True,
             }
             return dict(transfer.result)

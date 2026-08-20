@@ -135,9 +135,12 @@ class GenBoxPushScheduleService:
     @staticmethod
     def _validate(payload: dict[str, object], current: dict[str, object]) -> dict[str, object]:
         schedule = {**current}
-        for key in ("enabled", "start_date", "end_date"):
+        for key in ("enabled", "start_date", "end_date", "delete_source_after_push"):
             if key in payload:
-                schedule[key] = bool(payload[key]) if key == "enabled" else str(payload[key] or "").strip()
+                if key == "enabled" or key == "delete_source_after_push":
+                    schedule[key] = bool(payload[key])
+                else:
+                    schedule[key] = str(payload[key] or "").strip()
         try:
             weekday = int(payload.get("weekday", schedule["weekday"]))
         except (TypeError, ValueError) as exc:
@@ -171,6 +174,7 @@ class GenBoxPushScheduleService:
             "time": str(schedule.get("time") or "09:00"),
             "start_date": str(schedule.get("start_date") or ""),
             "end_date": str(schedule.get("end_date") or ""),
+            "delete_source_after_push": bool(schedule.get("delete_source_after_push")),
             "cursor": str(state.get("cursor") or ""),
             "last_run_at": str(schedule.get("last_run_at") or ""),
             "last_error": str(schedule.get("last_error") or ""),
@@ -320,7 +324,10 @@ class GenBoxPushScheduleService:
                     if identity in state["items"]:
                         continue
                     try:
-                        batch = self.batch_service.create([path])
+                        batch = self.batch_service.create(
+                            [path],
+                            delete_source_after_push=bool(schedule.get("delete_source_after_push")),
+                        )
                         status = str(batch.get("status") or "queued")
                         state["items"][identity] = {
                             "path": path,

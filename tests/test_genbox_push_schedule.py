@@ -36,7 +36,7 @@ class FakeBatchService:
         self.calls: list[str] = []
         self.batches: dict[str, dict[str, object]] = {}
 
-    def create(self, paths: list[str]) -> dict[str, object]:
+    def create(self, paths: list[str], *, delete_source_after_push: bool = False) -> dict[str, object]:
         path = paths[0]
         batch_id = f"batch-{len(self.calls) + 1}"
         self.calls.append(path)
@@ -237,6 +237,7 @@ class GenBoxPushScheduleApiTests(unittest.TestCase):
         self.assertEqual(scanned.status_code, 200)
         self.assertEqual(self.stub.payload, {
             "enabled": True, "weekday": 2, "time": "10:30", "start_date": "", "end_date": "",
+            "delete_source_after_push": False,
         })
         self.assertNotIn("push_key", updated.text)
         self.assertEqual(scanned.json()["schedule"]["queued"], 1)

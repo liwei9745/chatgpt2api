@@ -26,10 +26,12 @@ class GenBoxPushImageRequest(BaseModel):
     created_at: str = ""
     prompt: str = ""
     model: str = ""
+    delete_source_after_push: bool = False
 
 
 class GenBoxPushBatchRequest(BaseModel):
     paths: list[str] = Field(..., min_length=1, max_length=200)
+    delete_source_after_push: bool = False
 
 
 class GenBoxPushDateRangeRequest(BaseModel):
@@ -43,6 +45,7 @@ class GenBoxPushScheduleRequest(BaseModel):
     time: str = Field(default="09:00", min_length=5, max_length=5)
     start_date: str = Field(default="", max_length=10)
     end_date: str = Field(default="", max_length=10)
+    delete_source_after_push: bool = False
 
 
 class GenBoxPushCleanupSettingsRequest(BaseModel):
@@ -157,13 +160,24 @@ def create_router() -> APIRouter:
             )
         except GenBoxPushError as exc:
             _raise_push_error(exc)
+        if body.delete_source_after_push:
+            record_key = str((result or {}).get("record_key") or "")
+            if record_key:
+                try:
+                    cleanup = await run_in_threadpool(
+                        genbox_push_cleanup_service.delete_selected,
+                        {record_key},
+                    )
+                    result = {**result, "cleanup": cleanup}
+                except GenBoxPushError as exc:
+                    _raise_push_error(exc)
         return {"result": result}
 
     @router.post("/api/genbox-push/batches")
     async def create_batch(body: GenBoxPushBatchRequest, authorization: str | None = Header(default=None)):
         require_admin(authorization)
         try:
-            batch = await run_in_threadpool(genbox_push_batch_service.create, body.paths)
+            batch = await run_in_threadpool(genbox_push_batch_service.create, body.paths, delete_source_after_push=body.delete_source_after_push)
         except ValueError as exc:
             _raise_push_error(exc)
         return {"batch": batch}
