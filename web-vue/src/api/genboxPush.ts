@@ -70,6 +70,7 @@ export interface GenBoxPushSchedule {
   time: string
   start_date: string
   end_date: string
+  delete_source_after_push: boolean
   cursor: string
   last_run_at: string
   last_error: string
@@ -80,7 +81,7 @@ export interface GenBoxPushSchedule {
   source_retained: true
 }
 
-export type GenBoxPushSchedulePayload = Pick<GenBoxPushSchedule, 'enabled' | 'weekday' | 'time' | 'start_date' | 'end_date'>
+export type GenBoxPushSchedulePayload = Pick<GenBoxPushSchedule, 'enabled' | 'weekday' | 'time' | 'start_date' | 'end_date' | 'delete_source_after_push'>
 
 export type GenBoxPushSettingsPayload = Omit<GenBoxPushSettings, 'has_push_key'> & {
   push_key?: string
@@ -92,10 +93,16 @@ export const genboxPushApi = {
   updateSettings: (payload: GenBoxPushSettingsPayload) =>
     apiClient.post<GenBoxPushSettingsPayload, { settings: GenBoxPushSettings }>('/api/genbox-push/settings', payload),
   probe: () => apiClient.post<Record<string, never>, { result: GenBoxPushProbeResult }>('/api/genbox-push/probe', {}),
-  pushImage: (path: string) =>
-    apiClient.post<{ path: string }, { result: GenBoxPushImageResult }>('/api/genbox-push/images', { path }),
-  createBatch: (paths: string[]) =>
-    apiClient.post<{ paths: string[] }, { batch: GenBoxPushBatch }>('/api/genbox-push/batches', { paths }),
+  pushImage: (path: string, deleteSourceAfterPush: boolean = false) =>
+    apiClient.post<{ path: string; delete_source_after_push: boolean }, { result: GenBoxPushImageResult }>(
+      '/api/genbox-push/images',
+      { path, delete_source_after_push: deleteSourceAfterPush },
+    ),
+  createBatch: (paths: string[], deleteSourceAfterPush: boolean = false) =>
+    apiClient.post<{ paths: string[]; delete_source_after_push: boolean }, { batch: GenBoxPushBatch }>(
+      '/api/genbox-push/batches',
+      { paths, delete_source_after_push: deleteSourceAfterPush },
+    ),
   previewBatchDateRange: (startDate: string, endDate: string) =>
     apiClient.post<{ start_date: string; end_date: string }, { preview: GenBoxPushBatchDateRangePreview }>(
       '/api/genbox-push/batches/preview-date-range',

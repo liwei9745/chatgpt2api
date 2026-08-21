@@ -282,6 +282,8 @@
       :message="confirmDialog.message.value"
       :confirm-text="confirmDialog.confirmText.value"
       :cancel-text="confirmDialog.cancelText.value"
+      :checkbox-label="confirmDialog.checkboxLabel.value"
+      @update:checked="confirmDialog.checkboxChecked.value = $event"
       @confirm="confirmDialog.confirm"
       @cancel="confirmDialog.cancel"
     />

@@ -17,7 +17,15 @@
           <div class="ui-dialog-body whitespace-pre-line px-5 pb-5 pt-3">
             {{ message }}
           </div>
-          <div class="flex items-center justify-end gap-2 px-5 pb-5 pt-0">
+          <div v-if="checkboxLabel" class="flex items-center gap-2 px-5 pb-4 pt-0">
+            <input
+              id="confirm-dialog-checkbox"
+              v-model="checked"
+              type="checkbox"
+              class="size-4 accent-(--primary)"
+            />
+            <label for="confirm-dialog-checkbox" class="text-sm text-foreground">{{ checkboxLabel }}</label>
+          </div>          <div class="flex items-center justify-end gap-2 px-5 pb-5 pt-0">
             <Button
               size="xs"
               variant="outline"
@@ -30,7 +38,7 @@
               size="xs"
               variant="primary"
               root-class="min-w-14 justify-center"
-              @click="$emit('confirm')"
+              @click="confirmNow"
             >
               {{ confirmText || '确定' }}
             </Button>
@@ -42,18 +50,30 @@
 </template>
 
 <script setup lang="ts">
+import { ref, watch } from 'vue'
 import { Button } from 'nanocat-ui'
 
-defineProps<{
+const props = defineProps<{
   open: boolean
   title?: string
   message: string
   confirmText?: string
   cancelText?: string
+  checkboxLabel?: string
 }>()
 
-defineEmits<{
-  confirm: []
+const emit = defineEmits<{
+  confirm: [checked: boolean]
   cancel: []
 }>()
+
+const checked = ref(false)
+
+watch(() => props.open, (open) => {
+  if (open) checked.value = false
+})
+
+function confirmNow() {
+  emit('confirm', checked.value)
+}
 </script>

@@ -424,17 +424,20 @@ export function useGalleryOperationsRuntime(options: GalleryOperationsRuntimeOpt
     if (!paths.length) return
     const confirmed = await options.confirmDialog.ask({
       title: '推送到 GenBox',
-      message: `将把已选择的 ${paths.length} 张图片发送到 GenBox。源图会保留，不会删除。确定继续吗？`,
+      message: `将把已选择的 ${paths.length} 张图片发送到 GenBox。只有当你勾选下方选项、且 GenBox 回执确认时，源图才会被删除。确定继续吗？`,
       confirmText: '开始推送',
       cancelText: '取消',
+      checkboxLabel: '推送成功后删除源图（需 GenBox 回执确认，默认不删）',
     })
-    if (!confirmed) return
+    const confirmedFlag = confirmed === true || (typeof confirmed === 'object' && confirmed.confirmed)
+    if (!confirmedFlag) return
+    const deleteSource = typeof confirmed === 'object' ? confirmed.checked : false
 
     batchBusy.value = true
     const generation = ++pushBatchRequestGeneration
     resetProgress({ title: '推送到 GenBox', subtitle: `已选择 ${paths.length} 张图片`, total: paths.length, message: '正在创建可恢复的推送批次...' })
     try {
-      const response = await genboxPushApi.createBatch(paths)
+      const response = await genboxPushApi.createBatch(paths, deleteSource)
       if (generation !== pushBatchRequestGeneration) return
       options.clearSelection()
       applyPushBatch(response.batch)
@@ -465,12 +468,15 @@ export function useGalleryOperationsRuntime(options: GalleryOperationsRuntimeOpt
       }
       const confirmed = await options.confirmDialog.ask({
         title: '推送日期范围',
-        message: `${startDate} 到 ${endDate} 共有 ${preview.eligible_count} 张可推送图片。源图会保留，不会删除。确定创建推送批次吗？`,
+        message: `${startDate} 到 ${endDate} 共有 ${preview.eligible_count} 张可推送图片。只有当你勾选下方选项、且 GenBox 回执确认时，源图才会被删除。确定创建推送批次吗？`,
         confirmText: '开始推送',
         cancelText: '取消',
+        checkboxLabel: '推送成功后删除源图（需 GenBox 回执确认，默认不删）',
       })
-      if (!confirmed) return
-      const response = await genboxPushApi.createBatch(preview.paths)
+      const confirmedFlag = confirmed === true || (typeof confirmed === 'object' && confirmed.confirmed)
+      if (!confirmedFlag) return
+      const deleteSource = typeof confirmed === 'object' ? confirmed.checked : false
+      const response = await genboxPushApi.createBatch(preview.paths, deleteSource)
       if (generation !== pushBatchRequestGeneration) return
       applyPushBatch(response.batch)
       startPushBatchPolling(response.batch.id)

@@ -29,7 +29,7 @@
       <StateBlock v-if="message" :title="messageTone === 'success' ? '可以继续' : '需要处理'" :description="message" />
     </FormSection>
 
-    <FormSection title="自动推送" subtitle="默认每周一次。系统会重叠扫描最近图片，晚到的图片也不会被悄悄遗漏。源图始终保留。">
+    <FormSection title="自动推送" subtitle="默认每周一次。系统会重叠扫描最近图片，晚到的图片也不会被悄悄遗漏。只有你勾选“删除源图”时，已成功推送的源图才会被删除。">
       <div class="settings-check-item">
         <Checkbox v-model="scheduleForm.enabled">每周自动推送新图片</Checkbox>
       </div>
@@ -42,6 +42,9 @@
         <FormField label="执行时间"><Input v-model="scheduleForm.time" type="time" block /></FormField>
         <FormField label="最早日期（可选）"><Input v-model="scheduleForm.start_date" type="date" block /></FormField>
         <FormField label="截止日期（可选）"><Input v-model="scheduleForm.end_date" type="date" block /></FormField>
+      </div>
+      <div class="settings-check-item" style="max-width: 460px;">
+        <Checkbox v-model="scheduleForm.delete_source_after_push">推送成功后删除源图（需 GenBox 回执确认，默认不删）</Checkbox>
       </div>
       <div class="flex flex-wrap gap-2">
         <Button size="sm" variant="primary" :disabled="isScheduleSaving" @click="saveSchedule">{{ isScheduleSaving ? '保存中...' : '保存自动推送' }}</Button>
@@ -60,7 +63,7 @@ import { genboxPushApi } from '@/api/genboxPush'
 
 const form = reactive({ enabled: false, base_url: '', source_id: '', push_key: '', timeout_secs: 20 })
 const pastedConfiguration = ref('')
-const scheduleForm = reactive({ enabled: false, weekday: 0, time: '09:00', start_date: '', end_date: '' })
+const scheduleForm = reactive({ enabled: false, weekday: 0, time: '09:00', start_date: '', end_date: '', delete_source_after_push: false })
 const weekdays = [
   { value: 0, label: '星期一' }, { value: 1, label: '星期二' }, { value: 2, label: '星期三' },
   { value: 3, label: '星期四' }, { value: 4, label: '星期五' }, { value: 5, label: '星期六' }, { value: 6, label: '星期日' },
@@ -126,6 +129,7 @@ async function load() {
       time: scheduleResponse.schedule.time,
       start_date: scheduleResponse.schedule.start_date,
       end_date: scheduleResponse.schedule.end_date,
+      delete_source_after_push: scheduleResponse.schedule.delete_source_after_push,
     })
     if (scheduleResponse.schedule.queued > 0) {
       setScheduleMessage(scheduleResponse.schedule, '已恢复正在进行的扫描。')
