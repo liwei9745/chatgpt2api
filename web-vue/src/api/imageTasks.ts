@@ -73,6 +73,7 @@ export interface CreateGenerationTaskInput {
   quality?: string
   clientTaskId?: string
   pushToGenBox?: boolean
+  deleteSourceAfterPush?: boolean
 }
 
 export interface CreateEditTaskInput extends CreateGenerationTaskInput {
@@ -311,6 +312,7 @@ function createEditForm(input: CreateEditTaskInput) {
   form.append('n', String(normalizeImageCount(input.n)))
   form.append('quality', input.quality || DEFAULT_IMAGE_QUALITY)
   form.append('push_to_genbox', input.pushToGenBox ? 'true' : 'false')
+  form.append('delete_source_after_push', input.deleteSourceAfterPush ? 'true' : 'false')
   const size = requestSize(input.size)
   if (size) form.append('size', size)
 
@@ -387,6 +389,7 @@ export const imageTasksApi = {
       size: requestSize(input.size),
       quality: input.quality || DEFAULT_IMAGE_QUALITY,
       push_to_genbox: Boolean(input.pushToGenBox),
+      delete_source_after_push: Boolean(input.deleteSourceAfterPush),
     })
     return normalizeTask(response)
   },

@@ -136,7 +136,15 @@
                     >
                       生成后推送到 GenBox
                     </Checkbox>
-                    <p class="studio-size-hint">图片会先保存在本机；推送失败不会影响生成，也不会删除源图。</p>
+                    <Checkbox
+                      v-if="imageForm.pushToGenBox"
+                      :model-value="imageForm.deleteSourceAfterPush"
+                      :disabled="isSending"
+                      @update:model-value="$emit('update:deleteSourceAfterPush', Boolean($event))"
+                    >
+                      推送成功后删除源图（需 GenBox 回执确认，默认不删）
+                    </Checkbox>
+                    <p class="studio-size-hint">图片会先保存在本机；推送失败不会影响生成。只有你勾选删除、且 GenBox 回执确认时才会删除源图。</p>
                   </div>
                   <div class="studio-size-section">
                     <div class="studio-size-label">模型</div>
@@ -299,6 +307,7 @@ const emit = defineEmits<{
   'update:imageQuality': [quality: string]
   'update:imageCount': [count: number]
   'update:pushToGenBox': [enabled: boolean]
+  'update:deleteSourceAfterPush': [enabled: boolean]
   submit: []
   stop: []
   'cancel-edit': []

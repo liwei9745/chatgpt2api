@@ -110,6 +110,7 @@
         @update:image-quality="imageForm.quality = $event"
         @update:image-count="imageForm.n = $event"
         @update:push-to-gen-box="imageForm.pushToGenBox = $event"
+        @update:delete-source-after-push="imageForm.deleteSourceAfterPush = $event"
         @submit="sendMessage"
         @stop="stopStreaming"
         @cancel-edit="cancelMessageEdit"

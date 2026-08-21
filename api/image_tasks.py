@@ -20,6 +20,7 @@ class ImageGenerationTaskRequest(BaseModel):
     size: str | None = None
     quality: str = "auto"
     push_to_genbox: bool = False
+    delete_source_after_push: bool = False
 
 
 class ResumePollRequest(BaseModel):
@@ -96,6 +97,7 @@ def create_router() -> APIRouter:
                 size=body.size,
                 quality=body.quality,
                 push_to_genbox=body.push_to_genbox,
+                delete_source_after_push=body.delete_source_after_push,
                 base_url=resolve_image_base_url(request),
             )
         except ValueError as exc:
@@ -130,6 +132,7 @@ def create_router() -> APIRouter:
                 images=images,
                 masks=masks,
                 push_to_genbox=_push_requested(payload.get("push_to_genbox")),
+                delete_source_after_push=_push_requested(payload.get("delete_source_after_push")),
             )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc

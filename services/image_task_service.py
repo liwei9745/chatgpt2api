@@ -255,6 +255,7 @@ class ImageTaskService:
         size: str | None = None,
         quality: str = "auto",
         push_to_genbox: bool = False,
+        delete_source_after_push: bool = False,
         base_url: str = "",
     ) -> dict[str, Any]:
         payload = {
@@ -266,6 +267,7 @@ class ImageTaskService:
             "response_format": "url",
             "base_url": base_url,
             "push_to_genbox": bool(push_to_genbox),
+            "delete_source_after_push": bool(delete_source_after_push),
         }
         return self._submit(identity, client_task_id=client_task_id, mode="generate", payload=payload)
 
@@ -283,6 +285,7 @@ class ImageTaskService:
         images: list[tuple[bytes, str, str]] | None = None,
         masks: list[tuple[bytes, str, str]] | None = None,
         push_to_genbox: bool = False,
+        delete_source_after_push: bool = False,
     ) -> dict[str, Any]:
         payload = {
             "prompt": prompt,
@@ -295,6 +298,7 @@ class ImageTaskService:
             "response_format": "url",
             "base_url": base_url,
             "push_to_genbox": bool(push_to_genbox),
+            "delete_source_after_push": bool(delete_source_after_push),
         }
         return self._submit(identity, client_task_id=client_task_id, mode="edit", payload=payload)
 

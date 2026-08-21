@@ -107,6 +107,7 @@ export async function createStudioImageTask(input: StudioImageTaskInput): Promis
       size,
       quality,
       pushToGenBox: input.imageForm.pushToGenBox,
+      deleteSourceAfterPush: input.imageForm.deleteSourceAfterPush,
     })
     : imageTasksApi.createGeneration({
       prompt: input.prompt,
@@ -115,6 +116,7 @@ export async function createStudioImageTask(input: StudioImageTaskInput): Promis
       size,
       quality,
       pushToGenBox: input.imageForm.pushToGenBox,
+      deleteSourceAfterPush: input.imageForm.deleteSourceAfterPush,
     })
 }
 

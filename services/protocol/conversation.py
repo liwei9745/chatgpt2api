@@ -471,6 +471,7 @@ def format_image_result(
     message: str = "",
     model: str = "",
     push_to_genbox: bool = False,
+    delete_source_after_push: bool = False,
 ) -> dict[str, Any]:
     data: list[dict[str, Any]] = []
     image_urls: list[str] = []
@@ -499,6 +500,7 @@ def format_image_result(
                 created_at=str(created or int(time.time())),
                 prompt=revised_prompt,
                 model=model,
+                delete_source_after_push=bool(delete_source_after_push),
             )
         data.append(asset)
     result: dict[str, Any] = {"created": created or int(time.time()), "data": data}
@@ -527,6 +529,7 @@ class ConversationRequest:
     trace_image_perf: bool = False
     monitor_attempt: int = 0
     push_to_genbox: bool = False
+    delete_source_after_push: bool = False
 
 
 @dataclass
@@ -1561,6 +1564,7 @@ def _image_result_output_from_urls(
         int(time.time()),
         model=request.model,
         push_to_genbox=request.push_to_genbox,
+        delete_source_after_push=request.delete_source_after_push,
     )
     data = formatted["data"]
     if not data:
@@ -1948,6 +1952,7 @@ def stream_codex_image_outputs(
         int(time.time()),
         model=request.model,
         push_to_genbox=request.push_to_genbox,
+        delete_source_after_push=request.delete_source_after_push,
     )
     data = formatted["data"]
     if data:

@@ -28,6 +28,7 @@ export function useStudioModelFormRuntime(input: StudioModelFormRuntimeInput) {
     quality: DEFAULT_IMAGE_QUALITY,
     n: 1,
     pushToGenBox: false,
+    deleteSourceAfterPush: false,
   })
 
   const chatModelOptions = computed(() => uniqueStrings(['auto', ...chatModels.value]))

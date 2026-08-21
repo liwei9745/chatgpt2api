@@ -18,7 +18,8 @@ type ConfirmDialog = {
     message: string
     confirmText?: string
     cancelText?: string
-  }) => Promise<boolean>
+    checkboxLabel?: string
+  }) => Promise<boolean | { confirmed: boolean; checked: boolean }>
 }
 
 type Toast = {

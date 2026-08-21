@@ -85,6 +85,7 @@ export interface StudioImageForm {
   quality: string
   n: number
   pushToGenBox: boolean
+  deleteSourceAfterPush: boolean
 }
 
 export interface StudioPreviewImage {
