@@ -41,6 +41,7 @@ class FakePushService:
             "status": "imported",
             "sha256": expected_sha256 or "a" * 64,
             "safe_to_delete_source": True,
+            "record_key": "scope:src:2026/07/28/synthetic.png:" + (expected_sha256 or "a" * 64),
             "source_retained": True,
         }
 
@@ -229,3 +230,55 @@ class ConversationPushRegistrationTests(unittest.TestCase):
         self.assertEqual(asset["genbox_push"]["status"], "queued")
         self.assertEqual(outbox.calls[0]["digest"], hashlib.sha256(payload).hexdigest())
         self.assertEqual(outbox.calls[0]["model"], "local-model")
+
+
+class RecorderCleanup:
+    def __init__(self) -> None:
+        self.deleted: set[str] | None = None
+        self.calls: int = 0
+
+    def delete_selected(self, keys: set[str]) -> dict[str, object]:
+        self.calls += 1
+        self.deleted = set(keys)
+        return {"eligible": len(keys)}
+
+
+class GenBoxPushOutboxDeleteIntentTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp())
+
+    def test_outbox_delete_intent_triggers_cleanup_on_confirmed_push(self) -> None:
+        sender = FakePushService()
+        cleanup = RecorderCleanup()
+        outbox = GenBoxPushOutbox(
+            state_file=self.tmp / "outbox.json",
+            push_service=sender,
+            cleanup_service=cleanup,
+        )
+        digest = hashlib.sha256(b"synthetic").hexdigest()
+        outbox.enqueue(
+            "2026/07/28/confirmed.png",
+            digest,
+            delete_source_after_push=True,
+            created_at="2026-07-28 12:00:00",
+            prompt="phase9 manual",
+            model="gpt-image",
+        )
+        entry_id = outbox._entry_id("2026/07/28/confirmed.png", digest)
+        outbox._finish(entry_id, result={"status": "imported", "sha256": digest, "safe_to_delete_source": True, "record_key": "scope:src:confirmed"})
+        self.assertEqual(cleanup.calls, 1)
+        self.assertIn("scope:src:confirmed", cleanup.deleted)
+
+    def test_outbox_without_delete_intent_never_triggers_cleanup(self) -> None:
+        sender = FakePushService()
+        cleanup = RecorderCleanup()
+        outbox = GenBoxPushOutbox(
+            state_file=self.tmp / "outbox2.json",
+            push_service=sender,
+            cleanup_service=cleanup,
+        )
+        digest = hashlib.sha256(b"synthetic2").hexdigest()
+        outbox.enqueue("2026/07/28/kept.png", digest)
+        entry_id = outbox._entry_id("2026/07/28/kept.png", digest)
+        outbox._finish(entry_id, result={"status": "imported", "sha256": digest, "safe_to_delete_source": True, "record_key": "scope:src:kept"})
+        self.assertEqual(cleanup.calls, 0)

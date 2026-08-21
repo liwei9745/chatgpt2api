@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from services.config import DATA_DIR
+from services.genbox_push_cleanup import genbox_push_cleanup_service as _default_cleanup_service
 from services.genbox_push_service import GenBoxPushService, genbox_push_service
 from services.genbox_push_transfer import GenBoxPushTransferCoordinator, genbox_push_transfer_coordinator
 from services.json_file import read_json_object, write_json_file
@@ -29,11 +30,13 @@ class GenBoxPushOutbox:
         push_service: GenBoxPushService | Any = genbox_push_service,
         transfer_coordinator: GenBoxPushTransferCoordinator = genbox_push_transfer_coordinator,
         worker_factory: Callable[..., threading.Thread] = threading.Thread,
+        cleanup_service: Any = None,
     ) -> None:
         self.state_file = state_file
         self.push_service = push_service
         self.transfer_coordinator = transfer_coordinator
         self.worker_factory = worker_factory
+        self.cleanup_service: Any = cleanup_service or _default_cleanup_service
         # The outbox JSON is shared by all application workers.  A thread-only
         # lock allows two processes to claim the same queued item concurrently.
         self._lock = ProcessReentrantLock(state_file.with_suffix(state_file.suffix + ".state.lock"))
@@ -110,6 +113,7 @@ class GenBoxPushOutbox:
         created_at: str = "",
         prompt: str = "",
         model: str = "",
+        delete_source_after_push: bool = False,
         start_worker: bool = True,
     ) -> dict[str, object]:
         path = self._clean(relative_path).replace("\\", "/").lstrip("/")
@@ -127,6 +131,7 @@ class GenBoxPushOutbox:
                     "source_sha256": digest,
                     "created_at": self._clean(created_at),
                     "model": self._clean(model),
+                    "delete_source_after_push": bool(delete_source_after_push),
                     "status": "queued",
                     "attempts": 0,
                     "updated_at": now,
@@ -242,6 +247,21 @@ class GenBoxPushOutbox:
             # The prompt is only needed by the immediate outbound request. Do
             # not retain it in process memory after a terminal outcome.
             self._metadata.pop(entry_id, None)
+        if (
+            error == ""
+            and result is not None
+            and bool(item.get("delete_source_after_push"))
+            and result.get("safe_to_delete_source") is True
+            and str(item.get("status") or "") == "succeeded"
+        ):
+            record_key = str((result or {}).get("record_key") or "")
+            if record_key:
+                try:
+                    self.cleanup_service.delete_selected({record_key})
+                except Exception:
+                    # Per-action delete is best-effort after a confirmed push;
+                    # failure keeps the source and never affects the outbox item.
+                    pass
 
     def _drain(self) -> None:
         while True:
